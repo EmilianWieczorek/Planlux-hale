@@ -3,7 +3,7 @@
  */
 
 import { useState, useEffect } from "react";
-import { Typography, TextField, Box, Tabs, Tab, Table, TableBody, TableCell, TableHead, TableRow, Button, Chip } from "@mui/material";
+import { Typography, TextField, Box, Tabs, Tab, Table, TableBody, TableCell, TableHead, TableRow, Button, Chip, Snackbar, Alert } from "@mui/material";
 import { OfferDetailsView } from "./OfferDetailsView";
 
 type OfferFilterTab = "in_progress" | "generated" | "sent" | "realized" | "all";
@@ -28,6 +28,7 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
   const [selectedOfferId, setSelectedOfferId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<OfferFilterTab>("in_progress");
   const [searchQuery, setSearchQuery] = useState("");
+  const [syncingNumbers, setSyncingNumbers] = useState(false);
   const [offers, setOffers] = useState<Array<{
     id: string;
     offerNumber: string;
@@ -49,14 +50,28 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
   }>>([]);
   const [loading, setLoading] = useState(false);
 
+  const [syncError, setSyncError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       setLoading(true);
+      setSyncError(null);
       try {
         const onlineRes = (await api("planlux:isOnline")) as { online?: boolean };
-        if (onlineRes.online) {
-          await api("planlux:syncTempOfferNumbers");
+        if (onlineRes?.online) {
+          setSyncingNumbers(true);
+          try {
+            const syncRes = (await api("planlux:syncTempOfferNumbers")) as {
+              ok?: boolean;
+              updated?: Array<{ offerId: string; newNumber: string }>;
+              failed?: Array<{ offerId: string; error: string }>;
+            };
+            if (!cancelled && syncRes?.failed?.length) {
+              setSyncError(syncRes.failed[0]?.error ?? "Nie udało się zsynchronizować numerów");
+            }
+          } finally {
+            if (!cancelled) setSyncingNumbers(false);
+          }
         }
         const r = (await api("planlux:getOffersCrm", userId, activeTab, searchQuery)) as {
           ok: boolean;
@@ -65,8 +80,11 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
         if (cancelled) return;
         if (r.ok && r.offers) setOffers(r.offers);
         else setOffers([]);
-      } catch {
-        if (!cancelled) setOffers([]);
+      } catch (e) {
+        if (!cancelled) {
+          setOffers([]);
+          setSyncError(e instanceof Error ? e.message : String(e));
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -118,6 +136,16 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
 
   return (
     <Box>
+      <Snackbar
+        open={!!syncError}
+        autoHideDuration={5000}
+        onClose={() => setSyncError(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setSyncError(null)}>
+          {syncError}
+        </Alert>
+      </Snackbar>
       <Typography variant="h5" sx={{ mb: 2 }}>
         Oferty
       </Typography>
@@ -134,7 +162,9 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
         ))}
       </Tabs>
       {loading ? (
-        <Typography color="text.secondary">Ładowanie...</Typography>
+        <Typography color="text.secondary">
+          {syncingNumbers ? "Rezerwuję numery…" : "Ładowanie…"}
+        </Typography>
       ) : offers.length === 0 ? (
         <Typography color="text.secondary">Brak ofert.</Typography>
       ) : (
@@ -155,8 +185,8 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
                 <TableCell>{clientDisplay(o)}</TableCell>
                 <TableCell>
                   {o.offerNumber}
-                  {o.offerNumber.startsWith("TEMP-") && online && (
-                    <Chip label="Synchronizuję numer…" size="small" sx={{ ml: 1 }} color="warning" variant="outlined" />
+                  {o.offerNumber.startsWith("TEMP-") && syncingNumbers && (
+                    <Chip label="Rezerwuję numer…" size="small" sx={{ ml: 1 }} color="warning" variant="outlined" />
                   )}
                 </TableCell>
                 <TableCell>

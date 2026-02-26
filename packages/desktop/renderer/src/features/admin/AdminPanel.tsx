@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Box,
   Typography,
@@ -66,7 +66,7 @@ export function AdminPanel({ api, currentUser }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: "success" | "error" | "info" }>({ open: false, message: "", severity: "info" });
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
       const r = (await api("planlux:getUsers")) as { ok: boolean; users?: UserRow[] };
@@ -78,11 +78,11 @@ export function AdminPanel({ api, currentUser }: Props) {
     } finally {
       setLoading(false);
     }
-  };
+  }, [api]);
 
   useEffect(() => {
     loadUsers();
-  }, [api]);
+  }, [loadUsers]);
 
   const loadActivity = async () => {
     try {

@@ -1,13 +1,13 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { ThemeProvider } from "@mui/material/styles";
-import { CssBaseline, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button } from "@mui/material";
+import { CssBaseline, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button, Snackbar, Alert } from "@mui/material";
 import { planluxTheme } from "../theme/planluxTheme";
 
 const INACTIVITY_MS = 30 * 60 * 1000; // 30 min
 const REMINDER_BEFORE_MS = 2 * 60 * 1000; // przypomnienie 2 min przed wylogowaniem
 import { LoginScreen } from "../features/auth/LoginScreen";
 import { MainLayout } from "../features/layout/MainLayout";
-import { offerDraftStore } from "../state/offerDraftStore";
+import { offerDraftStore, setSyncErrorHandler } from "../state/offerDraftStore";
 import "../theme/global.css";
 
 declare global {
@@ -38,6 +38,7 @@ export default function App() {
   const [inProgressCount, setInProgressCount] = useState(0);
   const [reminderOpen, setReminderOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{ version: string; downloaded?: boolean } | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const lastActivityRef = useRef(Date.now());
   const reminderTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -50,7 +51,7 @@ export default function App() {
     throw new Error(r.error ?? "Login failed");
   };
 
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     setReminderOpen(false);
     if (reminderTimeoutRef.current) {
       clearTimeout(reminderTimeoutRef.current);
@@ -60,7 +61,7 @@ export default function App() {
       await api("planlux:endSession");
     } catch (_) {}
     setUser(null);
-  };
+  }, []);
 
   const handleReminderStay = () => {
     lastActivityRef.current = Date.now();
@@ -98,6 +99,11 @@ export default function App() {
     })();
     return () => { cancelled = true; };
   }, [user?.id]);
+
+  useEffect(() => {
+    setSyncErrorHandler((msg) => setSyncError(msg));
+    return () => setSyncErrorHandler(null);
+  }, []);
 
   useEffect(() => {
     window.__planlux_userId = user?.id ?? "";
@@ -146,7 +152,7 @@ export default function App() {
         clearTimeout(reminderTimeoutRef.current);
       }
     };
-  }, [reminderOpen, user]);
+  }, [reminderOpen, user, handleLogout]);
 
   if (loading) {
     return (
@@ -212,6 +218,16 @@ export default function App() {
           )}
         </DialogActions>
       </Dialog>
+      <Snackbar
+        open={!!syncError}
+        autoHideDuration={5000}
+        onClose={() => setSyncError(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setSyncError(null)}>
+          {syncError}
+        </Alert>
+      </Snackbar>
       <Dialog open={reminderOpen} onClose={handleReminderStay}>
         <DialogTitle>Czy nadal jesteś aktywny?</DialogTitle>
         <DialogContent>

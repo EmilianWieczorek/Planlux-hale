@@ -2,10 +2,10 @@ import { useSyncExternalStore } from "react";
 import { offerDraftStore } from "./offerDraftStore";
 
 export function useOfferDraft() {
-  const state = useSyncExternalStore(
+  const snapshot = useSyncExternalStore(
     offerDraftStore.subscribe,
-    () => offerDraftStore.getState(),
-    () => offerDraftStore.getState()
+    offerDraftStore.getSnapshot,
+    offerDraftStore.getSnapshot
   );
-  return { ...state, actions: offerDraftStore };
+  return { ...snapshot, actions: offerDraftStore };
 }

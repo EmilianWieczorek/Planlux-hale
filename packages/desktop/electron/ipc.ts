@@ -849,7 +849,31 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** Tworzy ofertę: rezerwuje numer (PLX lub TEMP offline), wstawia do offers_crm. Jedyne miejsce tworzenia nowej oferty. */
+  /** Ping backendu przed reserveOfferNumber. Jedyny sposób określenia online. */
+  async function checkOnline(): Promise<boolean> {
+    try {
+      const { config } = await import("../src/config");
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const res = await fetch(config.backend.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "health" }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        return res.ok || res.status < 500;
+      } catch {
+        clearTimeout(timeout);
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /** Tworzy ofertę: rezerwuje numer (PLX online / TEMP offline), wstawia do offers_crm. Jedyne miejsce generowania offer_number. */
   ipcMain.handle("planlux:createOffer", async (_, userId: string, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
     try {
       const numRes = await (async () => {
@@ -857,20 +881,24 @@ export function   registerIpcHandlers(deps: {
         const row = db.prepare("SELECT display_name FROM users WHERE id = ? AND active = 1").get(userId) as { display_name: string | null } | undefined;
         const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined } : null);
         const year = new Date().getFullYear();
-        try {
-          const reqId = uuid();
-          const res = await apiClient.reserveOfferNumber({
-            id: reqId,
-            idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
-            userId,
-            initial,
-            year,
-          });
-          if (res?.ok && res?.offerNumber) {
-            return { ok: true, offerNumber: res.offerNumber, isTemp: false };
+        const online = await checkOnline();
+        if (online) {
+          try {
+            const reqId = uuid();
+            const res = await apiClient.reserveOfferNumber({
+              id: reqId,
+              idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
+              userId,
+              initial,
+              year,
+            });
+            if (res?.ok && res?.offerNumber && !res.offerNumber.startsWith("TEMP-")) {
+              return { ok: true, offerNumber: res.offerNumber, isTemp: false };
+            }
+            logger.warn("[offer] reserveOfferNumber zwrócił niepoprawny wynik", res);
+          } catch (e) {
+            logger.warn("[offer] reserveOfferNumber failed", e);
           }
-        } catch {
-          /* offline */
         }
         const { getDeviceId } = await import("./deviceId");
         const deviceId = getDeviceId();
@@ -917,7 +945,7 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** Auto-numer oferty: online reserveNumber lub offline TEMP-<deviceId>-<ts> lub lokalny licznik. */
+  /** Auto-numer oferty: online reserveNumber (po ping) lub offline TEMP-<deviceId>-<ts>. */
   ipcMain.handle("planlux:getNextOfferNumber", async (_, userId: string) => {
     try {
       const db = getDb();
@@ -926,24 +954,24 @@ export function   registerIpcHandlers(deps: {
         | undefined;
       const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined } : null);
       const year = new Date().getFullYear();
-
-      try {
-        const reqId = uuid();
-        const res = await apiClient.reserveOfferNumber({
-          id: reqId,
-          idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
-          userId,
-          initial,
-          year,
-        });
-        if (res?.ok && res?.offerNumber) {
-          logger.info("[offer] reserveNumber ok", { offerNumber: res.offerNumber });
-          return { ok: true, offerNumber: res.offerNumber };
+      if (await checkOnline()) {
+        try {
+          const reqId = uuid();
+          const res = await apiClient.reserveOfferNumber({
+            id: reqId,
+            idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
+            userId,
+            initial,
+            year,
+          });
+          if (res?.ok && res?.offerNumber && !res.offerNumber.startsWith("TEMP-")) {
+            logger.info("[offer] reserveNumber ok", { offerNumber: res.offerNumber });
+            return { ok: true, offerNumber: res.offerNumber };
+          }
+        } catch (e) {
+          logger.warn("[offer] reserveNumber failed, using TEMP fallback", e);
         }
-      } catch (e) {
-        logger.warn("[offer] reserveNumber failed, using fallback", e);
       }
-
       const { getDeviceId } = await import("./deviceId");
       const deviceId = getDeviceId();
       const tempNumber = `TEMP-${deviceId}-${Date.now()}`;
@@ -1015,33 +1043,36 @@ export function   registerIpcHandlers(deps: {
               clientLastName = parts.slice(1).join(" ") ?? "";
             }
             const nowIso = new Date().toISOString();
-            db.prepare(
-              `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
-               VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET
-                 offer_number=excluded.offer_number,
-                 client_first_name=excluded.client_first_name, client_last_name=excluded.client_last_name, company_name=excluded.company_name,
-                 nip=excluded.nip, phone=excluded.phone, email=excluded.email, variant_hali=excluded.variant_hali,
-                 width_m=excluded.width_m, length_m=excluded.length_m, height_m=excluded.height_m, area_m2=excluded.area_m2,
-                 updated_at=excluded.updated_at`
-            ).run(
-              offerId,
-              offerNumber,
-              userId.trim(),
-              clientFirstName,
-              clientLastName,
-              companyName,
-              d.clientNip ?? "",
-              d.clientPhone ?? "",
-              d.clientEmail ?? "",
-              d.variantHali ?? "T18_T35_DACH",
-              w,
-              l,
-              h,
-              areaM2,
-              nowIso,
-              nowIso
-            );
+            if (existing) {
+              db.prepare(
+                `UPDATE offers_crm SET
+                  client_first_name=?, client_last_name=?, company_name=?, nip=?, phone=?, email=?, variant_hali=?,
+                  width_m=?, length_m=?, height_m=?, area_m2=?, updated_at=?
+                  WHERE id=?`
+              ).run(clientFirstName, clientLastName, companyName, d.clientNip ?? "", d.clientPhone ?? "", d.clientEmail ?? "", d.variantHali ?? "T18_T35_DACH", w, l, h, areaM2, nowIso, offerId);
+            } else {
+              db.prepare(
+                `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+                 VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
+              ).run(
+                offerId,
+                offerNumber,
+                userId.trim(),
+                clientFirstName,
+                clientLastName,
+                companyName,
+                d.clientNip ?? "",
+                d.clientPhone ?? "",
+                d.clientEmail ?? "",
+                d.variantHali ?? "T18_T35_DACH",
+                w,
+                l,
+                h,
+                areaM2,
+                nowIso,
+                nowIso
+              );
+            }
             const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
             if (auditTables.length > 0) {
               const auditType = existing ? "UPDATE_DRAFT" : "CREATE_DRAFT";
@@ -1053,38 +1084,7 @@ export function   registerIpcHandlers(deps: {
                 JSON.stringify({ clientName, widthM: w, lengthM: l })
               );
             }
-
-            let syncedOfferNumber: string | undefined;
-            if (offerNumber.startsWith("TEMP-")) {
-              try {
-                const { config } = await import("../src/config");
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 5000);
-                let online = false;
-                try {
-                  await fetch(config.backend.url, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ action: "health" }),
-                    signal: controller.signal,
-                  });
-                  online = true;
-                } catch {
-                  /* offline */
-                } finally {
-                  clearTimeout(timeout);
-                }
-                if (online) {
-                  const syncRes = await doSyncTempOfferNumbers();
-                  const u = syncRes.updated?.find((x) => x.offerId === offerId);
-                  if (u) syncedOfferNumber = u.newNumber;
-                }
-              } catch (e) {
-                logger.warn("[draft] syncTempOfferNumbers po zapisie nie powiódł się", e);
-              }
-            }
-
-            return { ok: true, syncedOfferNumber };
+            return { ok: true };
           }
         } catch (e) {
           logger.warn("[crm] saveOfferDraft to offers_crm skipped", e);

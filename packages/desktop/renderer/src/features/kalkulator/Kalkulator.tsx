@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useOfferDraft } from "../../state/useOfferDraft";
-import { buildPayloadFromDraft, offerDraftStore, type OfferStatus } from "../../state/offerDraftStore";
+import { buildPayloadFromDraft, offerDraftStore, requestSyncTempNumbers, type OfferStatus } from "../../state/offerDraftStore";
 import { buildPdfFileName as buildPdfFileNameFromShared } from "@planlux/shared";
 
 /** Bezpieczne wywołanie – fallback gdy import nie zadziała (np. cache Vite). */
@@ -175,43 +175,17 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   edycjaPdfExpandedRef.current = edycjaPdfExpanded;
   generatingRef.current = generating;
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3000);
-  };
+  }, []);
 
-  /** Sync TEMP→PLX w tle (nie blokuje UI). */
+  /** Sync TEMP→PLX (używa store – pokazuje badge „Rezerwuję numer…”, Snackbar przy błędzie). */
   const runSyncOfferNumber = useCallback(async () => {
-    const offerId = draft.draftId;
-    const offerNumber = draft.offerNumber ?? "";
-    console.log("[KALK] SAVE -> isOnline? offerNumber =", offerNumber);
-    const onlineRes = (await api("planlux:isOnline")) as { online?: boolean };
-    const isOnline = onlineRes?.online ?? false;
-    console.log("[KALK] isOnline =", isOnline, "offerNumber =", offerNumber);
-    if (!isOnline || !offerNumber.startsWith("TEMP-")) return;
-    try {
-      console.log("[KALK] calling syncTempOfferNumbers...");
-      const res = (await api("planlux:syncTempOfferNumbers")) as {
-        ok?: boolean;
-        updated?: Array<{ offerId: string; oldNumber: string; newNumber: string }>;
-        failed?: Array<{ offerId: string; error: string }>;
-      };
-      console.log("[KALK] syncTempOfferNumbers result:", res);
-      const refreshed = (await api("planlux:getOfferDetails", offerId, userId)) as { ok?: boolean; offer?: { offerNumber?: string } };
-      console.log("[KALK] refreshed offerNumber:", refreshed?.offer?.offerNumber);
-      const newNum = refreshed?.offer?.offerNumber;
-      if (newNum && !newNum.startsWith("TEMP-")) {
-        actions.setOfferNumber(newNum);
-        showToast(`Numer zsynchronizowany: ${newNum}`);
-      } else if (res?.failed?.length) {
-        showToast("Nie udało się zsynchronizować numeru oferty (zostaje TEMP).");
-        console.error("[KALK] syncTempOfferNumbers failed", res.failed);
-      }
-    } catch (e) {
-      console.error("[KALK] syncTempOfferNumbers failed", e);
-      showToast("Nie udało się zsynchronizować numeru oferty (zostaje TEMP).");
-    }
-  }, [api, userId, draft.draftId, draft.offerNumber, actions, showToast]);
+    if (!draft.offerNumber?.startsWith("TEMP-")) return;
+    const newNum = await requestSyncTempNumbers();
+    if (newNum) showToast(`Numer zsynchronizowany: ${newNum}`);
+  }, [showToast]);
 
   const loadPricing = useCallback(async () => {
     const r = (await api("planlux:getPricingCache")) as {
@@ -704,7 +678,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           <AccordionDetails>
             <label style={styles.label}>Numer oferty</label>
             <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center", flexWrap: "wrap" }}>
-              {draft.offerNumber?.startsWith("TEMP-") && online && (
+              {(draft as { syncingOfferNumber?: boolean }).syncingOfferNumber && (
                 <span style={{ fontSize: 11, color: tokens.color.warning, marginRight: 4 }}>Rezerwuję numer…</span>
               )}
               {draft.offerNumberLocked && (

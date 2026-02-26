@@ -92,25 +92,95 @@ function createEmptyDraft(): OfferDraft {
 }
 
 let state: OfferDraft = createEmptyDraft();
+let syncingOfferNumber = false;
 const listeners = new Set<() => void>();
+
+/** Cached snapshot for useSyncExternalStore – only updated when state/syncingOfferNumber changes. */
+export type OfferDraftSnapshot = OfferDraft & { syncingOfferNumber: boolean };
+let cachedSnapshot: OfferDraftSnapshot = { ...state, syncingOfferNumber };
+
+function refreshCachedSnapshot() {
+  cachedSnapshot = { ...state, syncingOfferNumber };
+}
 let saveTimeout: ReturnType<typeof setTimeout> | null = null;
 const DEBOUNCE_MS = 10_000;
+let syncErrorHandler: ((msg: string) => void) | null = null;
+
+export function setSyncErrorHandler(fn: ((msg: string) => void) | null) {
+  syncErrorHandler = fn;
+}
+
+/** Wywołaj sync TEMP→PLX (np. po powrocie online). Ustawia badge, aktualizuje numer. Zwraca nowy numer lub undefined. */
+export function requestSyncTempNumbers(): Promise<string | undefined> {
+  const invoke = (window as unknown as { planlux?: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).planlux?.invoke;
+  if (!invoke || !state.offerNumber?.startsWith("TEMP-")) return Promise.resolve(undefined);
+  setSyncingOfferNumber(true);
+  return invoke("planlux:isOnline")
+    .then((res: unknown) => (res as { online?: boolean })?.online)
+    .then(async (online) => {
+      if (!online) return undefined;
+      const syncRes = (await invoke("planlux:syncTempOfferNumbers")) as {
+        updated?: Array<{ offerId: string; newNumber: string }>;
+        failed?: Array<{ offerId: string; error: string }>;
+      };
+      const u = syncRes?.updated?.find((x) => x.offerId === state.draftId);
+      if (u?.newNumber) {
+        state = { ...state, offerNumber: u.newNumber, updatedAt: new Date().toISOString() };
+        refreshCachedSnapshot();
+        notify();
+        return u.newNumber;
+      }
+      if (syncRes?.failed?.length) {
+        syncErrorHandler?.(syncRes.failed.find((f) => f.offerId === state.draftId)?.error ?? syncRes.failed[0]?.error ?? "Błąd sync");
+      }
+      return undefined;
+    })
+    .finally(() => setSyncingOfferNumber(false));
+}
+
+function setSyncingOfferNumber(v: boolean) {
+  if (syncingOfferNumber !== v) {
+    syncingOfferNumber = v;
+    refreshCachedSnapshot();
+    notify();
+  }
+}
 
 function saveToBackend(): Promise<void> {
   const invoke = (window as unknown as { planlux?: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).planlux?.invoke;
   const userId = (window as unknown as { __planlux_userId?: string }).__planlux_userId ?? "";
-  if (invoke) {
-    return invoke("planlux:saveOfferDraft", state, userId)
-      .then((res: unknown) => {
-        const r = res as { ok?: boolean; syncedOfferNumber?: string };
-        if (r?.ok && r?.syncedOfferNumber) {
-          state = { ...state, offerNumber: r.syncedOfferNumber, updatedAt: new Date().toISOString() };
+  if (!invoke) return Promise.resolve();
+  return invoke("planlux:saveOfferDraft", state, userId)
+    .then(async (res: unknown) => {
+      const r = res as { ok?: boolean };
+      if (!r?.ok) return;
+      const offerNum = state.offerNumber ?? "";
+      if (!offerNum.startsWith("TEMP-")) return;
+      const onlineRes = (await invoke("planlux:isOnline")) as { online?: boolean };
+      if (!onlineRes?.online) return;
+      setSyncingOfferNumber(true);
+      try {
+        const syncRes = (await invoke("planlux:syncTempOfferNumbers")) as {
+          ok?: boolean;
+          updated?: Array<{ offerId: string; oldNumber: string; newNumber: string }>;
+          failed?: Array<{ offerId: string; error: string }>;
+        };
+        const u = syncRes?.updated?.find((x) => x.offerId === state.draftId);
+        if (u?.newNumber) {
+          state = { ...state, offerNumber: u.newNumber, updatedAt: new Date().toISOString() };
+          refreshCachedSnapshot();
           notify();
+        } else if (syncRes?.failed?.some((f) => f.offerId === state.draftId) || (syncRes?.failed?.length ?? 0) > 0) {
+          const err = syncRes.failed?.find((f) => f.offerId === state.draftId)?.error ?? syncRes.failed?.[0]?.error ?? "Nie udało się zsynchronizować numeru";
+          syncErrorHandler?.(err);
         }
-      })
-      .catch(() => {}) as Promise<void>;
-  }
-  return Promise.resolve();
+      } catch (e) {
+        syncErrorHandler?.(e instanceof Error ? e.message : String(e));
+      } finally {
+        setSyncingOfferNumber(false);
+      }
+    })
+    .catch(() => {}) as Promise<void>;
 }
 
 function scheduleSave() {
@@ -136,12 +206,19 @@ function notify() {
 
 function setState(updater: (prev: OfferDraft) => OfferDraft) {
   state = { ...updater(state), updatedAt: new Date().toISOString() };
+  refreshCachedSnapshot();
   scheduleSave();
   notify();
 }
 
+function getSnapshot(): OfferDraftSnapshot {
+  return cachedSnapshot;
+}
+
 export const offerDraftStore = {
   getState: () => state,
+  getSyncingOfferNumber: () => syncingOfferNumber,
+  getSnapshot,
   flushSave,
 
   subscribe: (listener: () => void) => {
@@ -250,12 +327,14 @@ export const offerDraftStore = {
       emailHistory: loaded.emailHistory ?? state.emailHistory,
       updatedAt: state.updatedAt,
     };
+    refreshCachedSnapshot();
     notify();
   },
 
   /** Reset global */
   resetGlobal: () => {
     state = createEmptyDraft();
+    refreshCachedSnapshot();
     saveToBackend();
     notify();
   },

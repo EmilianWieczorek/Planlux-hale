@@ -3,10 +3,15 @@
   "version": "1.0.0",
   "description": "Planlux Hale – kalkulator i CRM ofert hal stalowych",
   "author": "Planlux",
-  "repository": { "type": "git", "url": "https://github.com/planlux/planlux-hale.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/planlux/planlux-hale.git"
+  },
   "main": "dist/electron/main.js",
   "scripts": {
     "build": "npm run build -w @planlux/shared && vite build && tsc && npm run copy:assets",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:pdf": "electron . --test-pdf",
     "copy:assets": "node -e \"var fs=require('fs'),path=require('path');var s=path.join('assets');var t=path.join('dist','assets');if(fs.existsSync(s)){try{fs.mkdirSync(path.dirname(t),{recursive:true});fs.cpSync(s,t,{recursive:true});}catch(e){console.warn('Copy assets:',e.message);}}\"",
     "build:renderer": "vite build",
@@ -25,25 +30,29 @@
     "@mui/material": "^7.0.0",
     "@planlux/shared": "1.0.0",
     "better-sqlite3": "^9.2.2",
+    "electron-updater": "^6.3.0",
     "nodemailer": "^8.0.1",
     "pdfjs-dist": "^4.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "recharts": "^3.7.0",
-    "electron-updater": "^6.3.0"
+    "recharts": "^3.7.0"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/better-sqlite3": "^7.6.8",
     "@types/node": "^20.10.0",
     "@types/nodemailer": "^7.0.11",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.1",
+    "@vitest/ui": "^4.0.18",
     "electron": "^28.0.0",
     "electron-builder": "^26.8.1",
+    "jsdom": "^28.1.0",
     "rimraf": "^5.0.0",
     "typescript": "^5.3.0",
-    "vite": "^5.0.0"
+    "vite": "^5.0.0",
+    "vitest": "^4.0.18"
   }
 }
-
