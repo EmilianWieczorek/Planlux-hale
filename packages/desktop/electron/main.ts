@@ -34,39 +34,55 @@ function runMigrations(database: ReturnType<typeof Database>) {
   const migrations = [
     "ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
   ];
-  // users: rozszerzenie role o SALESPERSON, MANAGER (recreate table)
+  // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON)
   try {
-    const info = database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
-    const hasRole = info.some((c) => c.name === "role");
-    if (hasRole) {
-      database.exec(`
-        CREATE TABLE users_new (
-          id TEXT PRIMARY KEY,
-          email TEXT NOT NULL UNIQUE,
-          password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER', 'BOSS')),
-          display_name TEXT,
-          active INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        INSERT INTO users_new (id, email, password_hash, role, display_name, active, created_at, updated_at)
-        SELECT id, email, password_hash, CASE WHEN role = 'USER' THEN 'SALESPERSON' ELSE role END, display_name, COALESCE(active, 1), created_at, updated_at FROM users;
-        DROP TABLE users;
-        ALTER TABLE users_new RENAME TO users;
-        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-        CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-      `);
-      logger.info("[migration] users table recreated with SALESPERSON, MANAGER roles");
+    database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
+    const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_roles_3");
+    const usersExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get() as { name?: string } | undefined)?.name === "users";
+    if (!done && usersExists) {
+      logger.info("[migration] users_roles_3 START");
+      const sqlRow = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as { sql: string } | undefined;
+      const sqlDef = (sqlRow?.sql ?? "").toUpperCase();
+      const needsRebuild = sqlDef.includes("('USER','ADMIN')") || sqlDef.includes("('USER', 'ADMIN')") || !sqlDef.includes("BOSS") || !sqlDef.includes("SALESPERSON");
+      if (needsRebuild) {
+        database.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('ADMIN','BOSS','SALESPERSON')),
+            display_name TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+          INSERT INTO users_new (id, email, password_hash, role, display_name, active, created_at, updated_at)
+          SELECT id, email, password_hash,
+            CASE role
+              WHEN 'USER' THEN 'SALESPERSON'
+              WHEN 'MANAGER' THEN 'BOSS'
+              WHEN 'BOSS' THEN 'BOSS'
+              WHEN 'SALESPERSON' THEN 'SALESPERSON'
+              WHEN 'ADMIN' THEN 'ADMIN'
+              ELSE 'SALESPERSON'
+            END,
+            display_name, COALESCE(active, 1), created_at, updated_at FROM users;
+          DROP TABLE users;
+          ALTER TABLE users_new RENAME TO users;
+          CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+          CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+        `);
+        database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_roles_3");
+        logger.info("[migration] users_roles_3 DONE");
+      } else {
+        database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_3");
+        logger.info("[migration] users_roles_3 SKIP (already has BOSS/SALESPERSON)");
+      }
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("already exists") || msg.includes("duplicate")) {
-      /* table already migrated */
-    } else {
-      logger.warn("[migration] users role migration skipped", e);
-    }
+    logger.warn("[migration] users_roles_3 failed", e);
   }
+
   for (const sql of migrations) {
     try {
       database.exec(sql);
@@ -129,41 +145,6 @@ function runMigrations(database: ReturnType<typeof Database>) {
   } catch (e) {
     logger.warn("[migration] offer_counters skipped", e);
   }
-  // Migration: add BOSS role to users (for existing DBs that have old CHECK)
-  try {
-    database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
-    const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_boss_role");
-    const usersExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get() as { name?: string } | undefined)?.name === "users";
-    if (!done && usersExists) {
-      database.exec(`
-        CREATE TABLE users_boss (
-          id TEXT PRIMARY KEY,
-          email TEXT NOT NULL UNIQUE,
-          password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER', 'BOSS')),
-          display_name TEXT,
-          active INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        INSERT INTO users_boss SELECT id, email, password_hash, role, display_name, active, created_at, updated_at FROM users;
-        DROP TABLE users;
-        ALTER TABLE users_boss RENAME TO users;
-        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-        CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-      `);
-      database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_boss_role");
-      logger.info("[migration] users: BOSS role added");
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("no such table") || msg.includes("already exists")) {
-      /* table may not exist yet or migration already applied */
-    } else {
-      logger.warn("[migration] users BOSS role skipped", e);
-    }
-  }
-
   const { runCrmMigrations } = require("./migrations/crmMigrations");
   runCrmMigrations(database, logger);
 }

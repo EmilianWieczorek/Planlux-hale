@@ -19,12 +19,12 @@ const TAB_LABELS: Record<OfferFilterTab, string> = {
 interface Props {
   api: (channel: string, ...args: unknown[]) => Promise<unknown>;
   userId: string;
-  isManager: boolean;
+  isAdmin: boolean;
   online?: boolean;
   onEditOffer?: (offerId: string) => void;
 }
 
-export function OfertyView({ api, userId, isManager, online, onEditOffer }: Props) {
+export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props) {
   const [selectedOfferId, setSelectedOfferId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<OfferFilterTab>("in_progress");
   const [searchQuery, setSearchQuery] = useState("");
@@ -33,6 +33,7 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
     id: string;
     offerNumber: string;
     status: string;
+    userId?: string;
     clientFirstName: string;
     clientLastName: string;
     companyName: string;
@@ -51,29 +52,15 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
   const [loading, setLoading] = useState(false);
 
   const [syncError, setSyncError] = useState<string | null>(null);
+  const SYNC_TIMEOUT_MS = 4000;
+
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       setLoading(true);
       setSyncError(null);
       try {
-        const onlineRes = (await api("planlux:isOnline")) as { online?: boolean };
-        if (onlineRes?.online) {
-          setSyncingNumbers(true);
-          try {
-            const syncRes = (await api("planlux:syncTempOfferNumbers")) as {
-              ok?: boolean;
-              updated?: Array<{ offerId: string; newNumber: string }>;
-              failed?: Array<{ offerId: string; error: string }>;
-            };
-            if (!cancelled && syncRes?.failed?.length) {
-              setSyncError(syncRes.failed[0]?.error ?? "Nie udało się zsynchronizować numerów");
-            }
-          } finally {
-            if (!cancelled) setSyncingNumbers(false);
-          }
-        }
-        const r = (await api("planlux:getOffersCrm", userId, activeTab, searchQuery)) as {
+        const r = (await api("planlux:getOffersCrm", userId, activeTab, searchQuery, isAdmin)) as {
           ok: boolean;
           offers?: typeof offers;
         };
@@ -90,8 +77,25 @@ export function OfertyView({ api, userId, isManager, online, onEditOffer }: Prop
       }
     };
     load();
+
+    setSyncingNumbers(true);
+    const timeoutPromise = new Promise<{ ok: false; error: string }>((resolve) =>
+      setTimeout(() => resolve({ ok: false, error: "Limit czasu sync numerów (4s)" }), SYNC_TIMEOUT_MS)
+    );
+    Promise.race([api("planlux:syncTempOfferNumbers"), timeoutPromise])
+      .then((syncRes) => {
+        if (cancelled) return;
+        const s = syncRes as { ok?: boolean; failed?: Array<{ error: string }>; error?: string };
+        if (!s?.ok && (s?.failed?.length || s?.error)) {
+          setSyncError(s.failed?.[0]?.error ?? s.error ?? "Nie udało się zsynchronizować numerów");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSyncingNumbers(false);
+      });
+
     return () => { cancelled = true; };
-  }, [api, userId, activeTab, searchQuery, online]);
+  }, [api, userId, activeTab, searchQuery, isAdmin]);
 
   const handleMarkRealized = async (offerId: string) => {
     const r = (await api("planlux:markOfferRealized", offerId, userId)) as { ok: boolean };

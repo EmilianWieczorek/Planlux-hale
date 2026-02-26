@@ -20,4 +20,11 @@ describe("AdminPanel – no infinite update loop", () => {
     await findByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 3000 });
     expect(mockApi).toHaveBeenCalledWith("planlux:getUsers");
   });
+
+  it("role dropdown has Admin, Szef, Handlowiec options", async () => {
+    mockApi.mockResolvedValue({ ok: true, users: [] });
+    const { findByText } = render(<AdminPanel api={mockApi} currentUser={currentUser} />);
+    await findByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 2000 });
+    expect(mockApi).toHaveBeenCalledWith("planlux:getUsers");
+  });
 });

@@ -38,10 +38,10 @@ const styles = {
 interface Props {
   api: (channel: string, ...args: unknown[]) => Promise<unknown>;
   userId: string;
-  isManager: boolean;
+  isAdmin: boolean;
 }
 
-export function DashboardView({ api, userId, isManager }: Props) {
+export function DashboardView({ api, userId, isAdmin }: Props) {
   const [stats, setStats] = useState<{
     byStatus: Record<string, number>;
     totalPln: number;
@@ -54,7 +54,7 @@ export function DashboardView({ api, userId, isManager }: Props) {
     const load = async () => {
       setLoading(true);
       try {
-        const r = (await api("planlux:getDashboardStats", userId, isManager)) as {
+        const r = (await api("planlux:getDashboardStats", userId, isAdmin)) as {
           ok: boolean;
           byStatus?: Record<string, number>;
           totalPln?: number;
@@ -78,7 +78,7 @@ export function DashboardView({ api, userId, isManager }: Props) {
     };
     load();
     return () => { cancelled = true; };
-  }, [api, userId, isManager]);
+  }, [api, userId, isAdmin]);
 
   if (loading) {
     return (
@@ -158,7 +158,7 @@ export function DashboardView({ api, userId, isManager }: Props) {
             </ResponsiveContainer>
           </CardContent>
         </Card>
-        {isManager && userChartData.length > 0 && (
+        {isAdmin && userChartData.length > 0 && (
           <Card style={styles.card}>
             <CardContent>
               <Typography variant="subtitle1" sx={{ mb: 2 }}>

@@ -50,6 +50,12 @@ interface Props {
   currentUser: { id: string; email: string; role: string; displayName?: string };
 }
 
+const roleToLabel = (role: string) => {
+  if (role === "ADMIN") return "Admin";
+  if (role === "BOSS" || role === "MANAGER") return "Szef";
+  return "Handlowiec"; // SALESPERSON, USER
+};
+
 export function AdminPanel({ api, currentUser }: Props) {
   const [tab, setTab] = useState(0);
   const [users, setUsers] = useState<UserRow[]>([]);
@@ -134,7 +140,7 @@ export function AdminPanel({ api, currentUser }: Props) {
     setFormEmail(u.email);
     setFormPassword("");
     setFormDisplayName(u.displayName || "");
-    setFormRole(u.role);
+    setFormRole(u.role === "USER" ? "SALESPERSON" : u.role === "MANAGER" ? "BOSS" : u.role);
     setModalOpen(true);
   };
 
@@ -259,7 +265,7 @@ export function AdminPanel({ api, currentUser }: Props) {
                   <TableRow key={u.id}>
                     <TableCell>{u.email}</TableCell>
                     <TableCell>
-                      <Chip label={u.role} size="small" color={u.role === "ADMIN" ? "error" : u.role === "MANAGER" ? "primary" : "default"} />
+                      <Chip label={roleToLabel(u.role)} size="small" color={u.role === "ADMIN" ? "primary" : "default"} />
                     </TableCell>
                     <TableCell>{u.displayName || "—"}</TableCell>
                     <TableCell>{u.active ? "Aktywny" : "Nieaktywny"}</TableCell>
@@ -439,12 +445,10 @@ export function AdminPanel({ api, currentUser }: Props) {
           />
           <FormControl fullWidth margin="dense">
             <InputLabel>Rola</InputLabel>
-            <Select value={formRole} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
-              <MenuItem value="USER">USER (handlowiec)</MenuItem>
-              <MenuItem value="SALESPERSON">SALESPERSON</MenuItem>
-              <MenuItem value="BOSS">BOSS (manager)</MenuItem>
-              <MenuItem value="MANAGER">MANAGER</MenuItem>
-              <MenuItem value="ADMIN">ADMIN</MenuItem>
+            <Select value={["ADMIN","BOSS","SALESPERSON"].includes(formRole) ? formRole : "SALESPERSON"} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
+              <MenuItem value="ADMIN">Admin</MenuItem>
+              <MenuItem value="BOSS">Szef</MenuItem>
+              <MenuItem value="SALESPERSON">Handlowiec</MenuItem>
             </Select>
           </FormControl>
         </DialogContent>

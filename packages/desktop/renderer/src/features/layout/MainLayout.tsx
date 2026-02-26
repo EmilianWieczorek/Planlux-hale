@@ -87,8 +87,8 @@ export function MainLayout({ user, onLogout, api }: Props) {
   const [outboxCount, setOutboxCount] = useState(0);
   const [clearDialog, setClearDialog] = useState<"global" | "editor" | null>(null);
 
-  const isAdmin = user.role === "ADMIN";
-  const isManager = user.role === "MANAGER" || isAdmin;
+  const isAdmin = user.role === "ADMIN"; // tylko ADMIN widzi Panel admina
+  const isBossOrAdmin = user.role === "ADMIN" || user.role === "BOSS"; // widok wszystkich ofert
 
   const handleClearGlobal = () => {
     offerDraftStore.resetGlobal();
@@ -178,7 +178,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
       />
       <main style={styles.content}>
         {tab === "dashboard" && (
-          <DashboardView api={api} userId={user.id} isManager={isManager} />
+          <DashboardView api={api} userId={user.id} isAdmin={isBossOrAdmin} />
         )}
         {tab === "kalkulator" && (
           <Kalkulator
@@ -197,7 +197,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
           <OfertyView
             api={api}
             userId={user.id}
-            isManager={isManager}
+            isAdmin={isBossOrAdmin}
             online={online}
             onEditOffer={async (offerId) => {
               handleTabChange("kalkulator");

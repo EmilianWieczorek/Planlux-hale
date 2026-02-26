@@ -8,7 +8,7 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: [path.resolve(__dirname, "renderer/src/test/setup.ts")],
-    include: ["renderer/src/**/*.test.{ts,tsx}"],
+    include: ["renderer/src/**/*.test.{ts,tsx}", "electron/**/*.test.ts"],
     testTimeout: 5000,
   },
   resolve: {

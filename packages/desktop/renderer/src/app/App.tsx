@@ -91,7 +91,7 @@ export default function App() {
     (async () => {
       const [draftRes, offersRes] = await Promise.all([
         api("planlux:loadOfferDraft") as Promise<{ ok: boolean; draft?: unknown }>,
-        api("planlux:getOffersCrm", user.id, "in_progress", "") as Promise<{ ok: boolean; offers?: unknown[] }>,
+        api("planlux:getOffersCrm", user.id, "in_progress", "", user.role === "ADMIN" || user.role === "BOSS") as Promise<{ ok: boolean; offers?: unknown[] }>,
       ]);
       if (cancelled) return;
       if (draftRes.ok && draftRes.draft) offerDraftStore.hydrate(draftRes.draft as Parameters<typeof offerDraftStore.hydrate>[0]);

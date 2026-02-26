@@ -14,8 +14,20 @@ import { getPdfTemplateDir } from "./pdf/pdfPaths";
 import { createSendEmailForFlush } from "./smtpSend";
 import { createFilePdfTemplateConfigStore } from "./pdf/pdfTemplateConfigStore";
 import { getPreviewHtmlWithInlinedAssets } from "./pdf/renderTemplate";
+import { getNextOfferNumber as getNextOfferNumberLocal } from "./offerCounters";
 
 const SALT = "planlux-hale-v1";
+
+const ALLOWED_ROLES = ["ADMIN", "BOSS", "SALESPERSON"] as const;
+type AllowedRole = (typeof ALLOWED_ROLES)[number];
+
+function normalizeRole(input: string): AllowedRole {
+  const r = (input ?? "").trim().toUpperCase();
+  if (r === "ADMIN") return "ADMIN";
+  if (r === "BOSS" || r === "MANAGER" || r === "SZEF") return "BOSS";
+  if (r === "SALESPERSON" || r === "USER" || r === "HANDLOWIEC") return "SALESPERSON";
+  return "SALESPERSON";
+}
 
 function hashPassword(password: string): string {
   return crypto.scryptSync(password, SALT, 64).toString("hex");
@@ -30,39 +42,16 @@ function uuid(): string {
   return crypto.randomUUID();
 }
 
-/** Pierwsza litera imienia handlowca (firstName lub pierwsze słowo displayName). Fallback: X */
-function getSalesInitial(user: { displayName?: string; firstName?: string } | null | undefined): string {
+/** Pierwsza litera imienia handlowca. displayName → pierwsze słowo; fallback: pierwsza litera emaila; ostatecznie X */
+function getSalesInitial(user: { displayName?: string; firstName?: string; email?: string } | null | undefined): string {
   const name = (user?.firstName?.trim() || (user?.displayName?.trim().split(/\s+/)[0] ?? "")).trim();
-  if (!name) return "X";
-  const char = name.charAt(0);
-  return /[a-zA-Z]/.test(char) ? char.toUpperCase() : "X";
-}
-
-/** Generuje następny numer oferty PLX-{X}0001/{YYYY} (np. PLX-E0001/2026) w transakcji. */
-function getNextOfferNumber(
-  db: ReturnType<typeof import("better-sqlite3")>,
-  prefix: string,
-  year: number,
-  initial: string
-): string {
-  const id = `${prefix}-${year}`;
-  return db.transaction(() => {
-    const row = db.prepare("SELECT next_seq FROM offer_counters WHERE id = ?").get(id) as
-      | { next_seq: number }
-      | undefined;
-    if (!row) {
-      db.prepare(
-        "INSERT INTO offer_counters (id, prefix, year, next_seq, updated_at) VALUES (?, ?, ?, 2, datetime('now'))"
-      ).run(id, prefix, year);
-      return `PLX-${initial}0001/${year}`;
-    }
-    const seq = row.next_seq;
-    db.prepare("UPDATE offer_counters SET next_seq = next_seq + 1, updated_at = datetime('now') WHERE id = ?").run(
-      id
-    );
-    const seqStr = String(seq).padStart(4, "0");
-    return `PLX-${initial}${seqStr}/${year}`;
-  })();
+  if (name) {
+    const char = name.charAt(0);
+    if (/[a-zA-Z]/.test(char)) return char.toUpperCase();
+  }
+  const emailFirst = (user?.email ?? "").trim().charAt(0);
+  if (/[a-zA-Z0-9]/.test(emailFirst)) return emailFirst.toUpperCase();
+  return "X";
 }
 
 export function   registerIpcHandlers(deps: {
@@ -91,7 +80,7 @@ export function   registerIpcHandlers(deps: {
         user: {
           id: row.id,
           email: row.email,
-          role: row.role,
+          role: normalizeRole(row.role),
           displayName: row.display_name,
         },
         sessionId,
@@ -318,7 +307,7 @@ export function   registerIpcHandlers(deps: {
         users: rows.map((r) => ({
           id: r.id,
           email: r.email,
-          role: r.role,
+          role: normalizeRole(r.role),
           displayName: r.display_name ?? "",
           active: Boolean(r.active),
           createdAt: r.created_at ?? "",
@@ -346,8 +335,7 @@ export function   registerIpcHandlers(deps: {
       if (existing) return { ok: false, error: "Użytkownik z tym adresem email już istnieje" };
       const id = uuid();
       const hash = hashPassword(password);
-      const validRoles = ["ADMIN", "BOSS", "MANAGER", "USER", "SALESPERSON"];
-      const role = validRoles.includes(payload.role ?? "") ? payload.role! : "SALESPERSON";
+      const role = normalizeRole(payload.role ?? "SALESPERSON");
       const displayName = (payload.displayName ?? "").trim() || null;
       db.prepare(
         "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))"
@@ -384,9 +372,10 @@ export function   registerIpcHandlers(deps: {
         updates.push("display_name = ?");
         values.push((payload.displayName ?? "").trim() || null);
       }
-      if (payload.role !== undefined && ["ADMIN", "BOSS", "MANAGER", "USER", "SALESPERSON"].includes(payload.role)) {
+      if (payload.role !== undefined) {
+        const role = normalizeRole(payload.role);
         updates.push("role = ?");
-        values.push(payload.role);
+        values.push(role);
       }
       if (payload.password !== undefined && payload.password.length > 0) {
         if (payload.password.length < 4) return { ok: false, error: "Hasło musi mieć min. 4 znaki" };
@@ -873,32 +862,24 @@ export function   registerIpcHandlers(deps: {
     }
   }
 
-  /** Tworzy ofertę: rezerwuje numer (PLX online / TEMP offline), wstawia do offers_crm. Jedyne miejsce generowania offer_number. */
+  /** Tworzy ofertę: numer zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
   ipcMain.handle("planlux:createOffer", async (_, userId: string, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
     try {
       const numRes = await (async () => {
         const db = getDb();
-        const row = db.prepare("SELECT display_name FROM users WHERE id = ? AND active = 1").get(userId) as { display_name: string | null } | undefined;
-        const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined } : null);
+        const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(userId) as { display_name: string | null; email?: string } | undefined;
+        const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
         const year = new Date().getFullYear();
-        const online = await checkOnline();
-        if (online) {
-          try {
-            const reqId = uuid();
-            const res = await apiClient.reserveOfferNumber({
-              id: reqId,
-              idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
-              userId,
-              initial,
-              year,
-            });
-            if (res?.ok && res?.offerNumber && !res.offerNumber.startsWith("TEMP-")) {
-              return { ok: true, offerNumber: res.offerNumber, isTemp: false };
-            }
-            logger.warn("[offer] reserveOfferNumber zwrócił niepoprawny wynik", res);
-          } catch (e) {
-            logger.warn("[offer] reserveOfferNumber failed", e);
+        try {
+          const hasTable = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_counters'").get() as { name?: string } | undefined)?.name === "offer_counters";
+          if (hasTable) {
+            const plxNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
+            logger.info("[offer] createOffer local PLX", { offerNumber: plxNumber });
+            return { ok: true, offerNumber: plxNumber, isTemp: false };
           }
+          logger.warn("[offer] offer_counters table missing, using TEMP fallback");
+        } catch (e) {
+          logger.warn("[offer] offer_counters failed, using TEMP fallback", e);
         }
         const { getDeviceId } = await import("./deviceId");
         const deviceId = getDeviceId();
@@ -945,32 +926,25 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** Auto-numer oferty: online reserveNumber (po ping) lub offline TEMP-<deviceId>-<ts>. */
+  /** Auto-numer oferty: zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
   ipcMain.handle("planlux:getNextOfferNumber", async (_, userId: string) => {
     try {
       const db = getDb();
-      const row = db.prepare("SELECT display_name FROM users WHERE id = ? AND active = 1").get(userId) as
-        | { display_name: string | null }
+      const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(userId) as
+        | { display_name: string | null; email?: string }
         | undefined;
-      const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined } : null);
+      const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
       const year = new Date().getFullYear();
-      if (await checkOnline()) {
-        try {
-          const reqId = uuid();
-          const res = await apiClient.reserveOfferNumber({
-            id: reqId,
-            idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
-            userId,
-            initial,
-            year,
-          });
-          if (res?.ok && res?.offerNumber && !res.offerNumber.startsWith("TEMP-")) {
-            logger.info("[offer] reserveNumber ok", { offerNumber: res.offerNumber });
-            return { ok: true, offerNumber: res.offerNumber };
-          }
-        } catch (e) {
-          logger.warn("[offer] reserveNumber failed, using TEMP fallback", e);
+      try {
+        const hasTable = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_counters'").get() as { name?: string } | undefined)?.name === "offer_counters";
+        if (hasTable) {
+          const plxNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
+          logger.info("[offer] getNextOfferNumber local PLX", { offerNumber: plxNumber });
+          return { ok: true, offerNumber: plxNumber };
         }
+        logger.warn("[offer] offer_counters table missing, using TEMP fallback");
+      } catch (e) {
+        logger.warn("[offer] offer_counters failed, using TEMP fallback", e);
       }
       const { getDeviceId } = await import("./deviceId");
       const deviceId = getDeviceId();
@@ -1108,7 +1082,7 @@ export function   registerIpcHandlers(deps: {
   });
 
   /** Dashboard: statystyki ofert (per użytkownik lub globalne dla managera). */
-  ipcMain.handle("planlux:getDashboardStats", async (_, userId: string, isManager: boolean) => {
+  ipcMain.handle("planlux:getDashboardStats", async (_, userId: string, isAdmin: boolean) => {
     try {
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
@@ -1120,7 +1094,7 @@ export function   registerIpcHandlers(deps: {
           perUser: [],
         };
       }
-      const filterUser = isManager ? null : userId;
+      const filterUser = isAdmin ? null : userId;
       const where = filterUser ? "WHERE user_id = ?" : "";
       const args = filterUser ? [filterUser] : [];
 
@@ -1136,7 +1110,7 @@ export function   registerIpcHandlers(deps: {
         const s = (r.status ?? "IN_PROGRESS").toUpperCase();
         if (s in byStatus) byStatus[s]++;
         totalPln += Number(r.total_pln ?? 0) || 0;
-        if (isManager && r.user_id) {
+        if (isAdmin && r.user_id) {
           const u = userMap.get(r.user_id) ?? { count: 0, totalPln: 0 };
           u.count++;
           u.totalPln += Number(r.total_pln ?? 0) || 0;
@@ -1145,7 +1119,7 @@ export function   registerIpcHandlers(deps: {
       }
 
       let perUser: Array<{ userId: string; displayName: string; email: string; count: number; totalPln: number }> = [];
-      if (isManager && userMap.size > 0) {
+      if (isAdmin && userMap.size > 0) {
         const users = db.prepare("SELECT id, email, display_name FROM users WHERE active = 1").all() as Array<{ id: string; email: string; display_name: string }>;
         const userById = new Map(users.map((u) => [u.id, u]));
         perUser = Array.from(userMap.entries())
@@ -1175,21 +1149,25 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: lista ofert z offers_crm (filtrowanie po statusie, wyszukiwanie). */
-  ipcMain.handle("planlux:getOffersCrm", async (_, userId: string, statusFilter: string, searchQuery: string) => {
+  /** CRM: lista ofert z offers_crm. isAdmin=true → bez filtra user_id (Szef widzi wszystkie). */
+  ipcMain.handle("planlux:getOffersCrm", async (_, userId: string, statusFilter: string, searchQuery: string, isAdmin?: boolean) => {
     try {
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, offers: [] };
-      let sql = "SELECT id, offer_number, status, client_first_name, client_last_name, company_name, nip, phone, variant_hali, width_m, length_m, area_m2, total_pln, created_at, pdf_generated_at, emailed_at, realized_at FROM offers_crm WHERE user_id = ?";
-      const args: unknown[] = [userId];
+      let sql = "SELECT id, offer_number, status, user_id, client_first_name, client_last_name, company_name, nip, phone, variant_hali, width_m, length_m, area_m2, total_pln, created_at, pdf_generated_at, emailed_at, realized_at FROM offers_crm";
+      const args: unknown[] = [];
+      if (!isAdmin) {
+        sql += " WHERE user_id = ?";
+        args.push(userId);
+      }
       if (statusFilter !== "all") {
-        sql += " AND status = ?";
+        sql += (args.length > 0 ? " AND" : " WHERE") + " status = ?";
         args.push(statusFilter.toUpperCase());
       }
       if (searchQuery?.trim()) {
         const q = `%${searchQuery.trim()}%`;
-        sql += " AND (offer_number LIKE ? OR client_first_name LIKE ? OR client_last_name LIKE ? OR company_name LIKE ? OR nip LIKE ? OR phone LIKE ?)";
+        sql += (args.length > 0 ? " AND" : " WHERE") + " (offer_number LIKE ? OR client_first_name LIKE ? OR client_last_name LIKE ? OR company_name LIKE ? OR nip LIKE ? OR phone LIKE ?)";
         args.push(q, q, q, q, q, q);
       }
       sql += " ORDER BY created_at DESC LIMIT 200";
@@ -1198,6 +1176,7 @@ export function   registerIpcHandlers(deps: {
         id: r.id,
         offerNumber: r.offer_number,
         status: r.status,
+        userId: r.user_id ?? "",
         clientFirstName: r.client_first_name ?? "",
         clientLastName: r.client_last_name ?? "",
         companyName: r.company_name ?? "",
@@ -1333,13 +1312,22 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: szczegóły oferty (pełne dane). */
+  const ROLES_SEE_ALL = ["ADMIN", "BOSS"];
+
+  function canAccessOffer(db: ReturnType<typeof getDb>, offerId: string, userId: string): boolean {
+    const offer = db.prepare("SELECT user_id FROM offers_crm WHERE id = ?").get(offerId) as { user_id: string } | undefined;
+    if (!offer) return false;
+    if (offer.user_id === userId) return true;
+    const user = db.prepare("SELECT role FROM users WHERE id = ? AND active = 1").get(userId) as { role: string } | undefined;
+    return !!user && ROLES_SEE_ALL.includes(user.role);
+  }
+
+  /** CRM: szczegóły oferty (pełne dane). Owner lub manager/admin ma dostęp. */
   ipcMain.handle("planlux:getOfferDetails", async (_, offerId: string, userId: string) => {
     try {
       const db = getDb();
-      const row = db.prepare(
-        "SELECT * FROM offers_crm WHERE id = ? AND user_id = ?"
-      ).get(offerId, userId) as Record<string, unknown> | undefined;
+      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", offer: null };
+      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
       if (!row) return { ok: false, error: "Oferta nie znaleziona", offer: null };
       const offer = {
         id: row.id,
@@ -1378,12 +1366,11 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: audit trail oferty (offer_audit + event_log). */
+  /** CRM: audit trail oferty (offer_audit + event_log). Owner lub manager/admin ma dostęp. */
   ipcMain.handle("planlux:getOfferAudit", async (_, offerId: string, userId: string) => {
     try {
       const db = getDb();
-      const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ? AND user_id = ?").get(offerId, userId);
-      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona", items: [] };
+      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", items: [] };
       const auditRows = db.prepare(
         "SELECT id, offer_id, user_id, type, payload_json, created_at FROM offer_audit WHERE offer_id = ? ORDER BY created_at ASC"
       ).all(offerId) as Array<{ id: string; type: string; payload_json: string; created_at: string }>;
@@ -1401,12 +1388,11 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: historia e-maili dla oferty. */
+  /** CRM: historia e-maili dla oferty. Owner lub manager/admin ma dostęp. */
   ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string, userId: string) => {
     try {
       const db = getDb();
-      const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ? AND user_id = ?").get(offerId, userId);
-      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
+      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, emails: [] };
       const rows = db.prepare(
@@ -1431,12 +1417,11 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: pliki PDF powiązane z ofertą (z event_log). */
+  /** CRM: pliki PDF powiązane z ofertą (z event_log). Owner lub manager/admin ma dostęp. */
   ipcMain.handle("planlux:getPdfsForOffer", async (_, offerId: string, userId: string) => {
     try {
       const db = getDb();
-      const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ? AND user_id = ?").get(offerId, userId);
-      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
+      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
       const eventRows = db.prepare(
         "SELECT details_json FROM event_log WHERE offer_id = ? AND event_type = 'OFFER_CREATED'"
       ).all(offerId) as Array<{ details_json: string }>;
@@ -1486,7 +1471,7 @@ export function   registerIpcHandlers(deps: {
     const updated: Array<{ offerId: string; oldNumber: string; newNumber: string }> = [];
     const failed: Array<{ offerId: string; error: string }> = [];
     try {
-      log("START syncTempOfferNumbers");
+      log("START syncTempOfferNumbers (lokalnie, bez backendu)");
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) {
@@ -1497,38 +1482,27 @@ export function   registerIpcHandlers(deps: {
         "SELECT id, offer_number, user_id FROM offers_crm WHERE offer_number LIKE 'TEMP-%'"
       ).all() as Array<{ id: string; offer_number: string; user_id: string }>;
       log("found TEMP offers count", tempRows.length);
+      const hasCountersTable = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_counters'").get() as { name?: string } | undefined)?.name === "offer_counters";
+      if (!hasCountersTable) {
+        log("brak tabeli offer_counters, pomijam sync");
+        return { ok: true, syncedCount: 0, updated, failed };
+      }
       for (const row of tempRows) {
         log("processing offerId", { offerId: row.id, tempNumber: row.offer_number });
         try {
-          const userRow = db.prepare("SELECT display_name FROM users WHERE id = ? AND active = 1").get(row.user_id) as { display_name: string | null } | undefined;
-          const initial = getSalesInitial(userRow ? { displayName: userRow.display_name ?? undefined } : null);
+          const userRow = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(row.user_id) as { display_name: string | null; email?: string } | undefined;
+          const initial = getSalesInitial(userRow ? { displayName: userRow.display_name ?? undefined, email: userRow.email } : null);
           const year = new Date().getFullYear();
-          const payload = {
-            id: uuid(),
-            idempotencyKey: `reserve-${row.user_id}-${year}-${Date.now()}`,
-            userId: row.user_id,
-            initial,
-            year,
-          };
-          log("reserveOfferNumber request payload", payload);
-          let res;
+          let newNumber: string;
           try {
-            res = await apiClient.reserveOfferNumber(payload);
+            newNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
+            log("wygenerowano lokalnie", { offerId: row.id, newNumber });
           } catch (e) {
             const errMsg = e instanceof Error ? e.message : String(e);
-            errLog("reserveOfferNumber rzucił błąd – przechodzę do następnej oferty", { offerId: row.id, error: e });
+            errLog("offer_counters failed – przechodzę do następnej", { offerId: row.id, error: e });
             failed.push({ offerId: row.id, error: errMsg });
             continue;
           }
-          log("reserveOfferNumber response", { offerId: row.id, res });
-          const success = res?.ok && res?.offerNumber && !res.offerNumber.startsWith("TEMP-");
-          if (!success) {
-            const errMsg = res?.error ?? (res?.offerNumber?.startsWith("TEMP-") ? "Backend zwrócił TEMP" : "Nieznany błąd");
-            errLog("backend zwrócił niepoprawny wynik", { offerId: row.id });
-            failed.push({ offerId: row.id, error: errMsg });
-            continue;
-          }
-          const newNumber = res.offerNumber!;
           try {
             db.transaction(() => {
               const stmt = db.prepare("UPDATE offers_crm SET offer_number = ?, updated_at = datetime('now') WHERE id = ?");

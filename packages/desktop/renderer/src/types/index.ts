@@ -2,7 +2,7 @@
  * Shared types for Planlux Hale.
  */
 
-export type UserRole = "USER" | "ADMIN";
+export type UserRole = "ADMIN" | "BOSS" | "SALESPERSON";
 
 export interface User {
   id: string;

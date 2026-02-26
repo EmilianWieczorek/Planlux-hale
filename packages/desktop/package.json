@@ -11,6 +11,7 @@
   "scripts": {
     "build": "npm run build -w @planlux/shared && vite build && tsc && npm run copy:assets",
     "test": "vitest run",
+    "test:electron": "vitest run electron/ --environment node",
     "test:watch": "vitest",
     "test:pdf": "electron . --test-pdf",
     "copy:assets": "node -e \"var fs=require('fs'),path=require('path');var s=path.join('assets');var t=path.join('dist','assets');if(fs.existsSync(s)){try{fs.mkdirSync(path.dirname(t),{recursive:true});fs.cpSync(s,t,{recursive:true});}catch(e){console.warn('Copy assets:',e.message);}}\"",
