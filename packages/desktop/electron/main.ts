@@ -44,7 +44,7 @@ function runMigrations(database: ReturnType<typeof Database>) {
           id TEXT PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER')),
+          role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER', 'BOSS')),
           display_name TEXT,
           active INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -129,6 +129,41 @@ function runMigrations(database: ReturnType<typeof Database>) {
   } catch (e) {
     logger.warn("[migration] offer_counters skipped", e);
   }
+  // Migration: add BOSS role to users (for existing DBs that have old CHECK)
+  try {
+    database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
+    const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_boss_role");
+    const usersExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get() as { name?: string } | undefined)?.name === "users";
+    if (!done && usersExists) {
+      database.exec(`
+        CREATE TABLE users_boss (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER', 'BOSS')),
+          display_name TEXT,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO users_boss SELECT id, email, password_hash, role, display_name, active, created_at, updated_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_boss RENAME TO users;
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+      `);
+      database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_boss_role");
+      logger.info("[migration] users: BOSS role added");
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("no such table") || msg.includes("already exists")) {
+      /* table may not exist yet or migration already applied */
+    } else {
+      logger.warn("[migration] users BOSS role skipped", e);
+    }
+  }
+
   const { runCrmMigrations } = require("./migrations/crmMigrations");
   runCrmMigrations(database, logger);
 }
@@ -323,12 +358,12 @@ app.whenReady().then(async () => {
 
   // Auto-update: check on startup (tylko w produkcji, gdy jest opublikowany release)
   if (!process.env.VITE_DEV_SERVER_URL && process.env.NODE_ENV !== "development") {
-    autoUpdater.autoDownload = false;
+    autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.checkForUpdatesAndNotify().catch((err) => {
+    autoUpdater.checkForUpdatesAndNotify().catch((err: unknown) => {
       logger.warn("[autoUpdater] check failed", err);
     });
-    autoUpdater.on("update-available", (info) => {
+    autoUpdater.on("update-available", (info: { version: string }) => {
       logger.info("[autoUpdater] update available", info.version);
       mainWindow?.webContents.send("planlux:update-available", { version: info.version });
     });

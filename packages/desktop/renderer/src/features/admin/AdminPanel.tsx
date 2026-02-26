@@ -440,7 +440,9 @@ export function AdminPanel({ api, currentUser }: Props) {
           <FormControl fullWidth margin="dense">
             <InputLabel>Rola</InputLabel>
             <Select value={formRole} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
+              <MenuItem value="USER">USER (handlowiec)</MenuItem>
               <MenuItem value="SALESPERSON">SALESPERSON</MenuItem>
+              <MenuItem value="BOSS">BOSS (manager)</MenuItem>
               <MenuItem value="MANAGER">MANAGER</MenuItem>
               <MenuItem value="ADMIN">ADMIN</MenuItem>
             </Select>

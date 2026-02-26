@@ -61,4 +61,5 @@ export interface EventLogEntry {
   createdAt: string;
 }
 
-export type UserRole = "SALESPERSON" | "MANAGER" | "ADMIN";
+/** Supported roles: USER (handlowiec), BOSS (manager), ADMIN */
+export type UserRole = "USER" | "SALESPERSON" | "BOSS" | "MANAGER" | "ADMIN";

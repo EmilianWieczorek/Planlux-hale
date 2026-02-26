@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER')),
+  role TEXT NOT NULL CHECK (role IN ('USER', 'ADMIN', 'SALESPERSON', 'MANAGER', 'BOSS')),
   display_name TEXT,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),

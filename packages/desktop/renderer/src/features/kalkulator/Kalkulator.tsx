@@ -225,6 +225,31 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     loadPricing();
   }, [loadPricing]);
 
+  /** Gdy użytkownik ma dane klienta + wymiary, a brak numeru – utwórz ofertę (createOffer). */
+  const createOfferRequestedRef = useRef(false);
+  useEffect(() => {
+    const w = parseFloat(widthM) || 0;
+    const l = parseFloat(lengthM) || 0;
+    const hasData = clientName.trim().length > 0 && w > 0 && l > 0;
+    if (!hasData || draft.offerNumber || draft.offerNumberLocked || createOfferRequestedRef.current) return;
+    const invoke = (window as unknown as { planlux?: { invoke?: (c: string, ...a: unknown[]) => Promise<unknown> } }).planlux?.invoke;
+    if (!invoke) return;
+    createOfferRequestedRef.current = true;
+    invoke("planlux:createOffer", userId, { clientName: clientName.trim(), widthM: w, lengthM: l })
+      .then((res: unknown) => {
+        const r = res as { ok?: boolean; offerId?: string; offerNumber?: string };
+        if (r?.ok && r?.offerId && r?.offerNumber) {
+          actions.setDraftId(r.offerId);
+          actions.setOfferNumber(r.offerNumber);
+        } else {
+          createOfferRequestedRef.current = false;
+        }
+      })
+      .catch(() => {
+        createOfferRequestedRef.current = false;
+      });
+  }, [clientName, widthM, lengthM, draft.offerNumber, draft.offerNumberLocked, userId, actions]);
+
   const prevOnlineRef = useRef<boolean | undefined>(undefined);
   useEffect(() => {
     const wasOffline = prevOnlineRef.current === false;

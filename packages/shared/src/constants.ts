@@ -5,7 +5,8 @@
 export const OFFER_STATUSES = ["IN_PROGRESS", "GENERATED", "SENT", "REALIZED"] as const;
 export type OfferStatusValue = (typeof OFFER_STATUSES)[number];
 
-export const USER_ROLES = ["SALESPERSON", "MANAGER", "ADMIN"] as const;
+/** USER=SALESPERSON alias; BOSS=MANAGER alias for compatibility */
+export const USER_ROLES = ["USER", "SALESPERSON", "BOSS", "MANAGER", "ADMIN"] as const;
 export type UserRoleValue = (typeof USER_ROLES)[number];
 
 export const EMAIL_HISTORY_STATUSES = ["QUEUED", "SENT", "FAILED"] as const;

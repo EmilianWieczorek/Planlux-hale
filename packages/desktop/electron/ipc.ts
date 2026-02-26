@@ -346,7 +346,8 @@ export function   registerIpcHandlers(deps: {
       if (existing) return { ok: false, error: "Użytkownik z tym adresem email już istnieje" };
       const id = uuid();
       const hash = hashPassword(password);
-      const role = ["ADMIN", "MANAGER", "SALESPERSON"].includes(payload.role ?? "") ? payload.role! : "SALESPERSON";
+      const validRoles = ["ADMIN", "BOSS", "MANAGER", "USER", "SALESPERSON"];
+      const role = validRoles.includes(payload.role ?? "") ? payload.role! : "SALESPERSON";
       const displayName = (payload.displayName ?? "").trim() || null;
       db.prepare(
         "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))"
@@ -383,7 +384,7 @@ export function   registerIpcHandlers(deps: {
         updates.push("display_name = ?");
         values.push((payload.displayName ?? "").trim() || null);
       }
-      if (payload.role !== undefined && ["ADMIN", "MANAGER", "SALESPERSON"].includes(payload.role)) {
+      if (payload.role !== undefined && ["ADMIN", "BOSS", "MANAGER", "USER", "SALESPERSON"].includes(payload.role)) {
         updates.push("role = ?");
         values.push(payload.role);
       }
@@ -696,14 +697,28 @@ export function   registerIpcHandlers(deps: {
       ]);
       if (outcome.ok === false) {
         await insertPdfFailed(offerData, outcome.error);
-        logger.error("[pdf] failed", outcome.error);
+        const meta = (offerData as { offer?: { clientName?: string; widthM?: number; lengthM?: number }; offerNumber?: string }) || {};
+        logger.error("[pdf] DIAGNOSTYKA: PDF generation failed", {
+          error: outcome.error,
+          details: outcome.details,
+          clientName: meta.offer?.clientName,
+          widthM: meta.offer?.widthM,
+          lengthM: meta.offer?.lengthM,
+          offerNumber: meta.offerNumber,
+        });
         return { ok: false, error: outcome.error, details: outcome.details };
       }
       return outcome;
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       await insertPdfFailed(offerData, errMsg);
-      logger.error("[pdf] failed", e instanceof Error ? e.stack : e);
+      const meta = (offerData as { offer?: { clientName?: string }; offerNumber?: string }) || {};
+      logger.error("[pdf] DIAGNOSTYKA: PDF generation exception", {
+        error: errMsg,
+        stack: e instanceof Error ? e.stack : undefined,
+        clientName: meta.offer?.clientName,
+        offerNumber: meta.offerNumber,
+      });
       return { ok: false, error: errMsg, details: e instanceof Error ? e.stack : undefined };
     }
   }
@@ -834,6 +849,74 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
+  /** Tworzy ofertę: rezerwuje numer (PLX lub TEMP offline), wstawia do offers_crm. Jedyne miejsce tworzenia nowej oferty. */
+  ipcMain.handle("planlux:createOffer", async (_, userId: string, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
+    try {
+      const numRes = await (async () => {
+        const db = getDb();
+        const row = db.prepare("SELECT display_name FROM users WHERE id = ? AND active = 1").get(userId) as { display_name: string | null } | undefined;
+        const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined } : null);
+        const year = new Date().getFullYear();
+        try {
+          const reqId = uuid();
+          const res = await apiClient.reserveOfferNumber({
+            id: reqId,
+            idempotencyKey: `reserve-${userId}-${year}-${Date.now()}`,
+            userId,
+            initial,
+            year,
+          });
+          if (res?.ok && res?.offerNumber) {
+            return { ok: true, offerNumber: res.offerNumber, isTemp: false };
+          }
+        } catch {
+          /* offline */
+        }
+        const { getDeviceId } = await import("./deviceId");
+        const deviceId = getDeviceId();
+        return { ok: true, offerNumber: `TEMP-${deviceId}-${Date.now()}`, isTemp: true };
+      })();
+      if (!numRes?.ok || !numRes.offerNumber) return { ok: false, error: "Nie udało się zarezerwować numeru oferty" };
+
+      const offerId = uuid();
+      const db = getDb();
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
+      if (tables.length === 0) return { ok: true, offerId, offerNumber: numRes.offerNumber, isTemp: numRes.isTemp ?? false };
+
+      const clientName = (minimalData?.clientName ?? "").trim();
+      const w = minimalData?.widthM ?? 0;
+      const l = minimalData?.lengthM ?? 0;
+      const areaM2 = w * l || 0;
+      const isCompany = /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
+      let clientFirstName = "";
+      let clientLastName = "";
+      let companyName = "";
+      if (isCompany) companyName = clientName;
+      else {
+        const parts = clientName.split(/\s+/).filter(Boolean);
+        clientFirstName = parts[0] ?? "";
+        clientLastName = parts.slice(1).join(" ") ?? "";
+      }
+      const nowIso = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+         VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
+      ).run(offerId, numRes.offerNumber, userId.trim(), clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+
+      const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+      if (auditTables.length > 0) {
+        db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'CREATE_OFFER', ?)").run(
+          uuid(), offerId, userId.trim(), JSON.stringify({ offerNumber: numRes.offerNumber, clientName, widthM: w, lengthM: l })
+        );
+      }
+      logger.info("[crm] createOffer ok", { offerId, offerNumber: numRes.offerNumber });
+      return { ok: true, offerId, offerNumber: numRes.offerNumber, isTemp: numRes.isTemp ?? false };
+    } catch (e) {
+      logger.error("[crm] createOffer failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
   /** Auto-numer oferty: online reserveNumber lub offline TEMP-<deviceId>-<ts> lub lokalny licznik. */
   ipcMain.handle("planlux:getNextOfferNumber", async (_, userId: string) => {
     try {
@@ -912,7 +995,12 @@ export function   registerIpcHandlers(deps: {
           if (tables.length > 0) {
             const offerId = d.draftId ?? uuid();
             const existing = db.prepare("SELECT id, offer_number FROM offers_crm WHERE id = ?").get(offerId) as { id: string; offer_number: string } | undefined;
-            const offerNumber = (d?.offerNumber?.trim() && d.offerNumber !== "—") ? d.offerNumber : (existing?.offer_number && !existing.offer_number.startsWith("TEMP-") ? existing.offer_number : `TEMP-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
+            const draftNumber = (d?.offerNumber?.trim() && d.offerNumber !== "—") ? d.offerNumber : null;
+            const existingNumber = existing?.offer_number && !existing.offer_number.startsWith("TEMP-") ? existing.offer_number : null;
+            const offerNumber = draftNumber ?? existingNumber;
+            if (!offerNumber) {
+              return { ok: true };
+            }
             const areaM2 = w * l;
             const h = d.heightM ? parseFloat(String(d.heightM)) : null;
             const isCompany = /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);

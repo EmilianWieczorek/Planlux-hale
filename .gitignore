@@ -25,6 +25,10 @@ yarn-error.log*
 *.sqlite
 *.db
 
+# Electron build artifacts
+win-unpacked/
+release/
+
 # env
 .env
 .env.*

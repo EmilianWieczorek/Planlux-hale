@@ -173,6 +173,7 @@ export const offerDraftStore = {
 
   /** Sprzedaż */
   setOfferNumber: (v: string) => setState((s) => ({ ...s, offerNumber: v })),
+  setDraftId: (v: string) => setState((s) => ({ ...s, draftId: v })),
   lockOfferNumber: () => setState((s) => ({ ...s, offerNumberLocked: true })),
   setStatus: (v: OfferStatus) =>
     setState((s) => {
