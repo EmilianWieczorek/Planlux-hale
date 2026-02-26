@@ -11,7 +11,12 @@ const dirs = [
   "packages/shared/dist",
   "packages/desktop/release",
   "packages/desktop/win-unpacked",
+  "packages/desktop/out",
+  "packages/desktop/build",
   "packages/desktop/node_modules/.vite",
+  "packages/desktop/node_modules/.cache",
+  "packages/shared/node_modules/.cache",
+  "coverage",
 ];
 
 for (const d of dirs) {

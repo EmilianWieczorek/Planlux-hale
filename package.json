@@ -12,13 +12,24 @@
     "desktop": "npm run start -w packages/desktop",
     "dev:desktop": "concurrently -k -n vite,electron \"npm run dev -w packages/desktop\" \"wait-on http://localhost:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 npm run start -w packages/desktop\"",
     "mobile": "npm run start -w packages/mobile",
-    "dist:win": "npm run build -w packages/desktop && electron-builder --win --publish never --projectDir packages/desktop"
+    "dist:win": "npm run build -w packages/desktop && electron-builder --win --publish never --projectDir packages/desktop",
+    "analyze:size": "npm run build -w packages/desktop && npx source-map-explorer packages/desktop/dist/renderer/assets/index-*.js",
+    "release": "semantic-release",
+    "prepare": "husky"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
     "electron-builder": "^26.8.1",
     "electron-rebuild": "^3.2.9",
-    "wait-on": "^7.2.0"
+    "wait-on": "^7.2.0",
+    "@commitlint/cli": "^19.0.0",
+    "@commitlint/config-conventional": "^19.0.0",
+    "@semantic-release/changelog": "^6.0.0",
+    "@semantic-release/git": "^10.0.0",
+    "@semantic-release/github": "^10.0.0",
+    "@semantic-release/npm": "^10.0.0",
+    "husky": "^9.0.0",
+    "semantic-release": "^24.0.0"
   }
 }
