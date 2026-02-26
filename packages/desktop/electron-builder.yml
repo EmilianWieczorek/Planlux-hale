@@ -1,0 +1,14 @@
+appId: pl.planlux.hale
+productName: Planlux Hale
+electronVersion: "28.0.0"
+directories:
+  output: release
+# files: default - includes appDir contents (dist, assets, node_modules from workspace)
+asar: true
+asarUnpack:
+  - "**/node_modules/better-sqlite3/**"
+win:
+  target: nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Planlux — Oferta {{offerNumber}} – {{clientName}}</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+
+  <body>
+    <div class="wrap">
+
+      <!-- ===================== PAGE 1: OFERTA HANDLOWA ===================== -->
+      <main class="page plx-offer">
+        <header class="hero" data-plx-block="HEADER">
+          <div class="hero__inner">
+            <div class="brand">
+              <img class="brand__logoImg" src="assets/logo-bez-tla.png" alt="Planlux" />
+            </div>
+            <div class="hero__meta" data-plx-element="metaBox" data-plx-block="META_BOXES">
+              <div class="metaBox">
+                <div class="metaBox__grid">
+                  <div class="metaBox__k">Nr oferty</div>
+                  <div class="metaBox__v">{{offerNumber}}</div>
+                  <div class="metaBox__k">Data</div>
+                  <div class="metaBox__v">{{offerDate}}</div>
+                  <div class="metaBox__k">Handlowiec</div>
+                  <div class="metaBox__v">{{sellerName}}</div>
+                </div>
+              </div>
+            </div>
+            <div class="hero__titleWrap">
+              <h1 class="hero__title" data-plx-element="heroTitle">{{heroTitle}}</h1>
+              <p class="hero__sub" data-plx-element="heroSubtitle">{{heroSubtitle}}</p>
+              <div class="chips" data-plx-block="CLIENT_STRIP">
+                <span class="chip">Klient: {{clientName}}</span>
+                <span class="chip">Montaż: {{clientAddressOrInstall}}</span>
+                <span class="chip">Telefon: {{clientPhone}}</span>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="content">
+          <section class="price-card" data-plx-element="priceCard" data-plx-block="PRICE_SECTION">
+            <div class="price-card__bar">
+              <div class="price-card__label">HALA Z DOSTAWĄ ORAZ MONTAŻEM</div>
+              <div class="price-card__pill">Transport + montaż w cenie</div>
+            </div>
+            <div class="price-card__grid">
+              <div class="stat">
+                <div class="stat__label">Cena netto</div>
+                <div class="stat__value">{{priceNet}} zł</div>
+              </div>
+              <div class="stat stat--accent">
+                <div class="stat__label">Cena brutto</div>
+                <div class="stat__value stat__value--accent">{{priceGross}} zł</div>
+              </div>
+              <div class="stat stat--note">
+                <div class="stat__label stat__label--note">Ważne</div>
+                <div class="stat__note">{{importantText}}</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="grid">
+            <article class="card" data-plx-block="CLIENT_DATA_CARD">
+              <header class="card__head">
+                <h2 class="card__title">Dane klienta</h2>
+              </header>
+              <div class="card__body">
+                <div class="kv"><span class="kv__k">Zamawiający</span><span class="kv__v">{{clientName}}</span></div>
+                <div class="kv"><span class="kv__k">NIP</span><span class="kv__v">{{clientNip}}</span></div>
+                <div class="kv"><span class="kv__k">E-mail</span><span class="kv__v">{{clientEmail}}</span></div>
+                <div class="kv"><span class="kv__k">Adres</span><span class="kv__v">{{clientAddressOrInstall}}</span></div>
+                <div class="kv"><span class="kv__k">Tel.</span><span class="kv__v">{{clientPhone}}</span></div>
+              </div>
+            </article>
+
+            <article class="card card--dims" data-plx-block="HALL_DIMENSIONS_CARD">
+              <header class="card__head">
+                <h2 class="card__title">Wymiary hali</h2>
+              </header>
+              <div class="card__body">
+                <div class="kv"><span class="kv__k">Szerokość</span><span class="kv__v">{{widthM}} m</span></div>
+                <div class="kv"><span class="kv__k">Długość</span><span class="kv__v">{{lengthM}} m</span></div>
+                <div class="kv"><span class="kv__k">Wysokość boczna</span><span class="kv__v">{{heightM}}</span></div>
+                <div class="kv"><span class="kv__k">Powierzchnia</span><span class="kv__v">{{areaM2}} m²</span></div>
+              </div>
+            </article>
+
+            <article class="card" data-plx-block="ADDONS_CARD">
+              <header class="card__head">
+                <h2 class="card__title">Wybrane dodatki</h2>
+              </header>
+              <div class="card__body">
+                <div class="pills">{{addonsPillsHtml}}</div>
+              </div>
+            </article>
+
+            <article class="card" data-plx-block="TERMS_CARD">
+              <header class="card__head">
+                <h2 class="card__title">Warunki oferty</h2>
+              </header>
+              <div class="card__body">
+                <div class="kv"><span class="kv__k">Termin realizacji</span><span class="kv__v">90 dni</span></div>
+                <div class="kv"><span class="kv__k">Ważność oferty</span><span class="kv__v">30 dni</span></div>
+                <div class="kv"><span class="kv__k">Gwarancja</span><span class="kv__v">48 miesięcy</span></div>
+                <div class="kv"><span class="kv__k">Płatność</span><span class="kv__v">wg ustaleń z handlowcem</span></div>
+              </div>
+            </article>
+          </section>
+        </section>
+
+        <footer class="footer" data-plx-element="footer">
+          <div class="footer__left">
+            <span class="muted">{{footerText}}</span>
+            <span class="strong">{{offerNumber}}</span>
+          </div>
+          <div class="footer__right">
+            <span class="muted">tel.</span>
+            <span class="strong">514 708 479</span>
+            <span class="muted">•</span>
+            <span class="strong">twojahala@planlux.pl</span>
+            <span class="muted">•</span>
+            <span class="strong">planlux.pl</span>
+          </div>
+        </footer>
+      </main>
+
+      <!-- ===================== PAGE 2: SPECYFIKACJA TECHNICZNA ===================== -->
+      <main class="page plx-spec">
+        <header class="hero" data-plx-block="TECH_HEADER">
+          <div class="hero__inner">
+            <div class="brand">
+              <img class="brand__logoImg" src="assets/logo-bez-tla.png" alt="Planlux" />
+            </div>
+            <div class="hero__meta">
+              <div class="metaBox">
+                <div class="metaBox__grid">
+                  <div class="metaBox__k">Nr oferty</div>
+                  <div class="metaBox__v">{{offerNumber}}</div>
+                  <div class="metaBox__k">Data</div>
+                  <div class="metaBox__v">{{offerDate}}</div>
+                  <div class="metaBox__k">Handlowiec</div>
+                  <div class="metaBox__v">{{sellerName}}</div>
+                </div>
+              </div>
+            </div>
+            <div class="hero__titleWrap">
+              <h1 class="hero__title">{{page2SectionTitle}}</h1>
+              <p class="hero__sub">Podział na moduły</p>
+              <div class="chips">
+                <span class="chip">Konstrukcja: {{constructionType}}</span>
+                <span class="chip">Dach: {{roofType}}</span>
+                <span class="chip">Ściany: {{wallsType}}</span>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="spec">
+          <section class="spec-grid">
+            <article class="spec-card" data-plx-block="SPEC_BOX_1">
+              <header class="spec-card__head">
+                <h2 class="spec-card__title">Dokumentacja</h2>
+                <div class="badge">1</div>
+              </header>
+              <div class="spec-card__body">
+                <div class="spec-lines">{{page2Box1}}</div>
+                <div class="tags">
+                  <span class="tag">projekty</span>
+                  <span class="tag">zestawienia</span>
+                  <span class="tag">uzgodnienia</span>
+                </div>
+              </div>
+            </article>
+
+            <article class="spec-card" data-plx-block="SPEC_BOX_2">
+              <header class="spec-card__head">
+                <h2 class="spec-card__title">Konstrukcja</h2>
+                <div class="badge">2</div>
+              </header>
+              <div class="spec-card__body">
+                <div class="spec-lines">{{page2Box2}}</div>
+                <div class="tags">
+                  <span class="tag">stal • ocynk</span>
+                  <span class="tag">system modułowy</span>
+                  <span class="tag">montaż na miejscu</span>
+                </div>
+              </div>
+            </article>
+
+            <article class="spec-card" data-plx-block="SPEC_BOX_3">
+              <header class="spec-card__head">
+                <h2 class="spec-card__title">Pokrycie dachu</h2>
+                <div class="badge">3</div>
+              </header>
+              <div class="spec-card__body">
+                <div class="spec-lines">{{page2Box3}}</div>
+                <div class="tags">
+                  <span class="tag">PVC</span>
+                  <span class="tag">atest</span>
+                  <span class="tag">szczelność</span>
+                </div>
+              </div>
+            </article>
+
+            <article class="spec-card" data-plx-block="SPEC_BOX_4">
+              <header class="spec-card__head">
+                <h2 class="spec-card__title">Ściany + stolarka</h2>
+                <div class="badge">4</div>
+              </header>
+              <div class="spec-card__body">
+                <div class="spec-lines">{{page2Box4}}</div>
+                <div class="tags">
+                  <span class="tag">bramy</span>
+                  <span class="tag">drzwi</span>
+                  <span class="tag">wykończenia</span>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          <section class="spec-top-tiles">
+            <div class="mini-tile">
+              <div class="mini-tile__k">Transport</div>
+              <div class="mini-tile__v">w cenie</div>
+            </div>
+            <div class="mini-tile">
+              <div class="mini-tile__k">Montaż</div>
+              <div class="mini-tile__v">w cenie</div>
+            </div>
+            <div class="mini-tile">
+              <div class="mini-tile__k">Gwarancja</div>
+              <div class="mini-tile__v">48 miesięcy</div>
+            </div>
+            <div class="mini-tile">
+              <div class="mini-tile__k">Realizacja</div>
+              <div class="mini-tile__v">90 dni</div>
+            </div>
+          </section>
+          {{page2NoteSection}}
+        </section>
+
+        <footer class="footer">
+          <div class="footer__left">
+            <span class="muted">PLANLUX • Specyfikacja techniczna</span>
+            <span class="strong">{{offerNumber}}</span>
+          </div>
+          <div class="footer__right">
+            <span class="muted">tel.</span>
+            <span class="strong">514 708 479</span>
+            <span class="muted">•</span>
+            <span class="strong">twojahala@planlux.pl</span>
+            <span class="muted">•</span>
+            <span class="strong">planlux.pl</span>
+          </div>
+        </footer>
+      </main>
+
+      <!-- ===================== PAGE 3: PRZYGOTOWANIE TERENU ===================== -->
+      <main class="page xd-terrain">
+        <header class="hero">
+          <div class="hero__inner">
+            <div class="brand">
+              <img class="brand__logoImg" src="assets/logo-bez-tla.png" alt="Planlux" />
+            </div>
+            <div class="hero__meta">
+              <div class="metaBox">
+                <div class="metaBox__grid">
+                  <div class="metaBox__k">Nr oferty</div>
+                  <div class="metaBox__v">{{offerNumber}}</div>
+                  <div class="metaBox__k">Data</div>
+                  <div class="metaBox__v">{{offerDate}}</div>
+                  <div class="metaBox__k">Handlowiec</div>
+                  <div class="metaBox__v">{{sellerName}}</div>
+                </div>
+              </div>
+            </div>
+            <div class="hero__titleWrap">
+              <h1 class="hero__title">PRZYGOTOWANIE TERENU</h1>
+              <p class="hero__sub">Checklista dla Inwestora</p>
+              <div class="chips">
+                <span class="chip">
+                  <span class="dot"></span>
+                  Składowanie: do 50 m
+                </span>
+                <span class="chip">
+                  <span class="dot"></span>
+                  Strefa robocza: 3 m wokół hali
+                </span>
+                <span class="chip">
+                  <span class="dot"></span>
+                  Droga dojazdowa: 4 m
+                  </span>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main class="content">
+          <section class="grid">
+            <div class="colLeft">
+              <article class="stepCard stepCard--fixed">
+                <div class="stepCard__num">1</div>
+                <div class="stepCard__mid">
+                  <div class="stepCard__titleRow">
+                    <img class="stepIcon" src="assets/ciezarowka.svg" alt="" />
+                    <div class="stepCard__title stepCard__title--nowrap">Rozładunek i składowanie</div>
+                  </div>
+                  <div class="stepCard__desc">
+                    Rozładunek elementów konstrukcji i materiałów leży po stronie Zamawiającego.
+                    <span class="descAccent">Zaplanuj miejsce składowania możliwie blisko montażu.</span>
+                  </div>
+                </div>
+                <div class="stepCard__right">
+                  <div class="badge">
+                    <img class="badge__icon" src="assets/wykrzyknik.svg" alt="" />
+                    <span class="badge__txt">50 m</span>
+                  </div>
+                </div>
+              </article>
+
+              <article class="stepCard stepCard--fixed">
+                <div class="stepCard__num">2</div>
+                <div class="stepCard__mid">
+                  <div class="stepCard__titleRow">
+                    <img class="stepIcon" src="assets/teren-budowy.svg" alt="" />
+                    <div class="stepCard__title">Teren budowy</div>
+                  </div>
+                  <div class="stepCard__desc">
+                    Teren wewnątrz hali oraz pas <span class="w700">3 m</span> wokół hali musi być
+                    <span class="w700">uprzątnięty, wyrównany i utwardzony.</span>
+                    Zapewnij swobodny dojazd i manewrowanie maszyn.
+                  </div>
+                </div>
+                <div class="stepCard__right">
+                  <div class="badge">
+                    <img class="badge__icon" src="assets/wykrzyknik.svg" alt="" />
+                    <span class="badge__txt">3 m</span>
+                  </div>
+                </div>
+              </article>
+
+              <article class="stepCard stepCard--fixed">
+                <div class="stepCard__num">3</div>
+                <div class="stepCard__mid">
+                  <div class="stepCard__titleRow">
+                    <img class="stepIcon" src="assets/droga-dojazdowa.svg" alt="" />
+                    <div class="stepCard__title">Droga dojazdowa</div>
+                  </div>
+                  <div class="stepCard__desc">
+                    Utwardzona droga o szerokości około <span class="w700">4 m</span> prowadząca bezpośrednio do
+                    miejsca montażu. Usuń przeszkody ograniczające przejazd transportu.
+                  </div>
+                </div>
+                <div class="stepCard__right">
+                  <div class="badge">
+                    <img class="badge__icon" src="assets/wykrzyknik.svg" alt="" />
+                    <span class="badge__txt">4 m</span>
+                  </div>
+                </div>
+              </article>
+
+              <article class="stepCard stepCard--fixed">
+                <div class="stepCard__num">4</div>
+                <div class="stepCard__mid">
+                  <div class="stepCard__titleRow">
+                    <img class="stepIcon" src="assets/media.svg" alt="" />
+                    <div class="stepCard__title">Media <span class="stepCard__titleLight">(do 50 m)</span></div>
+                  </div>
+                  <div class="stepCard__desc">
+                    Dostęp do toalety (<span class="w700">WC</span>), wody (cele sanitarne) oraz energii elektrycznej
+                    w pobliżu budowy (ładowanie elektronarzędzi).
+                  </div>
+                </div>
+                <div class="stepCard__right stepCard__right--pills">
+                  <span class="miniPill">Woda</span>
+                  <span class="miniPill miniPill--left">WC</span>
+                  <span class="miniPill">Prąd</span>
+                </div>
+              </article>
+            </div>
+
+            <div class="colRight">
+              <article class="diagramCard">
+                  <div class="diagramPanel">
+                    <img class="diagramImg" src="assets/diagram-techniczny.png" alt="Diagram techniczny" />
+                  </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="callout">
+            <div class="callout__icon">
+              <img class="callout__iconImg" src="assets/blue-wykrzyknik.svg" alt="" />
+            </div>
+            <div class="callout__text">
+              <div class="callout__title">Najważniejsze:</div>
+              <div class="callout__desc">
+                Teren wokół hali musi umożliwiać sprawny i bezpieczny montaż.
+                Jeśli warunki na miejscu odbiegają od powyższych – daj znać przed montażem, dopasujemy logistykę.
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <footer class="footer">
+          <div class="footer__left">
+            <span class="muted">PLANLUX • Przygotowanie terenu</span>
+            <span class="strong">{{offerNumber}}</span>
+          </div>
+          <div class="footer__right">
+            <span class="muted">tel.</span>
+            <span class="strong">514 708 479</span>
+            <span class="muted">•</span>
+            <span class="strong">twojahala@planlux.pl</span>
+            <span class="muted">•</span>
+            <span class="strong">planlux.pl</span>
+          </div>
+        </footer>
+      </main>
+
+    </div>
+  </body>
+</html>

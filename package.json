@@ -1,0 +1,24 @@
+{
+  "name": "planlux-hale",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:shared": "npm run build -w packages/shared",
+    "clean": "npm run clean --workspaces --if-present",
+    "clean:all": "npm run clean && node scripts/clean-all.js",
+    "desktop": "npm run start -w packages/desktop",
+    "dev:desktop": "concurrently -k -n vite,electron \"npm run dev -w packages/desktop\" \"wait-on http://localhost:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 npm run start -w packages/desktop\"",
+    "mobile": "npm run start -w packages/mobile",
+    "dist:win": "npm run build -w packages/desktop && electron-builder --win --publish never --projectDir packages/desktop"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron-builder": "^26.8.1",
+    "electron-rebuild": "^3.2.9",
+    "wait-on": "^7.2.0"
+  }
+}

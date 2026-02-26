@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+packages/desktop/dist/
+packages/shared/dist/
+packages/desktop/release/
+packages/desktop/win-unpacked/
+
+# Cache
+.vite/
+.cache/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Electron builder
+*.exe
+*.dmg
+*.AppImage
+*.zip
+
+# Generated PDFs (userData – lokalnie, nie w repo)
+# PlanluxOferty/ – w userData, nie commitowane
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
