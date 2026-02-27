@@ -24,7 +24,8 @@ import {
   Tabs,
   Tab,
 } from "@mui/material";
-import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email } from "@mui/icons-material";
+import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email, Mail } from "@mui/icons-material";
+import { AdminEmailTab } from "./AdminEmailTab";
 import { tokens } from "../../theme/tokens";
 
 const styles = {
@@ -92,7 +93,7 @@ export function AdminPanel({ api, currentUser }: Props) {
 
   const loadActivity = async () => {
     try {
-      const r = (await api("planlux:getActivity", currentUser.id, true)) as { ok: boolean; data?: ActivityRow[] };
+      const r = (await api("planlux:getActivity", { all: true })) as { ok: boolean; data?: ActivityRow[] };
       if (r.ok && r.data) setActivity(r.data);
       else setActivity([]);
     } catch {
@@ -103,8 +104,8 @@ export function AdminPanel({ api, currentUser }: Props) {
   const loadHistory = async () => {
     try {
       const [pRes, eRes] = await Promise.all([
-        api("planlux:getPdfs", currentUser.id, true),
-        api("planlux:getEmails", currentUser.id, true),
+        api("planlux:getPdfs"),
+        api("planlux:getEmails"),
       ]);
       const p = pRes as { ok: boolean; data?: PdfRow[] };
       const e = eRes as { ok: boolean; data?: EmailRow[] };
@@ -167,7 +168,7 @@ export function AdminPanel({ api, currentUser }: Props) {
           role: formRole,
         };
         if (formPassword.length > 0) payload.password = formPassword;
-        const r = (await api("planlux:updateUser", currentUser.id, editingUser.id, payload)) as { ok: boolean; error?: string };
+        const r = (await api("planlux:updateUser", editingUser.id, payload)) as { ok: boolean; error?: string };
         if (r.ok) {
           setSnackbar({ open: true, message: "Użytkownik zaktualizowany", severity: "success" });
           setModalOpen(false);
@@ -176,7 +177,7 @@ export function AdminPanel({ api, currentUser }: Props) {
           setSnackbar({ open: true, message: r.error ?? "Błąd aktualizacji", severity: "error" });
         }
       } else {
-        const r = (await api("planlux:createUser", currentUser.id, {
+        const r = (await api("planlux:createUser", {
           email,
           password: formPassword,
           displayName: formDisplayName.trim() || undefined,
@@ -209,7 +210,7 @@ export function AdminPanel({ api, currentUser }: Props) {
       return;
     }
     try {
-      const r = (await api("planlux:disableUser", currentUser.id, u.id, active)) as { ok: boolean; error?: string };
+      const r = (await api("planlux:disableUser", u.id, active)) as { ok: boolean; error?: string };
       if (r.ok) {
         setSnackbar({ open: true, message: active ? "Użytkownik włączony" : "Użytkownik wyłączony", severity: "success" });
         loadUsers();
@@ -231,6 +232,7 @@ export function AdminPanel({ api, currentUser }: Props) {
         <Tab icon={<Timeline />} iconPosition="start" label="Aktywność" />
         <Tab icon={<PictureAsPdf />} iconPosition="start" label="Historia PDF" />
         <Tab icon={<Email />} iconPosition="start" label="Historia e-mail" />
+        <Tab icon={<Mail />} iconPosition="start" label="E-mail" />
       </Tabs>
 
       {tab === 0 && (
@@ -371,6 +373,8 @@ export function AdminPanel({ api, currentUser }: Props) {
           )}
         </div>
       )}
+
+      {tab === 4 && <AdminEmailTab api={api} />}
 
       {tab === 3 && (
         <div style={styles.card}>

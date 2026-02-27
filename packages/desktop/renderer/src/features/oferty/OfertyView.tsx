@@ -60,7 +60,7 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
       setLoading(true);
       setSyncError(null);
       try {
-        const r = (await api("planlux:getOffersCrm", userId, activeTab, searchQuery, isAdmin)) as {
+        const r = (await api("planlux:getOffersCrm", { statusFilter: activeTab, searchQuery })) as {
           ok: boolean;
           offers?: typeof offers;
         };
@@ -95,10 +95,10 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
       });
 
     return () => { cancelled = true; };
-  }, [api, userId, activeTab, searchQuery, isAdmin]);
+  }, [api, activeTab, searchQuery, isAdmin]);
 
   const handleMarkRealized = async (offerId: string) => {
-    const r = (await api("planlux:markOfferRealized", offerId, userId)) as { ok: boolean };
+    const r = (await api("planlux:markOfferRealized", offerId)) as { ok: boolean };
     if (r?.ok) {
       setOffers((prev) =>
         prev.map((o) =>

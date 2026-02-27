@@ -33,6 +33,7 @@ export interface FlushOutboxDeps {
   api: ApiClient;
   storage: OutboxStorage;
   sendEmail?: (payload: OutboxPayloadMap["SEND_EMAIL"]) => Promise<void>;
+  sendGenericEmail?: (payload: OutboxPayloadMap["SEND_GENERIC_EMAIL"]) => Promise<void>;
   offerSync?: (payload: OutboxPayloadMap["OFFER_SYNC"]) => Promise<void>;
   isOnline: () => boolean;
 }
@@ -70,6 +71,13 @@ export async function flushOutbox(deps: FlushOutboxDeps): Promise<{ processed: n
         case "SEND_EMAIL":
           if (deps.sendEmail && deps.isOnline()) {
             await deps.sendEmail(payload as OutboxPayloadMap["SEND_EMAIL"]);
+          } else {
+            continue;
+          }
+          break;
+        case "SEND_GENERIC_EMAIL":
+          if (deps.sendGenericEmail && deps.isOnline()) {
+            await deps.sendGenericEmail(payload as OutboxPayloadMap["SEND_GENERIC_EMAIL"]);
           } else {
             continue;
           }

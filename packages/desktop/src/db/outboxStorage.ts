@@ -21,8 +21,8 @@ export function createOutboxStorage(db: Db): OutboxStorage {
         `SELECT id, operation_type, payload_json, retry_count, max_retries, last_error, created_at, processed_at
          FROM outbox WHERE processed_at IS NULL
          ORDER BY CASE operation_type
-           WHEN 'HEARTBEAT' THEN 1 WHEN 'LOG_PDF' THEN 2 WHEN 'SEND_EMAIL' THEN 3
-           WHEN 'LOG_EMAIL' THEN 4 WHEN 'OFFER_SYNC' THEN 5 ELSE 6 END,
+           WHEN 'HEARTBEAT' THEN 1 WHEN 'LOG_PDF' THEN 2 WHEN 'SEND_EMAIL' THEN 3 WHEN 'SEND_GENERIC_EMAIL' THEN 4
+           WHEN 'LOG_EMAIL' THEN 5 WHEN 'OFFER_SYNC' THEN 6 ELSE 7 END,
          created_at ASC`
       ).all() as unknown as OutboxRecord[];
       return rows;

@@ -31,6 +31,6 @@ describe("OfertyView – lista nie blokuje się na sync", () => {
       <OfertyView api={mockApi} userId="u1" isAdmin={false} />
     );
     await findByText(/Oferty|Brak ofert/u, {}, { timeout: 2000 });
-    expect(mockApi).toHaveBeenCalledWith("planlux:getOffersCrm", "u1", "in_progress", "", false);
+    expect(mockApi).toHaveBeenCalledWith("planlux:getOffersCrm", { statusFilter: "in_progress", searchQuery: "" });
   });
 });

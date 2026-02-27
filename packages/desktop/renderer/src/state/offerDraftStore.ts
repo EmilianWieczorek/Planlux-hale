@@ -148,9 +148,8 @@ function setSyncingOfferNumber(v: boolean) {
 
 function saveToBackend(): Promise<void> {
   const invoke = (window as unknown as { planlux?: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).planlux?.invoke;
-  const userId = (window as unknown as { __planlux_userId?: string }).__planlux_userId ?? "";
   if (!invoke) return Promise.resolve();
-  return invoke("planlux:saveOfferDraft", state, userId)
+  return invoke("planlux:saveOfferDraft", state)
     .then(async (res: unknown) => {
       const r = res as { ok?: boolean };
       if (!r?.ok) return;

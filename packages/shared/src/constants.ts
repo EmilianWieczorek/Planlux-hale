@@ -16,6 +16,7 @@ export const OUTBOX_OPERATION_TYPES = [
   "HEARTBEAT",
   "LOG_PDF",
   "SEND_EMAIL",
+  "SEND_GENERIC_EMAIL",
   "LOG_EMAIL",
   "OFFER_SYNC",
 ] as const;

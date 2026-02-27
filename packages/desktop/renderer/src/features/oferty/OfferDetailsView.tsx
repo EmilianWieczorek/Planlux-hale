@@ -15,6 +15,7 @@ import {
   TableRow,
   Chip,
   Stack,
+  Snackbar,
 } from "@mui/material";
 import { ArrowBack, Email } from "@mui/icons-material";
 import { EmailComposer } from "./EmailComposer";
@@ -102,6 +103,7 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
   const [pdfs, setPdfs] = useState<PdfItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [emailComposerOpen, setEmailComposerOpen] = useState(false);
+  const [queueSnackbarOpen, setQueueSnackbarOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -109,10 +111,10 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
       setLoading(true);
       try {
         const [offerRes, auditRes, emailRes, pdfRes] = await Promise.all([
-          api("planlux:getOfferDetails", offerId, userId) as Promise<{ ok: boolean; offer?: Offer }>,
-          api("planlux:getOfferAudit", offerId, userId) as Promise<{ ok: boolean; items?: AuditItem[] }>,
-          api("planlux:getEmailHistoryForOffer", offerId, userId) as Promise<{ ok: boolean; emails?: EmailItem[] }>,
-          api("planlux:getPdfsForOffer", offerId, userId) as Promise<{ ok: boolean; pdfs?: PdfItem[] }>,
+          api("planlux:getOfferDetails", offerId) as Promise<{ ok: boolean; offer?: Offer }>,
+          api("planlux:getOfferAudit", offerId) as Promise<{ ok: boolean; items?: AuditItem[] }>,
+          api("planlux:getEmailHistoryForOffer", offerId) as Promise<{ ok: boolean; emails?: EmailItem[] }>,
+          api("planlux:getPdfsForOffer", offerId) as Promise<{ ok: boolean; pdfs?: PdfItem[] }>,
         ]);
         if (cancelled) return;
         if (offerRes.ok && offerRes.offer) setOffer(offerRes.offer);
@@ -127,15 +129,15 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
     };
     load();
     return () => { cancelled = true; };
-  }, [api, offerId, userId]);
+  }, [api, offerId]);
 
   const refreshData = async () => {
     try {
       const [offerRes, auditRes, emailRes, pdfRes] = await Promise.all([
-        api("planlux:getOfferDetails", offerId, userId) as Promise<{ ok: boolean; offer?: Offer }>,
-        api("planlux:getOfferAudit", offerId, userId) as Promise<{ ok: boolean; items?: AuditItem[] }>,
-        api("planlux:getEmailHistoryForOffer", offerId, userId) as Promise<{ ok: boolean; emails?: EmailItem[] }>,
-        api("planlux:getPdfsForOffer", offerId, userId) as Promise<{ ok: boolean; pdfs?: PdfItem[] }>,
+        api("planlux:getOfferDetails", offerId) as Promise<{ ok: boolean; offer?: Offer }>,
+        api("planlux:getOfferAudit", offerId) as Promise<{ ok: boolean; items?: AuditItem[] }>,
+        api("planlux:getEmailHistoryForOffer", offerId) as Promise<{ ok: boolean; emails?: EmailItem[] }>,
+        api("planlux:getPdfsForOffer", offerId) as Promise<{ ok: boolean; pdfs?: PdfItem[] }>,
       ]);
       if (offerRes.ok && offerRes.offer) setOffer(offerRes.offer);
       if (auditRes.ok && auditRes.items) setAuditItems(auditRes.items);
@@ -317,7 +319,11 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
         pdfPath={pdfs[0]?.filePath ?? null}
         pdfFileName={pdfs[0]?.fileName}
         onSend={async (p) => {
-          const r = (await api("planlux:sendOfferEmail", offerId, userId, {
+          const check = (await api("planlux:checkInternet")) as { online?: boolean };
+          if (!check.online) {
+            setQueueSnackbarOpen(true);
+          }
+          const r = (await api("planlux:sendOfferEmail", offerId, {
             to: p.to,
             subject: p.subject,
             body: p.body,
@@ -326,6 +332,13 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
           if (r.ok) await refreshData();
           return r;
         }}
+      />
+      <Snackbar
+        open={queueSnackbarOpen}
+        autoHideDuration={6000}
+        onClose={() => setQueueSnackbarOpen(false)}
+        message="Brak prawdziwego połączenia z internetem — e-maile trafią do kolejki."
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       />
     </Box>
   );

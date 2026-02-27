@@ -1,8 +1,9 @@
 /**
  * IPC handlers – bridge renderer <-> main.
+ * Auth: session lives in main; never trust userId from renderer.
  */
 
-import { ipcMain, app, shell } from "electron";
+import { ipcMain, app, shell, net } from "electron";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
@@ -12,9 +13,35 @@ import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTem
 import { getTestPdfFileName } from "./pdf/generatePdf";
 import { getPdfTemplateDir } from "./pdf/pdfPaths";
 import { createSendEmailForFlush } from "./smtpSend";
+import { sendEmail as sendSmtpEmail } from "./mail";
 import { createFilePdfTemplateConfigStore } from "./pdf/pdfTemplateConfigStore";
 import { getPreviewHtmlWithInlinedAssets } from "./pdf/renderTemplate";
 import { getNextOfferNumber as getNextOfferNumberLocal } from "./offerCounters";
+
+/** Session: current user in main process. Set on login, cleared on logout. */
+export type SessionUser = { id: string; email: string; role: string; displayName: string | null };
+let currentUser: SessionUser | null = null;
+
+export function setSession(user: SessionUser | null): void {
+  currentUser = user;
+}
+
+export function getSession(): SessionUser | null {
+  return currentUser;
+}
+
+/** Throws if not logged in. Returns session user. */
+function requireAuth(): SessionUser {
+  if (!currentUser) throw new Error("Unauthorized");
+  return currentUser;
+}
+
+/** Throws if not logged in or role not in allowed. Returns session user. */
+function requireRole(allowedRoles: string[]): SessionUser {
+  const user = requireAuth();
+  if (!allowedRoles.includes(user.role)) throw new Error("Forbidden");
+  return user;
+}
 
 const SALT = "planlux-hale-v1";
 
@@ -54,6 +81,30 @@ function getSalesInitial(user: { displayName?: string; firstName?: string; email
   return "X";
 }
 
+const CHECK_INTERNET_URL = "https://example.com/favicon.ico";
+const CHECK_INTERNET_TIMEOUT_MS = 3000;
+
+function checkInternetNet(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => resolve(false), CHECK_INTERNET_TIMEOUT_MS);
+    try {
+      const request = net.request(CHECK_INTERNET_URL);
+      request.on("response", () => {
+        clearTimeout(timeout);
+        resolve(true);
+      });
+      request.on("error", () => {
+        clearTimeout(timeout);
+        resolve(false);
+      });
+      request.end();
+    } catch {
+      clearTimeout(timeout);
+      resolve(false);
+    }
+  });
+}
+
 export function   registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
   apiClient: import("@planlux/shared").ApiClient;
@@ -64,25 +115,30 @@ export function   registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:login", async (_, email: string, password: string) => {
     try {
+      if (typeof email !== "string" || typeof password !== "string") {
+        return { ok: false, error: "Invalid input" };
+      }
       const db = getDb();
-      const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(email) as
+      const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(email.trim().toLowerCase()) as
         | { id: string; email: string; role: string; password_hash: string; display_name: string }
         | undefined;
       if (!row || !verifyPassword(password, row.password_hash)) {
         return { ok: false, error: "Nieprawidłowy email lub hasło" };
       }
+      const user: SessionUser = {
+        id: row.id,
+        email: row.email,
+        role: normalizeRole(row.role),
+        displayName: row.display_name ?? null,
+      };
+      currentUser = user;
       const sessionId = uuid();
       db.prepare(
         "INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)"
       ).run(sessionId, row.id, config.appVersion);
       return {
         ok: true,
-        user: {
-          id: row.id,
-          email: row.email,
-          role: normalizeRole(row.role),
-          displayName: row.display_name,
-        },
+        user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
         sessionId,
       };
     } catch (e) {
@@ -91,13 +147,26 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
+  ipcMain.handle("planlux:logout", async () => {
+    try {
+      const db = getDb();
+      const row = db.prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1").get() as { id: string } | undefined;
+      if (row) db.prepare("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?").run(row.id);
+      currentUser = null;
+      return { ok: true };
+    } catch (e) {
+      logger.error("logout failed", e);
+      currentUser = null;
+      return { ok: false, error: String(e) };
+    }
+  });
+
   ipcMain.handle("planlux:endSession", async () => {
     try {
       const db = getDb();
       const row = db.prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1").get() as { id: string } | undefined;
-      if (row) {
-        db.prepare("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?").run(row.id);
-      }
+      if (row) db.prepare("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?").run(row.id);
+      currentUser = null;
       return { ok: true };
     } catch (e) {
       logger.error("endSession failed", e);
@@ -238,17 +307,18 @@ export function   registerIpcHandlers(deps: {
   });
 
   /** Dodaje heartbeat do outbox i zapisuje lokalnie w activity (dla panelu admina). */
-  ipcMain.handle("planlux:enqueueHeartbeat", async (_, userId: string) => {
+  ipcMain.handle("planlux:enqueueHeartbeat", async () => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      const user = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(userId) as { email: string } | undefined;
-      if (!user) return { ok: false, error: "Użytkownik nie znaleziony" };
+      const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(user.id) as { email: string } | undefined;
+      if (!userRow) return { ok: false, error: "Użytkownik nie znaleziony" };
       const { generateOutboxId } = await import("@planlux/shared");
       const config = (await import("../src/config")).config;
       const payload = {
         id: uuid(),
-        userId,
-        userEmail: user.email,
+        userId: user.id,
+        userEmail: userRow.email,
         deviceType: "desktop" as const,
         appVersion: config.appVersion ?? "1.0.0",
         occurredAt: new Date().toISOString(),
@@ -259,7 +329,7 @@ export function   registerIpcHandlers(deps: {
       if (activityTables.length > 0) {
         db.prepare("INSERT INTO activity (id, user_id, device_type, app_version, online, occurred_at, synced) VALUES (?, ?, ?, ?, 1, ?, 0)").run(
           uuid(),
-          userId,
+          user.id,
           "desktop",
           config.appVersion ?? "1.0.0",
           payload.occurredAt
@@ -267,25 +337,33 @@ export function   registerIpcHandlers(deps: {
       }
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("enqueueHeartbeat failed", e);
       return { ok: false, error: String(e) };
     }
   });
 
-  ipcMain.handle("planlux:getActivity", async (_, userId: string, isAdmin: boolean) => {
+  ipcMain.handle("planlux:getActivity", async (_, options?: { all?: boolean }) => {
     try {
+      const user = requireAuth();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='activity'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, data: [] };
-      const rows = isAdmin
+      const showAll = options?.all === true && (user.role === "ADMIN" || user.role === "BOSS");
+      const rows = showAll
         ? db.prepare(
             `SELECT a.id, a.user_id, a.device_type, a.app_version, a.occurred_at, u.display_name as user_display_name, u.email as user_email
              FROM activity a LEFT JOIN users u ON a.user_id = u.id
              ORDER BY a.occurred_at DESC LIMIT 200`
           ).all()
-        : db.prepare("SELECT * FROM activity WHERE user_id = ? ORDER BY occurred_at DESC LIMIT 100").all(userId);
+        : db.prepare("SELECT * FROM activity WHERE user_id = ? ORDER BY occurred_at DESC LIMIT 100").all(user.id);
       return { ok: true, data: rows };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message, data: [] };
+      }
       logger.error("getActivity failed", e);
       return { ok: false, error: String(e), data: [] };
     }
@@ -293,6 +371,7 @@ export function   registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getUsers", async () => {
     try {
+      requireRole(["ADMIN"]);
       const db = getDb();
       const rows = db.prepare("SELECT id, email, role, display_name, active, created_at FROM users ORDER BY email").all() as Array<{
         id: string;
@@ -314,19 +393,19 @@ export function   registerIpcHandlers(deps: {
         })),
       };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message, users: [] };
+      }
       logger.error("getUsers failed", e);
       return { ok: false, error: String(e), users: [] };
     }
   });
 
   /** Admin: utwórz użytkownika. Wymaga roli ADMIN. */
-  ipcMain.handle("planlux:createUser", async (_, actingUserId: string, payload: { email: string; password: string; displayName?: string; role?: string }) => {
+  ipcMain.handle("planlux:createUser", async (_, payload: { email: string; password: string; displayName?: string; role?: string }) => {
     try {
+      requireRole(["ADMIN"]);
       const db = getDb();
-      const actor = db.prepare("SELECT role FROM users WHERE id = ? AND active = 1").get(actingUserId) as { role: string } | undefined;
-      if (!actor || actor.role !== "ADMIN") {
-        return { ok: false, error: "Brak uprawnień (wymagana rola ADMIN)" };
-      }
       const email = (payload.email ?? "").trim().toLowerCase();
       if (!email) return { ok: false, error: "Email jest wymagany" };
       const password = payload.password ?? "";
@@ -343,19 +422,19 @@ export function   registerIpcHandlers(deps: {
       logger.info("[admin] createUser", { email, role });
       return { ok: true, id };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[admin] createUser failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
   /** Admin: aktualizuj użytkownika. Wymaga roli ADMIN. */
-  ipcMain.handle("planlux:updateUser", async (_, actingUserId: string, targetUserId: string, payload: { email?: string; displayName?: string; role?: string; password?: string }) => {
+  ipcMain.handle("planlux:updateUser", async (_, targetUserId: string, payload: { email?: string; displayName?: string; role?: string; password?: string }) => {
     try {
+      requireRole(["ADMIN"]);
       const db = getDb();
-      const actor = db.prepare("SELECT role FROM users WHERE id = ? AND active = 1").get(actingUserId) as { role: string } | undefined;
-      if (!actor || actor.role !== "ADMIN") {
-        return { ok: false, error: "Brak uprawnień (wymagana rola ADMIN)" };
-      }
       const target = db.prepare("SELECT id FROM users WHERE id = ?").get(targetUserId);
       if (!target) return { ok: false, error: "Użytkownik nie znaleziony" };
       const updates: string[] = [];
@@ -389,38 +468,46 @@ export function   registerIpcHandlers(deps: {
       logger.info("[admin] updateUser", { targetUserId });
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[admin] updateUser failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
   /** Admin: wyłącz/włącz użytkownika. Wymaga roli ADMIN. */
-  ipcMain.handle("planlux:disableUser", async (_, actingUserId: string, targetUserId: string, active: boolean) => {
+  ipcMain.handle("planlux:disableUser", async (_, targetUserId: string, active: boolean) => {
     try {
+      requireRole(["ADMIN"]);
       const db = getDb();
-      const actor = db.prepare("SELECT role FROM users WHERE id = ? AND active = 1").get(actingUserId) as { role: string } | undefined;
-      if (!actor || actor.role !== "ADMIN") {
-        return { ok: false, error: "Brak uprawnień (wymagana rola ADMIN)" };
-      }
       const target = db.prepare("SELECT id FROM users WHERE id = ?").get(targetUserId);
       if (!target) return { ok: false, error: "Użytkownik nie znaleziony" };
       db.prepare("UPDATE users SET active = ?, updated_at = datetime('now') WHERE id = ?").run(active ? 1 : 0, targetUserId);
       logger.info("[admin] disableUser", { targetUserId, active });
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[admin] disableUser failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
-  ipcMain.handle("planlux:getOffers", async (_, userId: string, isAdmin: boolean) => {
+  ipcMain.handle("planlux:getOffers", async () => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      const rows = isAdmin
+      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      const rows = seeAll
         ? db.prepare("SELECT * FROM offers ORDER BY created_at DESC LIMIT 200").all()
-        : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(userId);
+        : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
       return { ok: true, data: rows };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("getOffers failed", e);
       return { ok: false, error: String(e) };
     }
@@ -863,11 +950,12 @@ export function   registerIpcHandlers(deps: {
   }
 
   /** Tworzy ofertę: numer zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
-  ipcMain.handle("planlux:createOffer", async (_, userId: string, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
+  ipcMain.handle("planlux:createOffer", async (_, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
     try {
+      const user = requireAuth();
       const numRes = await (async () => {
         const db = getDb();
-        const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(userId) as { display_name: string | null; email?: string } | undefined;
+        const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(user.id) as { display_name: string | null; email?: string } | undefined;
         const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
         const year = new Date().getFullYear();
         try {
@@ -910,27 +998,31 @@ export function   registerIpcHandlers(deps: {
       db.prepare(
         `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
          VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
-      ).run(offerId, numRes.offerNumber, userId.trim(), clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+      ).run(offerId, numRes.offerNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
 
       const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
       if (auditTables.length > 0) {
         db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'CREATE_OFFER', ?)").run(
-          uuid(), offerId, userId.trim(), JSON.stringify({ offerNumber: numRes.offerNumber, clientName, widthM: w, lengthM: l })
+          uuid(), offerId, user.id, JSON.stringify({ offerNumber: numRes.offerNumber, clientName, widthM: w, lengthM: l })
         );
       }
       logger.info("[crm] createOffer ok", { offerId, offerNumber: numRes.offerNumber });
       return { ok: true, offerId, offerNumber: numRes.offerNumber, isTemp: numRes.isTemp ?? false };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[crm] createOffer failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
   /** Auto-numer oferty: zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
-  ipcMain.handle("planlux:getNextOfferNumber", async (_, userId: string) => {
+  ipcMain.handle("planlux:getNextOfferNumber", async () => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(userId) as
+      const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(user.id) as
         | { display_name: string | null; email?: string }
         | undefined;
       const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
@@ -951,6 +1043,9 @@ export function   registerIpcHandlers(deps: {
       const tempNumber = `TEMP-${deviceId}-${Date.now()}`;
       return { ok: true, offerNumber: tempNumber, isTemp: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[offer] getNextOfferNumber failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
@@ -959,17 +1054,22 @@ export function   registerIpcHandlers(deps: {
   const OFFER_DRAFT_PATH = path.join(app.getPath("userData"), "offer-draft.json");
   ipcMain.handle("planlux:loadOfferDraft", async () => {
     try {
+      requireAuth();
       if (!fs.existsSync(OFFER_DRAFT_PATH)) return { ok: true, draft: null };
       const raw = fs.readFileSync(OFFER_DRAFT_PATH, "utf-8");
       const draft = JSON.parse(raw);
       return { ok: true, draft };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message, draft: null };
+      }
       logger.error("[draft] loadOfferDraft failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      return { ok: false, error: e instanceof Error ? e.message : String(e), draft: null };
     }
   });
-  ipcMain.handle("planlux:saveOfferDraft", async (_, draft: unknown, userId?: string) => {
+  ipcMain.handle("planlux:saveOfferDraft", async (_, draft: unknown) => {
     try {
+      const user = requireAuth();
       fs.mkdirSync(path.dirname(OFFER_DRAFT_PATH), { recursive: true });
       fs.writeFileSync(OFFER_DRAFT_PATH, JSON.stringify(draft, null, 0), "utf-8");
 
@@ -990,7 +1090,7 @@ export function   registerIpcHandlers(deps: {
       const l = parseFloat(String(d?.lengthM ?? 0)) || 0;
       const hasData = clientName.length > 0 && w > 0 && l > 0;
 
-      if (hasData && typeof userId === "string" && userId.trim()) {
+      if (hasData && user.id) {
         try {
           const db = getDb();
           const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
@@ -1031,7 +1131,7 @@ export function   registerIpcHandlers(deps: {
               ).run(
                 offerId,
                 offerNumber,
-                userId.trim(),
+                user.id,
                 clientFirstName,
                 clientLastName,
                 companyName,
@@ -1053,7 +1153,7 @@ export function   registerIpcHandlers(deps: {
               db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, ?, ?)").run(
                 uuid(),
                 offerId,
-                userId.trim(),
+                user.id,
                 auditType,
                 JSON.stringify({ clientName, widthM: w, lengthM: l })
               );
@@ -1067,23 +1167,31 @@ export function   registerIpcHandlers(deps: {
 
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[draft] saveOfferDraft failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
   ipcMain.handle("planlux:clearOfferDraft", async () => {
     try {
+      requireAuth();
       if (fs.existsSync(OFFER_DRAFT_PATH)) fs.unlinkSync(OFFER_DRAFT_PATH);
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[draft] clearOfferDraft failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
   /** Dashboard: statystyki ofert (per użytkownik lub globalne dla managera). */
-  ipcMain.handle("planlux:getDashboardStats", async (_, userId: string, isAdmin: boolean) => {
+  ipcMain.handle("planlux:getDashboardStats", async () => {
     try {
+      const user = requireAuth();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) {
@@ -1094,7 +1202,8 @@ export function   registerIpcHandlers(deps: {
           perUser: [],
         };
       }
-      const filterUser = isAdmin ? null : userId;
+      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      const filterUser = seeAll ? null : user.id;
       const where = filterUser ? "WHERE user_id = ?" : "";
       const args = filterUser ? [filterUser] : [];
 
@@ -1110,7 +1219,7 @@ export function   registerIpcHandlers(deps: {
         const s = (r.status ?? "IN_PROGRESS").toUpperCase();
         if (s in byStatus) byStatus[s]++;
         totalPln += Number(r.total_pln ?? 0) || 0;
-        if (isAdmin && r.user_id) {
+        if (seeAll && r.user_id) {
           const u = userMap.get(r.user_id) ?? { count: 0, totalPln: 0 };
           u.count++;
           u.totalPln += Number(r.total_pln ?? 0) || 0;
@@ -1119,7 +1228,7 @@ export function   registerIpcHandlers(deps: {
       }
 
       let perUser: Array<{ userId: string; displayName: string; email: string; count: number; totalPln: number }> = [];
-      if (isAdmin && userMap.size > 0) {
+      if (seeAll && userMap.size > 0) {
         const users = db.prepare("SELECT id, email, display_name FROM users WHERE active = 1").all() as Array<{ id: string; email: string; display_name: string }>;
         const userById = new Map(users.map((u) => [u.id, u]));
         perUser = Array.from(userMap.entries())
@@ -1139,6 +1248,9 @@ export function   registerIpcHandlers(deps: {
 
       return { ok: true, byStatus, totalPln, perUser };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, byStatus: { IN_PROGRESS: 0, GENERATED: 0, SENT: 0, REALIZED: 0 }, totalPln: 0, perUser: [], error: e.message };
+      }
       logger.error("[dashboard] getDashboardStats failed", e);
       return {
         ok: false,
@@ -1149,17 +1261,21 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: lista ofert z offers_crm. isAdmin=true → bez filtra user_id (Szef widzi wszystkie). */
-  ipcMain.handle("planlux:getOffersCrm", async (_, userId: string, statusFilter: string, searchQuery: string, isAdmin?: boolean) => {
+  /** CRM: lista ofert z offers_crm. SALESPERSON → filtr user_id; BOSS/ADMIN → wszystkie. */
+  ipcMain.handle("planlux:getOffersCrm", async (_, params?: { statusFilter?: string; searchQuery?: string }) => {
     try {
+      const user = requireAuth();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, offers: [] };
+      const statusFilter = params?.statusFilter ?? "all";
+      const searchQuery = params?.searchQuery ?? "";
       let sql = "SELECT id, offer_number, status, user_id, client_first_name, client_last_name, company_name, nip, phone, variant_hali, width_m, length_m, area_m2, total_pln, created_at, pdf_generated_at, emailed_at, realized_at FROM offers_crm";
       const args: unknown[] = [];
-      if (!isAdmin) {
+      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      if (!seeAll) {
         sql += " WHERE user_id = ?";
-        args.push(userId);
+        args.push(user.id);
       }
       if (statusFilter !== "all") {
         sql += (args.length > 0 ? " AND" : " WHERE") + " status = ?";
@@ -1194,18 +1310,18 @@ export function   registerIpcHandlers(deps: {
       }));
       return { ok: true, offers };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message, offers: [] };
+      }
       logger.error("[crm] getOffersCrm failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e), offers: [] };
     }
   });
 
   /** CRM: znajdź potencjalne duplikaty (imię/nazwisko, firma, NIP, telefon, e-mail). */
-  ipcMain.handle("planlux:findDuplicateOffers", async (
-    _,
-    userId: string,
-    params: { clientName: string; nip?: string; phone?: string; email?: string }
-  ) => {
+  ipcMain.handle("planlux:findDuplicateOffers", async (_, params: { clientName: string; nip?: string; phone?: string; email?: string }) => {
     try {
+      const user = requireAuth();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, duplicates: [] };
@@ -1220,7 +1336,7 @@ export function   registerIpcHandlers(deps: {
       const rows = db.prepare(
         `SELECT id, offer_number, status, client_first_name, client_last_name, company_name, nip, phone, email, width_m, length_m, area_m2, total_pln, created_at
          FROM offers_crm WHERE user_id = ? ORDER BY created_at DESC LIMIT 100`
-      ).all(userId) as Array<Record<string, unknown>>;
+      ).all(user.id) as Array<Record<string, unknown>>;
 
       const duplicates: Array<{
         id: string;
@@ -1282,13 +1398,16 @@ export function   registerIpcHandlers(deps: {
   });
 
   /** CRM: oznacz ofertę jako zrealizowaną. */
-  ipcMain.handle("planlux:markOfferRealized", async (_, offerId: string, userId?: string) => {
+  ipcMain.handle("planlux:markOfferRealized", async (_, offerId: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
+      const offerRow = db.prepare("SELECT user_id FROM offers_crm WHERE id = ?").get(offerId) as { user_id: string } | undefined;
+      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
+      if (offerRow.user_id !== user.id && user.role !== "ADMIN" && user.role !== "BOSS") return { ok: false, error: "Forbidden" };
       const now = new Date().toISOString();
       db.prepare("UPDATE offers_crm SET status = 'REALIZED', realized_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
-      const row = db.prepare("SELECT user_id FROM offers_crm WHERE id = ?").get(offerId) as { user_id: string } | undefined;
-      const uid = userId ?? row?.user_id ?? "";
+      const uid = user.id;
       const id = uuid();
       db.prepare("INSERT INTO event_log (id, offer_id, user_id, event_type, details_json) VALUES (?, ?, ?, 'OFFER_REALIZED', ?)").run(
         id,
@@ -1322,11 +1441,12 @@ export function   registerIpcHandlers(deps: {
     return !!user && ROLES_SEE_ALL.includes(user.role);
   }
 
-  /** CRM: szczegóły oferty (pełne dane). Owner lub manager/admin ma dostęp. */
-  ipcMain.handle("planlux:getOfferDetails", async (_, offerId: string, userId: string) => {
+  /** CRM: szczegóły oferty (pełne dane). Owner lub BOSS/ADMIN ma dostęp. */
+  ipcMain.handle("planlux:getOfferDetails", async (_, offerId: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", offer: null };
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", offer: null };
       const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
       if (!row) return { ok: false, error: "Oferta nie znaleziona", offer: null };
       const offer = {
@@ -1367,10 +1487,11 @@ export function   registerIpcHandlers(deps: {
   });
 
   /** CRM: audit trail oferty (offer_audit + event_log). Owner lub manager/admin ma dostęp. */
-  ipcMain.handle("planlux:getOfferAudit", async (_, offerId: string, userId: string) => {
+  ipcMain.handle("planlux:getOfferAudit", async (_, offerId: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", items: [] };
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", items: [] };
       const auditRows = db.prepare(
         "SELECT id, offer_id, user_id, type, payload_json, created_at FROM offer_audit WHERE offer_id = ? ORDER BY created_at ASC"
       ).all(offerId) as Array<{ id: string; type: string; payload_json: string; created_at: string }>;
@@ -1388,11 +1509,12 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: historia e-maili dla oferty. Owner lub manager/admin ma dostęp. */
-  ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string, userId: string) => {
+  /** CRM: historia e-maili dla oferty. Owner lub BOSS/ADMIN ma dostęp. */
+  ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, emails: [] };
       const rows = db.prepare(
@@ -1417,11 +1539,12 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: pliki PDF powiązane z ofertą (z event_log). Owner lub manager/admin ma dostęp. */
-  ipcMain.handle("planlux:getPdfsForOffer", async (_, offerId: string, userId: string) => {
+  /** CRM: pliki PDF powiązane z ofertą (z event_log). Owner lub BOSS/ADMIN ma dostęp. */
+  ipcMain.handle("planlux:getPdfsForOffer", async (_, offerId: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      if (!canAccessOffer(db, offerId, userId)) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
       const eventRows = db.prepare(
         "SELECT details_json FROM event_log WHERE offer_id = ? AND event_type = 'OFFER_CREATED'"
       ).all(offerId) as Array<{ details_json: string }>;
@@ -1546,31 +1669,33 @@ export function   registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:syncTempOfferNumbers", () => doSyncTempOfferNumbers());
 
-  /** CRM: zamień numer oferty (np. TEMP→final po sync). */
+  /** CRM: zamień numer oferty (np. TEMP→final po sync). Owner lub BOSS/ADMIN. */
   ipcMain.handle("planlux:replaceOfferNumber", async (_, offerId: string, newOfferNumber: string) => {
     try {
+      const user = requireAuth();
       const db = getDb();
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
       db.prepare("UPDATE offers_crm SET offer_number = ?, updated_at = datetime('now') WHERE id = ?").run(newOfferNumber, offerId);
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[crm] replaceOfferNumber failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
-  /** CRM: wyślij e-mail oferty (online: SMTP + SENT; offline: QUEUED + outbox). */
-  ipcMain.handle("planlux:sendOfferEmail", async (
-    _,
-    offerId: string,
-    userId: string,
-    params: { to: string; subject: string; body: string; pdfPath?: string }
-  ) => {
+/** CRM: wyślij e-mail oferty (online: SMTP + SENT; offline: QUEUED + outbox). */
+  ipcMain.handle("planlux:sendOfferEmail", async (_, offerId: string, params: { to: string; subject: string; body: string; pdfPath?: string }) => {
     try {
+      const user = requireAuth();
       const db = getDb();
-      const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(userId) as { email: string } | undefined;
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
+      const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(user.id) as { email: string } | undefined;
       if (!userRow?.email) return { ok: false, error: "Użytkownik nie znaleziony" };
 
-      const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ? AND user_id = ?").get(offerId, userId);
+      const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerId);
       if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
 
       const emailId = uuid();
@@ -1584,7 +1709,7 @@ export function   registerIpcHandlers(deps: {
       ).run(
         emailId,
         offerId,
-        userId,
+        user.id,
         fromEmail,
         params.to.trim(),
         params.subject.trim() || "Oferta PLANLUX",
@@ -1628,7 +1753,7 @@ export function   registerIpcHandlers(deps: {
             db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
               uuid(),
               offerId,
-              userId,
+              user.id,
               JSON.stringify({ emailId, to: params.to })
             );
           }
@@ -1658,22 +1783,69 @@ export function   registerIpcHandlers(deps: {
         db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_QUEUED', ?)").run(
           uuid(),
           offerId,
-          userId,
+          user.id,
           JSON.stringify({ emailId, to: params.to })
         );
       }
       return { ok: true, queued: true };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("[email] sendOfferEmail failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
-  /** CRM: załaduj ofertę do edycji (format dla draft store). */
-  ipcMain.handle("planlux:loadOfferForEdit", async (_, offerId: string, userId: string) => {
+  /** Ogólny kanał e-mail: sprawdzenie internetu (net.request); offline → { ok: false, offline: true }. */
+  ipcMain.handle("planlux:sendEmail", async (_, payload: unknown) => {
     try {
+      const user = requireAuth();
+      if (!payload || typeof payload !== "object") {
+        return { ok: false, error: "Invalid payload" };
+      }
+      const { to, subject, text, html } = payload as {
+        to?: unknown;
+        subject?: unknown;
+        text?: unknown;
+        html?: unknown;
+      };
+      if (typeof to !== "string" || typeof subject !== "string") {
+        return { ok: false, error: "Invalid input" };
+      }
+
+      const hasInternet = await checkInternetNet();
+      if (!hasInternet) {
+        return { ok: false, offline: true };
+      }
+
+      const safeText = typeof text === "string" ? text : text != null ? String(text) : undefined;
+      const safeHtml = typeof html === "string" ? html : html != null ? String(html) : undefined;
+
+      const info = await sendSmtpEmail({
+        to: (to as string).trim(),
+        subject: (subject as string).trim(),
+        text: safeText,
+        html: safeHtml,
+      });
+      logger.info("[mail] sendEmail ok", { userId: user.id, to });
+      return { ok: true, info };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
+      logger.error("[mail] sendEmail failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** CRM: załaduj ofertę do edycji (format dla draft store). Owner lub BOSS/ADMIN. */
+  ipcMain.handle("planlux:loadOfferForEdit", async (_, offerId: string) => {
+    try {
+      const user = requireAuth();
       const db = getDb();
-      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ? AND user_id = ?").get(offerId, userId) as Record<string, unknown> | undefined;
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", draft: null };
+      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
       if (!row) return { ok: false, error: "Oferta nie znaleziona", draft: null };
       const clientName = [row.client_first_name, row.client_last_name].filter(Boolean).join(" ") || (row.company_name as string) || "";
       const addons = (() => {
@@ -1766,47 +1938,46 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  ipcMain.handle("planlux:getPdfs", async (_, userId: string, isAdmin: boolean) => {
+  ipcMain.handle("planlux:getPdfs", async () => {
     try {
+      const user = requireRole(["ADMIN", "BOSS"]);
       const db = getDb();
-      const rows = isAdmin
-        ? db.prepare(
-            `SELECT p.id, p.user_id, p.offer_id, p.client_name, p.variant_hali, p.file_name, p.file_path, p.status, p.created_at,
-              u.display_name as user_display_name
-             FROM pdfs p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT 100`
-          ).all()
-        : db.prepare("SELECT * FROM pdfs WHERE user_id = ? ORDER BY created_at DESC LIMIT 100").all(userId);
+      const rows = db.prepare(
+        `SELECT p.id, p.user_id, p.offer_id, p.client_name, p.variant_hali, p.file_name, p.file_path, p.status, p.created_at,
+          u.display_name as user_display_name
+         FROM pdfs p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT 100`
+      ).all();
       return { ok: true, data: rows };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("getPdfs failed", e);
       return { ok: false, error: String(e) };
     }
   });
 
-  ipcMain.handle("planlux:getEmails", async (_, userId: string, isAdmin: boolean) => {
+  ipcMain.handle("planlux:getEmails", async () => {
     try {
+      const user = requireRole(["ADMIN", "BOSS"]);
       const db = getDb();
       const hasEmailHistory = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>).length > 0;
       if (hasEmailHistory) {
-        const rows = isAdmin
-          ? db.prepare(
-              `SELECT eh.id, eh.offer_id, eh.user_id, eh.from_email, eh.to_email, eh.subject, eh.sent_at, eh.status, eh.error_message, eh.created_at,
-                u.display_name as user_display_name
-               FROM email_history eh
-               LEFT JOIN users u ON eh.user_id = u.id
-               ORDER BY eh.created_at DESC LIMIT 100`
-            ).all()
-          : db.prepare(
-              `SELECT eh.id, eh.offer_id, eh.user_id, eh.from_email, eh.to_email, eh.subject, eh.sent_at, eh.status, eh.error_message, eh.created_at
-               FROM email_history eh WHERE eh.user_id = ? ORDER BY eh.created_at DESC LIMIT 100`
-            ).all(userId);
+        const rows = db.prepare(
+          `SELECT eh.id, eh.offer_id, eh.user_id, eh.from_email, eh.to_email, eh.subject, eh.sent_at, eh.status, eh.error_message, eh.created_at,
+            u.display_name as user_display_name
+           FROM email_history eh
+           LEFT JOIN users u ON eh.user_id = u.id
+           ORDER BY eh.created_at DESC LIMIT 100`
+        ).all();
         return { ok: true, data: rows };
       }
-      const rows = isAdmin
-        ? db.prepare("SELECT * FROM emails ORDER BY created_at DESC LIMIT 100").all()
-        : db.prepare("SELECT * FROM emails WHERE user_id = ? ORDER BY created_at DESC LIMIT 100").all(userId);
+      const rows = db.prepare("SELECT * FROM emails ORDER BY created_at DESC LIMIT 100").all();
       return { ok: true, data: rows };
     } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
       logger.error("getEmails failed", e);
       return { ok: false, error: String(e) };
     }
@@ -1867,6 +2038,487 @@ export function   registerIpcHandlers(deps: {
     } catch (e) {
       console.log("[IPC] isOnline outer error =", e);
       return { ok: true, online: false };
+    }
+  });
+
+  /** Real Internet check via Electron net.request (no navigator.onLine). */
+  ipcMain.handle("planlux:checkInternet", async () => {
+    try {
+      const online = await checkInternetNet();
+      return { ok: true, online };
+    } catch (e) {
+      logger.warn("[checkInternet] error", e);
+      return { ok: true, online: false };
+    }
+  });
+
+  // ---------- SMTP accounts & email outbox (secure store, offline-first) ----------
+  const {
+    checkInternet: checkInternetEmail,
+    enqueueEmail,
+    sendNow,
+    processOutbox,
+    startOutboxWorker,
+  } = await import("./emailService");
+  const { setPassword: secureSetPassword, setSmtpPassword, getPassword: secureGetPassword, deletePassword: secureDeletePassword, deleteSmtpPassword, isKeytarAvailable } = await import("./secureStore");
+  const { getAccountByUserId, buildTransportForUser, getEmailSettings, setEmailSetting, sendOfferEmailNow, renderTemplate } = await import("./emailService");
+
+  startOutboxWorker(getDb as () => import("./emailService").Db, logger);
+
+  ipcMain.handle("planlux:smtp:listAccounts", async () => {
+    try {
+      requireAuth();
+      const rows = getDb().prepare("SELECT id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts ORDER BY is_default DESC, created_at ASC").all();
+      return { ok: true, accounts: rows };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      logger.error("[smtp] listAccounts failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:smtp:upsertAccount", async (_, payload: unknown) => {
+    try {
+      requireRole(["ADMIN"]);
+      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      const p = payload as { id?: string; name?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; password?: string; reply_to?: string; is_default?: boolean };
+      const id = (p.id && typeof p.id === "string") ? p.id : uuid();
+      const name = (p.name && typeof p.name === "string") ? p.name : "";
+      const from_name = (p.from_name && typeof p.from_name === "string") ? p.from_name : "";
+      const from_email = (p.from_email && typeof p.from_email === "string") ? p.from_email.trim() : "";
+      const host = (p.host && typeof p.host === "string") ? p.host.trim() : "";
+      const port = typeof p.port === "number" ? p.port : 587;
+      const secure = p.secure === true ? 1 : 0;
+      const auth_user = (p.auth_user && typeof p.auth_user === "string") ? p.auth_user.trim() : from_email;
+      const reply_to = (p.reply_to && typeof p.reply_to === "string") ? p.reply_to.trim() : null;
+      const is_default = p.is_default === true ? 1 : 0;
+      const now = new Date().toISOString();
+      const db = getDb();
+      const existing = db.prepare("SELECT id FROM smtp_accounts WHERE id = ?").get(id);
+      if (existing) {
+        db.prepare(
+          "UPDATE smtp_accounts SET name=?, from_name=?, from_email=?, host=?, port=?, secure=?, auth_user=?, reply_to=?, is_default=?, updated_at=? WHERE id=?"
+        ).run(name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, now, id);
+        if (typeof p.password === "string" && p.password.length > 0) {
+          await secureSetPassword(id, p.password);
+        }
+      } else {
+        db.prepare(
+          "INSERT INTO smtp_accounts (id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)"
+        ).run(id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, now, now);
+        if (typeof p.password === "string" && p.password.length > 0) {
+          await secureSetPassword(id, p.password);
+        }
+      }
+      if (is_default === 1) {
+        db.prepare("UPDATE smtp_accounts SET is_default = 0 WHERE id != ?").run(id);
+      }
+      return { ok: true, id };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      logger.error("[smtp] upsertAccount failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:smtp:setDefaultAccount", async (_, accountId: string) => {
+    try {
+      requireRole(["ADMIN"]);
+      getDb().prepare("UPDATE smtp_accounts SET is_default = 0").run();
+      getDb().prepare("UPDATE smtp_accounts SET is_default = 1 WHERE id = ?").run(accountId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:smtp:testAccount", async (_, accountId: string) => {
+    try {
+      requireRole(["ADMIN"]);
+      const db = getDb();
+      const row = db.prepare("SELECT * FROM smtp_accounts WHERE id = ?").get(accountId) as import("./emailService").SmtpAccountRow | undefined;
+      if (!row) return { ok: false, error: "Konto nie znalezione" };
+      const transporter = await (await import("./emailService")).buildTransport(db as import("./emailService").Db, row);
+      await transporter.verify();
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.warn("[smtp] testAccount failed", e);
+      return { ok: false, error: msg };
+    }
+  });
+
+  ipcMain.handle("planlux:smtp:deleteAccount", async (_, accountId: string) => {
+    try {
+      requireRole(["ADMIN"]);
+      await secureDeletePassword(accountId);
+      getDb().prepare("UPDATE smtp_accounts SET active = 0 WHERE id = ?").run(accountId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:smtp:isKeytarAvailable", async () => ({ ok: true, available: isKeytarAvailable() }));
+
+  /** Per-user: SMTP config for current user (no password). */
+  ipcMain.handle("planlux:smtp:getForCurrentUser", async () => {
+    try {
+      const user = requireAuth();
+      const db = getDb();
+      const row = getAccountByUserId(db as import("./emailService").Db, user.id);
+      if (!row) return { ok: true, account: null };
+      const { id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, active, created_at, updated_at } = row;
+      return { ok: true, account: { id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, active, created_at, updated_at } };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** Upsert SMTP for a user. SALESPERSON can only update self; ADMIN/BOSS can update any user. */
+  ipcMain.handle("planlux:smtp:upsertForUser", async (_, payload: unknown) => {
+    try {
+      const user = requireAuth();
+      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      const p = payload as { targetUserId?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; smtpPass?: string; reply_to?: string };
+      const targetUserId = (typeof p.targetUserId === "string" ? p.targetUserId : null) ?? user.id;
+      if (user.role === "SALESPERSON" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
+      const db = getDb();
+      const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(targetUserId) as { email: string } | undefined;
+      if (!userRow) return { ok: false, error: "Użytkownik nie znaleziony" };
+      const from_email = (typeof p.from_email === "string" ? p.from_email.trim() : null) ?? userRow.email;
+      const from_name = (typeof p.from_name === "string" ? p.from_name.trim() : "") || from_email;
+      const host = (typeof p.host === "string" ? p.host.trim() : "") || "";
+      const port = typeof p.port === "number" ? p.port : 587;
+      const secure = p.secure === true ? 1 : 0;
+      const auth_user = (typeof p.auth_user === "string" ? p.auth_user.trim() : null) ?? from_email;
+      const reply_to = (typeof p.reply_to === "string" ? p.reply_to.trim() : null) || null;
+      const now = new Date().toISOString();
+      const existing = db.prepare("SELECT id FROM smtp_accounts WHERE user_id = ?").get(targetUserId) as { id: string } | undefined;
+      if (existing) {
+        db.prepare(
+          "UPDATE smtp_accounts SET from_name=?, from_email=?, host=?, port=?, secure=?, auth_user=?, reply_to=?, updated_at=? WHERE user_id=?"
+        ).run(from_name, from_email, host, port, secure, auth_user, reply_to, now, targetUserId);
+      } else {
+        const id = uuid();
+        db.prepare(
+          "INSERT INTO smtp_accounts (id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,1,?,?)"
+        ).run(id, targetUserId, "", from_name, from_email, host, port, secure, auth_user, reply_to, now, now);
+      }
+      if (typeof p.smtpPass === "string" && p.smtpPass.length > 0) {
+        await setSmtpPassword(targetUserId, p.smtpPass);
+      }
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      logger.error("[smtp] upsertForUser failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** Test SMTP connection for a user. */
+  ipcMain.handle("planlux:smtp:testForUser", async (_, userId?: string) => {
+    try {
+      const user = requireAuth();
+      const targetUserId = (typeof userId === "string" ? userId : null) ?? user.id;
+      if (user.role === "SALESPERSON" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
+      const db = getDb() as import("./emailService").Db;
+      const transporter = await buildTransportForUser(db, targetUserId);
+      await transporter.verify();
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.warn("[smtp] testForUser failed", e);
+      return { ok: false, error: msg };
+    }
+  });
+
+  ipcMain.handle("planlux:settings:getEmailSettings", async () => {
+    try {
+      requireAuth();
+      const db = getDb() as import("./emailService").Db;
+      const settings = getEmailSettings(db);
+      return { ok: true, settings };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:settings:updateEmailSettings", async (_, payload: unknown) => {
+    try {
+      requireRole(["ADMIN"]);
+      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      const p = payload as { office_cc_email?: string; office_cc_default_enabled?: boolean; email_template_subject?: string; email_template_body_html?: string; email_template_body_text?: string };
+      const db = getDb();
+      if (typeof p.office_cc_email === "string") setEmailSetting(db as import("./emailService").Db, "office_cc_email", p.office_cc_email);
+      if (typeof p.office_cc_default_enabled === "boolean") setEmailSetting(db as import("./emailService").Db, "office_cc_default_enabled", p.office_cc_default_enabled ? "1" : "0");
+      if (typeof p.email_template_subject === "string") setEmailSetting(db as import("./emailService").Db, "email_template_subject", p.email_template_subject);
+      if (typeof p.email_template_body_html === "string") setEmailSetting(db as import("./emailService").Db, "email_template_body_html", p.email_template_body_html);
+      if (typeof p.email_template_body_text === "string") setEmailSetting(db as import("./emailService").Db, "email_template_body_text", p.email_template_body_text);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** Preview subject/body for offer email (templates + vars). */
+  ipcMain.handle("planlux:email:getOfferEmailPreview", async (_, offerId: string) => {
+    try {
+      const user = requireAuth();
+      const db = getDb();
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", subject: "", bodyHtml: "", bodyText: "" };
+      const settings = getEmailSettings(db as import("./emailService").Db);
+      const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(offerId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
+      if (!offerRow) return { ok: true, subject: settings.email_template_subject, bodyHtml: settings.email_template_body_html, bodyText: settings.email_template_body_text };
+      const salespersonRow = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(user.id) as { display_name: string | null; email: string } | undefined;
+      const clientName = [offerRow.client_first_name, offerRow.client_last_name].filter(Boolean).join(" ") || offerRow.company_name || "";
+      const templateVars: Record<string, string> = {
+        offerNumber: offerRow.offer_number || "",
+        clientName,
+        companyName: offerRow.company_name || "",
+        salespersonName: salespersonRow?.display_name?.trim() || salespersonRow?.email || "",
+        salespersonEmail: salespersonRow?.email || "",
+        date: new Date().toLocaleDateString("pl-PL"),
+      };
+      const subject = renderTemplate(settings.email_template_subject, templateVars);
+      const bodyHtml = renderTemplate(settings.email_template_body_html, templateVars);
+      const bodyText = renderTemplate(settings.email_template_body_text, templateVars);
+      return { ok: true, subject, bodyHtml, bodyText, officeCcDefault: settings.office_cc_default_enabled, officeCcEmail: settings.office_cc_email };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message, subject: "", bodyHtml: "", bodyText: "" };
+      return { ok: false, error: e instanceof Error ? e.message : String(e), subject: "", bodyHtml: "", bodyText: "" };
+    }
+  });
+
+  /** Send offer email: templates, CC to office, auto PDF. SALESPERSON = own account; BOSS/ADMIN may send as another user. */
+  ipcMain.handle("planlux:email:sendOfferEmail", async (_, payload: unknown) => {
+    try {
+      const user = requireAuth();
+      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      const p = payload as { offerId: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string };
+      const offerId = typeof p.offerId === "string" ? p.offerId : "";
+      const to = typeof p.to === "string" ? p.to.trim() : "";
+      if (!offerId || !to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      const db = getDb();
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
+      const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
+      if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };
+      const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
+      if (!account) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)" };
+
+      const settings = getEmailSettings(db as import("./emailService").Db);
+      const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(offerId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
+      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
+      const salespersonRow = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(senderUserId) as { display_name: string | null; email: string } | undefined;
+      const clientName = [offerRow.client_first_name, offerRow.client_last_name].filter(Boolean).join(" ") || offerRow.company_name || "";
+      const companyName = offerRow.company_name || "";
+      const templateVars: Record<string, string> = {
+        offerNumber: offerRow.offer_number || "",
+        clientName,
+        companyName,
+        salespersonName: salespersonRow?.display_name?.trim() || salespersonRow?.email || "",
+        salespersonEmail: salespersonRow?.email || "",
+        date: new Date().toLocaleDateString("pl-PL"),
+      };
+      const subject = typeof p.subjectOverride === "string" && p.subjectOverride.trim()
+        ? p.subjectOverride.trim()
+        : renderTemplate(settings.email_template_subject, templateVars);
+      const bodyHtml = typeof p.bodyOverride === "string" && p.bodyOverride.trim()
+        ? p.bodyOverride.trim()
+        : renderTemplate(settings.email_template_body_html, templateVars);
+      const bodyText = typeof p.bodyOverride === "string" && p.bodyOverride.trim()
+        ? p.bodyOverride.trim().replace(/<[^>]+>/g, " ").trim()
+        : renderTemplate(settings.email_template_body_text, templateVars);
+
+      let cc = "";
+      if (p.ccOfficeEnabled !== false && settings.office_cc_default_enabled !== false && settings.office_cc_email) {
+        cc = settings.office_cc_email.trim();
+      } else if (p.ccOfficeEnabled === true && settings.office_cc_email) {
+        cc = settings.office_cc_email.trim();
+      }
+
+      const eventRows = db.prepare("SELECT details_json FROM event_log WHERE offer_id = ? AND event_type = 'OFFER_CREATED'").all(offerId) as Array<{ details_json: string }>;
+      const pdfIds = eventRows.map((r) => {
+        try {
+          const d = JSON.parse(r.details_json || "{}");
+          return d.pdfId;
+        } catch {
+          return null;
+        }
+      }).filter(Boolean) as string[];
+      let pdfPath: string | null = null;
+      let pdfFileName: string | null = null;
+      if (pdfIds.length > 0) {
+        const pdfRow = db.prepare("SELECT file_path, file_name FROM pdfs WHERE id = ?").get(pdfIds[0]) as { file_path: string; file_name: string } | undefined;
+        if (pdfRow?.file_path) {
+          pdfPath = pdfRow.file_path;
+          pdfFileName = pdfRow.file_name || "oferta.pdf";
+        }
+      }
+      const attachments = pdfPath && pdfFileName ? [{ filename: pdfFileName, path: pdfPath }] : undefined;
+
+      const online = await checkInternetEmail();
+      if (!online) {
+        const id = enqueueEmail(db as import("./emailService").Db, {
+          to,
+          cc: cc || undefined,
+          subject,
+          html: bodyHtml,
+          text: bodyText,
+          attachments,
+          relatedOfferId: offerId,
+          accountUserId: senderUserId,
+        }, logger);
+        return { ok: true, queued: true, outboxId: id };
+      }
+
+      const result = await sendOfferEmailNow(db as import("./emailService").Db, {
+        to,
+        cc: cc || undefined,
+        subject,
+        bodyHtml,
+        bodyText,
+        attachments,
+        accountUserId: senderUserId,
+      }, logger);
+
+      if (result.ok) {
+        const now = new Date().toISOString();
+        db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
+        const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+        if (auditTables.length > 0) {
+          db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
+            uuid(), offerId, user.id, JSON.stringify({ to })
+          );
+        }
+        return { ok: true, sent: true };
+      }
+
+      enqueueEmail(db as import("./emailService").Db, {
+        to,
+        cc: cc || undefined,
+        subject,
+        html: bodyHtml,
+        text: bodyText,
+        attachments,
+        relatedOfferId: offerId,
+        accountUserId: senderUserId,
+      }, logger);
+      return { ok: true, queued: true, error: result.error };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      logger.error("[email] sendOfferEmail failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:email:send", async (_, payload: unknown) => {
+    try {
+      requireAuth();
+      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      const p = payload as { to?: string; cc?: string; bcc?: string; subject?: string; text?: string; html?: string; attachments?: Array<{ filename: string; path: string }>; relatedOfferId?: string; accountId?: string | null };
+      const to = typeof p.to === "string" ? p.to.trim() : "";
+      const subject = typeof p.subject === "string" ? p.subject.trim() : "";
+      if (!to || !subject) return { ok: false, error: "Do i temat są wymagane" };
+      const online = await checkInternetEmail();
+      const db = getDb() as import("./emailService").Db;
+      if (!online) {
+        const id = enqueueEmail(db, {
+          to,
+          cc: p.cc,
+          bcc: p.bcc,
+          subject,
+          text: p.text,
+          html: p.html,
+          attachments: p.attachments,
+          relatedOfferId: p.relatedOfferId,
+          accountId: p.accountId,
+        }, logger);
+        return { ok: true, queued: true, outboxId: id };
+      }
+      const { getDefaultAccount: getDefaultSmtpAccount } = await import("./emailService");
+      const defaultAccount = getDefaultSmtpAccount(db);
+      if (!defaultAccount && !p.accountId) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina" };
+      const accountId = p.accountId ?? defaultAccount?.id ?? null;
+      const account: import("./emailService").SmtpAccountRow | null | undefined = accountId
+        ? (db.prepare("SELECT * FROM smtp_accounts WHERE id = ? AND active = 1").get(accountId) as import("./emailService").SmtpAccountRow | undefined)
+        : defaultAccount;
+      if (!account) return { ok: false, error: "Konto SMTP nie znalezione" };
+      const tempId = uuid();
+      const outboxRow: import("./emailService").EmailOutboxRow = {
+        id: tempId,
+        account_id: account.id,
+        to_addr: to,
+        cc: p.cc || null,
+        bcc: p.bcc || null,
+        subject,
+        text_body: p.text || null,
+        html_body: p.html || null,
+        attachments_json: JSON.stringify(p.attachments || []),
+        related_offer_id: p.relatedOfferId || null,
+        status: "queued",
+        retry_count: 0,
+        next_retry_at: null,
+        last_error: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      const result = await sendNow(db, outboxRow, logger);
+      if (result.ok) {
+        db.prepare(
+          "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?)"
+        ).run(uuid(), tempId, account.id, to, subject, result.messageId || null, new Date().toISOString(), new Date().toISOString());
+        return { ok: true, sent: true };
+      }
+      enqueueEmail(db, { to, cc: p.cc, bcc: p.bcc, subject, text: p.text, html: p.html, attachments: p.attachments, relatedOfferId: p.relatedOfferId, accountId: account.id }, logger);
+      return { ok: true, queued: true, outboxId: tempId };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      logger.error("[email] send failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:email:outboxList", async (_, filter: { status?: string }) => {
+    try {
+      requireAuth();
+      const status = filter?.status;
+      const db = getDb();
+      const rows = status
+        ? db.prepare("SELECT * FROM email_outbox WHERE status = ? ORDER BY created_at DESC LIMIT 200").all(status)
+        : db.prepare("SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT 200").all();
+      return { ok: true, items: rows };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e), items: [] };
+    }
+  });
+
+  ipcMain.handle("planlux:email:retryNow", async (_, outboxId: string) => {
+    try {
+      requireAuth();
+      getDb().prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'queued', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:email:historyList", async (_, limit?: number) => {
+    try {
+      requireAuth();
+      const limitNum = typeof limit === "number" ? Math.min(limit, 500) : 100;
+      const rows = getDb().prepare("SELECT * FROM email_history ORDER BY created_at DESC LIMIT ?").all(limitNum);
+      return { ok: true, items: rows };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      return { ok: false, error: e instanceof Error ? e.message : String(e), items: [] };
     }
   });
 }

@@ -209,7 +209,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     const invoke = (window as unknown as { planlux?: { invoke?: (c: string, ...a: unknown[]) => Promise<unknown> } }).planlux?.invoke;
     if (!invoke) return;
     createOfferRequestedRef.current = true;
-    invoke("planlux:createOffer", userId, { clientName: clientName.trim(), widthM: w, lengthM: l })
+    invoke("planlux:createOffer", { clientName: clientName.trim(), widthM: w, lengthM: l })
       .then((res: unknown) => {
         const r = res as { ok?: boolean; offerId?: string; offerNumber?: string };
         if (r?.ok && r?.offerId && r?.offerNumber) {
@@ -497,7 +497,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     let offerNumber = draft.offerNumber?.trim();
     if (!offerNumber) {
       if (typeof window.planlux?.invoke === "function") {
-        const res = (await api("planlux:getNextOfferNumber", userId)) as { ok: boolean; offerNumber?: string };
+        const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
         if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
       }
       if (!offerNumber && typeof localStorage !== "undefined") {
@@ -556,7 +556,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
     setGenerating(true);
     try {
-      const dupRes = (await api("planlux:findDuplicateOffers", userId, {
+      const dupRes = (await api("planlux:findDuplicateOffers", {
         clientName,
         nip: clientNip || undefined,
         phone: clientPhone || undefined,
@@ -701,7 +701,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                     try {
                       let offerNumber: string | null = null;
                       if (typeof window.planlux?.invoke === "function") {
-                        const res = (await api("planlux:getNextOfferNumber", userId)) as { ok: boolean; offerNumber?: string };
+                        const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
                         if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
                       }
                       if (!offerNumber && typeof localStorage !== "undefined") {
@@ -772,7 +772,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                     setOverwriteOfferNumberDialog(false);
                     let offerNumber: string | null = null;
                     if (typeof window.planlux?.invoke === "function") {
-                      const res = (await api("planlux:getNextOfferNumber", userId)) as { ok: boolean; offerNumber?: string };
+                      const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
                       if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
                     }
                     if (!offerNumber && typeof localStorage !== "undefined") {

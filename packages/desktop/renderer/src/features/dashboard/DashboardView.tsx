@@ -54,7 +54,7 @@ export function DashboardView({ api, userId, isAdmin }: Props) {
     const load = async () => {
       setLoading(true);
       try {
-        const r = (await api("planlux:getDashboardStats", userId, isAdmin)) as {
+        const r = (await api("planlux:getDashboardStats")) as {
           ok: boolean;
           byStatus?: Record<string, number>;
           totalPln?: number;

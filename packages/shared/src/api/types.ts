@@ -116,10 +116,11 @@ export interface ReserveOfferNumberResponse {
   error?: string;
 }
 
-export type OutboxOperationType = "SEND_EMAIL" | "LOG_PDF" | "LOG_EMAIL" | "HEARTBEAT" | "OFFER_SYNC";
+export type OutboxOperationType = "SEND_EMAIL" | "SEND_GENERIC_EMAIL" | "LOG_PDF" | "LOG_EMAIL" | "HEARTBEAT" | "OFFER_SYNC";
 
 export interface OutboxPayloadMap {
   SEND_EMAIL: { emailId: string; to: string; subject: string; body: string; attachmentPath?: string };
+  SEND_GENERIC_EMAIL: { to: string; subject: string; text?: string; html?: string };
   LOG_PDF: LogPdfPayload;
   LOG_EMAIL: LogEmailPayload;
   HEARTBEAT: HeartbeatPayload;

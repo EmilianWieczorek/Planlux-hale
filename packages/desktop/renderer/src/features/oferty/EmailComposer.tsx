@@ -1,8 +1,8 @@
 /**
- * Kompozytor e-mail – Do, Temat, Treść, Załączniki (PDF + opcjonalne).
+ * Kompozytor e-mail – Do, Temat, Treść, CC do biura, Załączniki (PDF z oferty).
  */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Dialog,
   DialogTitle,
@@ -12,8 +12,13 @@ import {
   TextField,
   Box,
   Typography,
+  FormControlLabel,
+  Checkbox,
+  Alert,
 } from "@mui/material";
 import { Send } from "@mui/icons-material";
+
+export type SendResult = { ok: boolean; error?: string; queued?: boolean };
 
 interface Props {
   open: boolean;
@@ -21,9 +26,13 @@ interface Props {
   defaultTo: string;
   defaultSubject: string;
   defaultBody?: string;
+  /** Domyślnie włączone „Wyślij kopię do biura” (z ustawień). */
+  officeCcDefault?: boolean;
+  /** Adres biura do CC (np. biuro@planlux.pl) – wyświetlany przy checkboxie. */
+  officeCcEmail?: string;
   pdfPath?: string | null;
   pdfFileName?: string;
-  onSend: (params: { to: string; subject: string; body: string; pdfPath?: string }) => Promise<{ ok: boolean; error?: string }>;
+  onSend: (params: { to: string; subject: string; body: string; ccOfficeEnabled: boolean; pdfPath?: string }) => Promise<SendResult>;
 }
 
 export function EmailComposer({
@@ -32,6 +41,8 @@ export function EmailComposer({
   defaultTo,
   defaultSubject,
   defaultBody = "",
+  officeCcDefault = true,
+  officeCcEmail,
   pdfPath,
   pdfFileName,
   onSend,
@@ -39,8 +50,21 @@ export function EmailComposer({
   const [to, setTo] = useState(defaultTo);
   const [subject, setSubject] = useState(defaultSubject);
   const [body, setBody] = useState(defaultBody);
+  const [ccOfficeEnabled, setCcOfficeEnabled] = useState(officeCcDefault);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resultMessage, setResultMessage] = useState<"sent" | "queued" | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setTo(defaultTo);
+      setSubject(defaultSubject);
+      setBody(defaultBody);
+      setCcOfficeEnabled(officeCcDefault);
+      setError(null);
+      setResultMessage(null);
+    }
+  }, [open, defaultTo, defaultSubject, defaultBody, officeCcDefault]);
 
   const handleSend = async () => {
     if (!to.trim()) {
@@ -49,15 +73,22 @@ export function EmailComposer({
     }
     setSending(true);
     setError(null);
+    setResultMessage(null);
     try {
       const res = await onSend({
         to: to.trim(),
         subject: subject.trim() || defaultSubject,
         body: body.trim(),
+        ccOfficeEnabled,
         pdfPath: pdfPath ?? undefined,
       });
       if (res.ok) {
-        onClose();
+        if (res.queued) {
+          setResultMessage("queued");
+        } else {
+          setResultMessage("sent");
+          setTimeout(() => onClose(), 1500);
+        }
       } else {
         setError(res.error ?? "Błąd wysyłki");
       }

@@ -21,6 +21,15 @@ declare global {
       downloadUpdate?: () => Promise<unknown>;
       quitAndInstall?: () => Promise<unknown>;
     };
+    api?: {
+      syncBase?: () => Promise<unknown>;
+      generatePdf?: (payload: unknown) => Promise<unknown>;
+      pdfGenerate?: (payload: unknown) => Promise<unknown>;
+      sendEmail?: (data: { to: string; subject: string; text?: string; html?: string }) => Promise<unknown>;
+      checkInternet?: () => Promise<{ ok: boolean; online: boolean }>;
+      // other methods may be added over time
+      [key: string]: unknown;
+    };
     /** Używane przez main przy before-quit – synchroniczny zapis draftu. */
     __planlux_saveDraft?: () => Promise<void>;
     /** Ustawiane przez App – userId do zapisu w offers_crm. */
@@ -58,7 +67,7 @@ export default function App() {
       reminderTimeoutRef.current = undefined;
     }
     try {
-      await api("planlux:endSession");
+      await api("planlux:logout");
     } catch (_) {}
     setUser(null);
   }, []);
@@ -91,7 +100,7 @@ export default function App() {
     (async () => {
       const [draftRes, offersRes] = await Promise.all([
         api("planlux:loadOfferDraft") as Promise<{ ok: boolean; draft?: unknown }>,
-        api("planlux:getOffersCrm", user.id, "in_progress", "", user.role === "ADMIN" || user.role === "BOSS") as Promise<{ ok: boolean; offers?: unknown[] }>,
+        api("planlux:getOffersCrm", { statusFilter: "in_progress", searchQuery: "" }) as Promise<{ ok: boolean; offers?: unknown[] }>,
       ]);
       if (cancelled) return;
       if (draftRes.ok && draftRes.draft) offerDraftStore.hydrate(draftRes.draft as Parameters<typeof offerDraftStore.hydrate>[0]);

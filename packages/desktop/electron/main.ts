@@ -9,12 +9,14 @@ import path from "path";
 import fs from "fs";
 import Database from "better-sqlite3";
 import { SCHEMA_SQL, ApiClient, flushOutbox } from "@planlux/shared";
-import { registerIpcHandlers } from "./ipc";
+import { registerIpcHandlers } from "./ipc"; // IPC handlers registered in whenReady before createWindow()
 import { config } from "../src/config";
 import { logger } from "../src/logger";
 import { createOutboxStorage, type Db } from "../src/db/outboxStorage";
 import { getRemoteMeta } from "../src/infra/baseSync";
 import { createSendEmailForFlush } from "./smtpSend";
+import { checkInternet } from "./checkInternet";
+import { sendEmail as sendGenericEmailSmtp } from "./mail";
 
 const dbPath = path.join(app.getPath("userData"), "planlux-hale.db");
 
@@ -353,17 +355,11 @@ app.whenReady().then(async () => {
     });
   }
 
-  // Flush outbox periodically; isOnline = real check via GET meta with timeout
-  const META_TIMEOUT_MS = 5000;
+  // Flush outbox periodically; isOnline = real Internet check (not just LAN)
   setInterval(async () => {
     let online = false;
     try {
-      const meta = await getRemoteMeta(
-        config.backend.url,
-        globalThis.fetch.bind(globalThis),
-        META_TIMEOUT_MS
-      );
-      online = meta != null;
+      online = await checkInternet();
     } catch (e) {
       logger.warn("[outbox] online check failed", e);
     }
@@ -373,6 +369,14 @@ app.whenReady().then(async () => {
         storage: createOutboxStorage(getDb() as Db),
         isOnline: () => online,
         sendEmail: createSendEmailForFlush(getDb),
+        sendGenericEmail: async (payload) => {
+          await sendGenericEmailSmtp({
+            to: payload.to,
+            subject: payload.subject,
+            text: payload.text,
+            html: payload.html,
+          });
+        },
       });
       if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush", r);
     } catch (e) {

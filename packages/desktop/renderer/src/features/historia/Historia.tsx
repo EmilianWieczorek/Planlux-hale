@@ -64,19 +64,19 @@ export function Historia({ api, userId, isAdmin }: Props) {
 
   useEffect(() => {
     const load = async () => {
-      const r = (await api("planlux:getPdfs", userId, isAdmin)) as { ok: boolean; data?: unknown[] };
+      const r = (await api("planlux:getPdfs")) as { ok: boolean; data?: unknown[] };
       if (r.ok && r.data) setPdfs(r.data as typeof pdfs);
     };
     load();
-  }, [api, userId, isAdmin]);
+  }, [api]);
 
   useEffect(() => {
     const load = async () => {
-      const r = (await api("planlux:getEmails", userId, isAdmin)) as { ok: boolean; data?: unknown[] };
+      const r = (await api("planlux:getEmails")) as { ok: boolean; data?: unknown[] };
       if (r.ok && r.data) setEmails(r.data as typeof emails);
     };
     load();
-  }, [api, userId, isAdmin]);
+  }, [api]);
 
   return (
     <div>

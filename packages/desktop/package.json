@@ -21,7 +21,8 @@
     "clean": "rimraf dist",
     "pdf:rebuild:test": "npm run clean && npm run build",
     "build:win": "npm run build && electron-builder --win",
-    "dist:win": "npm run build && electron-builder --win --publish never --projectDir ."
+    "dist:win": "npm run build && electron-builder --win --publish never --projectDir .",
+    "rebuild": "electron-rebuild -f -w keytar"
   },
   "dependencies": {
     "@emotion/react": "^11.13.5",
@@ -32,6 +33,7 @@
     "@planlux/shared": "1.0.0",
     "better-sqlite3": "^9.2.2",
     "electron-updater": "^6.3.0",
+    "keytar": "^7.9.0",
     "nodemailer": "^8.0.1",
     "pdfjs-dist": "^4.0.0",
     "react": "^18.2.0",
