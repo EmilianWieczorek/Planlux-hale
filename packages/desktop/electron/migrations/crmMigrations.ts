@@ -195,9 +195,11 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
 
   // 6. smtp_accounts – konfiguracja SMTP w aplikacji (hasło NIE w DB, tylko w keychain/secureStore)
   try {
+    // Nowe instalacje: pełna tabela z user_id (jeden rekord SMTP per użytkownik).
     database.exec(`
       CREATE TABLE IF NOT EXISTS smtp_accounts (
         id TEXT PRIMARY KEY,
+        user_id TEXT UNIQUE REFERENCES users(id),
         name TEXT NOT NULL DEFAULT '',
         from_name TEXT NOT NULL DEFAULT '',
         from_email TEXT NOT NULL,
@@ -285,15 +287,86 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] app_settings skipped", e);
   }
 
-  // 10. smtp_accounts: add user_id UNIQUE (one account per user)
+  // 10. smtp_accounts: przebudowa z user_id (one account per user) – idempotent, dla istniejących instalacji.
   try {
-    const info = database.prepare("PRAGMA table_info(smtp_accounts)").all() as Array<{ name: string }>;
-    if (info.length > 0 && !info.some((c) => c.name === "user_id")) {
-      database.exec("ALTER TABLE smtp_accounts ADD COLUMN user_id TEXT UNIQUE REFERENCES users(id)");
-      logger.info("[migration] smtp_accounts user_id added");
+    const info = database
+      .prepare("PRAGMA table_info(smtp_accounts)")
+      .all() as Array<{ name: string }>;
+    if (info.length > 0) {
+      const hasUserId = info.some((c) => c.name === "user_id");
+      if (hasUserId) {
+        logger.info("[migration] smtp_accounts user_id already present – skipping rebuild");
+      } else {
+        logger.info("[migration] smtp_accounts: rebuilding table to add user_id");
+        database.exec(`
+BEGIN TRANSACTION;
+
+CREATE TABLE smtp_accounts_new (
+  id TEXT PRIMARY KEY,
+  user_id TEXT UNIQUE REFERENCES users(id),
+  name TEXT NOT NULL DEFAULT '',
+  from_name TEXT NOT NULL,
+  from_email TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  secure INTEGER NOT NULL DEFAULT 0,
+  auth_user TEXT NOT NULL,
+  reply_to TEXT,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+INSERT INTO smtp_accounts_new (
+  id,
+  user_id,
+  name,
+  from_name,
+  from_email,
+  host,
+  port,
+  secure,
+  auth_user,
+  reply_to,
+  is_default,
+  active,
+  created_at,
+  updated_at
+)
+SELECT
+  id,
+  (SELECT id FROM users WHERE email = smtp_accounts.from_email LIMIT 1) AS user_id,
+  COALESCE(name, '') AS name,
+  from_name,
+  from_email,
+  host,
+  port,
+  secure,
+  auth_user,
+  reply_to,
+  COALESCE(is_default, 0) AS is_default,
+  COALESCE(active, 1) AS active,
+  COALESCE(created_at, datetime('now')) AS created_at,
+  COALESCE(updated_at, datetime('now')) AS updated_at
+FROM smtp_accounts
+WHERE EXISTS (
+  SELECT 1 FROM users WHERE email = smtp_accounts.from_email
+);
+
+DROP TABLE smtp_accounts;
+ALTER TABLE smtp_accounts_new RENAME TO smtp_accounts;
+
+CREATE INDEX IF NOT EXISTS idx_smtp_accounts_active ON smtp_accounts(active);
+CREATE INDEX IF NOT EXISTS idx_smtp_accounts_is_default ON smtp_accounts(is_default);
+
+COMMIT;
+`);
+        logger.info("[migration] smtp_accounts rebuilt with user_id");
+      }
     }
   } catch (e) {
-    logger.warn("[migration] smtp_accounts user_id skipped", e);
+    logger.warn("[migration] smtp_accounts user_id rebuild failed", e);
   }
 
   // 11. email_outbox: add account_user_id (sender user)
@@ -317,5 +390,19 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     }
   } catch (e) {
     logger.warn("[migration] email_outbox sent_at skipped", e);
+  }
+
+  // 13. email_history: add related_offer_id, provider_message_id if missing (for outbox-linked history)
+  try {
+    const info = database.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+    if (info.length > 0) {
+      if (!info.some((c) => c.name === "related_offer_id")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN related_offer_id TEXT DEFAULT NULL");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_related_offer_id ON email_history(related_offer_id)");
+        logger.info("[migration] email_history related_offer_id added");
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history related_offer_id skipped", e);
   }
 }

@@ -33,51 +33,78 @@ const apiClient = new ApiClient({
 });
 
 function runMigrations(database: ReturnType<typeof Database>) {
-  const migrations = [
-    "ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
-  ];
-  // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON)
+  // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON) + mapowanie starych ról.
   try {
     database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
     const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_roles_3");
-    const usersExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get() as { name?: string } | undefined)?.name === "users";
+    const usersExists =
+      (database
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        .get() as { name?: string } | undefined)?.name === "users";
     if (!done && usersExists) {
       logger.info("[migration] users_roles_3 START");
-      const sqlRow = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as { sql: string } | undefined;
+      const sqlRow = database
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
+        .get() as { sql: string } | undefined;
       const sqlDef = (sqlRow?.sql ?? "").toUpperCase();
-      const needsRebuild = sqlDef.includes("('USER','ADMIN')") || sqlDef.includes("('USER', 'ADMIN')") || !sqlDef.includes("BOSS") || !sqlDef.includes("SALESPERSON");
+      const needsRebuild =
+        sqlDef.includes("('USER','ADMIN')") ||
+        sqlDef.includes("('USER', 'ADMIN')") ||
+        !sqlDef.includes("BOSS") ||
+        !sqlDef.includes("SALESPERSON");
       if (needsRebuild) {
-        database.exec(`
-          CREATE TABLE users_new (
-            id TEXT PRIMARY KEY,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('ADMIN','BOSS','SALESPERSON')),
-            display_name TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-          );
-          INSERT INTO users_new (id, email, password_hash, role, display_name, active, created_at, updated_at)
-          SELECT id, email, password_hash,
-            CASE role
-              WHEN 'USER' THEN 'SALESPERSON'
-              WHEN 'MANAGER' THEN 'BOSS'
-              WHEN 'BOSS' THEN 'BOSS'
-              WHEN 'SALESPERSON' THEN 'SALESPERSON'
-              WHEN 'ADMIN' THEN 'ADMIN'
-              ELSE 'SALESPERSON'
-            END,
-            display_name, COALESCE(active, 1), created_at, updated_at FROM users;
-          DROP TABLE users;
-          ALTER TABLE users_new RENAME TO users;
-          CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-          CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-        `);
+        const cols = database
+          .prepare("PRAGMA table_info(users)")
+          .all() as Array<{ name: string }>;
+        const hasActive = cols.some((c) => c.name === "active");
+        const hasDisplayName = cols.some((c) => c.name === "display_name");
+        const hasFullName = cols.some((c) => c.name === "full_name");
+        const nameColumn = hasDisplayName ? "display_name" : hasFullName ? "full_name" : "email";
+        const activeExpr = hasActive ? "COALESCE(active,1)" : "1";
+
+        const sql = `
+BEGIN TRANSACTION;
+CREATE TABLE users_new (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('ADMIN','BOSS','SALESPERSON')),
+  display_name TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO users_new (id, email, password_hash, role, display_name, active, created_at, updated_at)
+SELECT
+  id,
+  email,
+  password_hash,
+  CASE role
+    WHEN 'USER' THEN 'SALESPERSON'
+    WHEN 'MANAGER' THEN 'BOSS'
+    WHEN 'BOSS' THEN 'BOSS'
+    WHEN 'SALESPERSON' THEN 'SALESPERSON'
+    WHEN 'ADMIN' THEN 'ADMIN'
+    ELSE 'SALESPERSON'
+  END AS role,
+  ${nameColumn} AS display_name,
+  ${activeExpr} AS active,
+  COALESCE(created_at, datetime('now')) AS created_at,
+  COALESCE(updated_at, datetime('now')) AS updated_at
+FROM users;
+DROP TABLE users;
+ALTER TABLE users_new RENAME TO users;
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+COMMIT;
+`;
+        database.exec(sql);
         database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_roles_3");
         logger.info("[migration] users_roles_3 DONE");
       } else {
-        database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_3");
+        database
+          .prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)")
+          .run("users_roles_3");
         logger.info("[migration] users_roles_3 SKIP (already has BOSS/SALESPERSON)");
       }
     }
@@ -85,6 +112,10 @@ function runMigrations(database: ReturnType<typeof Database>) {
     logger.warn("[migration] users_roles_3 failed", e);
   }
 
+  // Proste, idempotentne migracje kolumnowe.
+  const migrations = [
+    "ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+  ];
   for (const sql of migrations) {
     try {
       database.exec(sql);
@@ -149,6 +180,20 @@ function runMigrations(database: ReturnType<typeof Database>) {
   }
   const { runCrmMigrations } = require("./migrations/crmMigrations");
   runCrmMigrations(database, logger);
+
+  // Diagnostyka: logujemy aktualny kształt tabel users i smtp_accounts po migracjach.
+  try {
+    const usersSqlRow = database
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
+      .get() as { sql?: string } | undefined;
+    logger.info("[schema] users.sql", { sql: usersSqlRow?.sql });
+    const smtpInfo = database
+      .prepare("PRAGMA table_info(smtp_accounts)")
+      .all() as Array<{ name: string; type: string; notnull: number; dflt_value: unknown }>;
+    logger.info("[schema] smtp_accounts.columns", smtpInfo);
+  } catch (e) {
+    logger.warn("[schema] log failed", e);
+  }
 }
 
 function getDb() {

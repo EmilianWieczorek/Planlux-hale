@@ -1509,29 +1509,65 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: historia e-maili dla oferty. Owner lub BOSS/ADMIN ma dostęp. */
+  /** CRM: historia e-maili dla oferty. Źródła: email_history (legacy offer_id) + email_outbox (related_offer_id). */
   ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
       const db = getDb();
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>;
-      if (tables.length === 0) return { ok: true, emails: [] };
-      const rows = db.prepare(
-        "SELECT id, from_email, to_email, subject, body, attachments_json, sent_at, status, error_message, created_at FROM email_history WHERE offer_id = ? ORDER BY created_at DESC"
-      ).all(offerId) as Array<Record<string, unknown>>;
-      const emails = rows.map((r) => ({
-        id: r.id,
-        fromEmail: r.from_email ?? "",
-        toEmail: r.to_email ?? "",
-        subject: r.subject ?? "",
-        body: r.body ?? "",
-        attachments: JSON.parse((r.attachments_json as string) || "[]"),
-        sentAt: r.sent_at ?? null,
-        status: r.status ?? "",
-        errorMessage: r.error_message ?? null,
-        createdAt: r.created_at ?? "",
-      }));
+      const emails: Array<{ id: string; fromEmail: string; toEmail: string; subject: string; body: string; status: string; sentAt: string | null; errorMessage: string | null; createdAt: string }> = [];
+      try {
+        const info = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+        const hasOfferId = info.some((c) => c.name === "offer_id");
+        if (hasOfferId) {
+          const legacy = db.prepare(
+            "SELECT id, from_email, to_email, subject, body, sent_at, status, error_message, created_at FROM email_history WHERE offer_id = ? ORDER BY created_at DESC"
+          ).all(offerId) as Array<Record<string, unknown>>;
+          legacy.forEach((r) => {
+            emails.push({
+              id: String(r.id ?? ""),
+              fromEmail: String(r.from_email ?? ""),
+              toEmail: String(r.to_email ?? ""),
+              subject: String(r.subject ?? ""),
+              body: String(r.body ?? ""),
+              status: String(r.status ?? ""),
+              sentAt: r.sent_at ? String(r.sent_at) : null,
+              errorMessage: r.error_message ? String(r.error_message) : null,
+              createdAt: String(r.created_at ?? ""),
+            });
+          });
+        }
+      } catch {
+        /* legacy table may not exist or have different schema */
+      }
+      try {
+        const outboxInfo = db.prepare("PRAGMA table_info(email_outbox)").all() as Array<{ name: string }>;
+        const hasRelatedOfferId = outboxInfo.some((c) => c.name === "related_offer_id");
+        if (hasRelatedOfferId) {
+          const outbox = db.prepare(
+            "SELECT id, to_addr, subject, html_body, status, sent_at, last_error, created_at, account_user_id FROM email_outbox WHERE related_offer_id = ? ORDER BY created_at DESC"
+          ).all(offerId) as Array<Record<string, unknown>>;
+          for (const r of outbox) {
+            const senderEmail = r.account_user_id
+              ? (db.prepare("SELECT email FROM users WHERE id = ?").get(r.account_user_id) as { email: string } | undefined)?.email ?? ""
+              : "";
+            emails.push({
+              id: String(r.id ?? ""),
+              fromEmail: senderEmail,
+              toEmail: String(r.to_addr ?? ""),
+              subject: String(r.subject ?? ""),
+              body: String((r.html_body as string) ?? "").replace(/<[^>]+>/g, " ").trim(),
+              status: String(r.status ?? ""),
+              sentAt: r.sent_at ? String(r.sent_at) : null,
+              errorMessage: r.last_error ? String(r.last_error) : null,
+              createdAt: String(r.created_at ?? ""),
+            });
+          }
+        }
+      } catch {
+        /* outbox may use different column name */
+      }
+      emails.sort((a, b) => (b.createdAt > a.createdAt ? 1 : b.createdAt < a.createdAt ? -1 : 0));
       return { ok: true, emails };
     } catch (e) {
       logger.error("[crm] getEmailHistoryForOffer failed", e);
@@ -2063,24 +2099,36 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     processOutbox,
     startOutboxWorker,
   } = await import("./emailService");
-  const { setPassword: secureSetPassword, setSmtpPassword, getPassword: secureGetPassword, deletePassword: secureDeletePassword, deleteSmtpPassword, isKeytarAvailable } = await import("./secureStore");
+  const { setPassword: secureSetPassword, setSmtpPassword, getPassword: secureGetPassword, getSmtpPassword: secureGetSmtpPassword, deletePassword: secureDeletePassword, deleteSmtpPassword, isKeytarAvailable } = await import("./secureStore");
   const { getAccountByUserId, buildTransportForUser, getEmailSettings, setEmailSetting, sendOfferEmailNow, renderTemplate } = await import("./emailService");
 
   startOutboxWorker(getDb as () => import("./emailService").Db, logger);
 
   ipcMain.handle("planlux:smtp:listAccounts", async () => {
     try {
-      console.log("[IPC] planlux:smtp:listAccounts called");
-      requireAuth();
-      const rows = getDb().prepare("SELECT id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts ORDER BY is_default DESC, created_at ASC").all();
-      return { ok: true, accounts: rows };
+      const user = requireAuth();
+      const db = getDb();
+      const isAdminOrBoss = user.role === "ADMIN" || user.role === "BOSS";
+      let rows: Array<Record<string, unknown>>;
+      if (isAdminOrBoss) {
+        rows = db.prepare("SELECT id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts ORDER BY is_default DESC, created_at ASC").all() as Array<Record<string, unknown>>;
+      } else {
+        rows = db.prepare("SELECT id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts WHERE user_id = ? ORDER BY created_at ASC").all(user.id) as Array<Record<string, unknown>>;
+      }
+      const withPasswordStatus = await Promise.all(rows.map(async (r) => {
+        const uid = r.user_id as string | null;
+        const hasPassword = uid
+          ? !!(await secureGetSmtpPassword(uid))
+          : !!(await secureGetPassword(r.id as string));
+        return { ...r, hasPassword };
+      }));
+      return { ok: true, accounts: withPasswordStatus };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       logger.error("[smtp] listAccounts failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
-  console.log("[IPC] handler registered: planlux:smtp:listAccounts");
 
   ipcMain.handle("planlux:smtp:upsertAccount", async (_, payload: unknown) => {
     try {
@@ -2177,8 +2225,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const db = getDb();
       const row = getAccountByUserId(db as import("./emailService").Db, user.id);
       if (!row) return { ok: true, account: null };
-      const { id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, active, created_at, updated_at } = row;
-      return { ok: true, account: { id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, active, created_at, updated_at } };
+      const r = row as Record<string, unknown>;
+      return { ok: true, account: { id: row.id, user_id: row.user_id, name: row.name, from_name: row.from_name, from_email: row.from_email, host: row.host, port: row.port, secure: row.secure, auth_user: row.auth_user, reply_to: row.reply_to, active: row.active, created_at: r.created_at, updated_at: r.updated_at } };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -2397,10 +2445,28 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (result.ok) {
         const now = new Date().toISOString();
         db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
+        const outboxId = uuid();
+        db.prepare(
+          `INSERT INTO email_outbox (id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
+        ).run(
+          outboxId,
+          senderUserId,
+          to,
+          cc || null,
+          subject,
+          bodyText,
+          bodyHtml,
+          JSON.stringify(attachments || []),
+          offerId,
+          now,
+          now,
+          now
+        );
         const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
         if (auditTables.length > 0) {
           db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
-            uuid(), offerId, user.id, JSON.stringify({ to })
+            uuid(), offerId, user.id, JSON.stringify({ to, outboxId })
           );
         }
         return { ok: true, sent: true };
@@ -2493,12 +2559,20 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
   ipcMain.handle("planlux:email:outboxList", async (_, filter: { status?: string }) => {
     try {
-      requireAuth();
+      const user = requireAuth();
       const status = filter?.status;
       const db = getDb();
-      const rows = status
-        ? db.prepare("SELECT * FROM email_outbox WHERE status = ? ORDER BY created_at DESC LIMIT 200").all(status)
-        : db.prepare("SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT 200").all();
+      const isAdminOrBoss = user.role === "ADMIN" || user.role === "BOSS";
+      let rows: unknown[];
+      if (isAdminOrBoss) {
+        rows = status
+          ? db.prepare("SELECT * FROM email_outbox WHERE status = ? ORDER BY created_at DESC LIMIT 200").all(status)
+          : db.prepare("SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT 200").all();
+      } else {
+        rows = status
+          ? db.prepare("SELECT * FROM email_outbox WHERE account_user_id = ? AND status = ? ORDER BY created_at DESC LIMIT 200").all(user.id, status)
+          : db.prepare("SELECT * FROM email_outbox WHERE account_user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
+      }
       return { ok: true, items: rows };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
@@ -2508,8 +2582,13 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
   ipcMain.handle("planlux:email:retryNow", async (_, outboxId: string) => {
     try {
-      requireAuth();
-      getDb().prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'queued', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
+      const user = requireAuth();
+      const db = getDb();
+      const row = db.prepare("SELECT account_user_id FROM email_outbox WHERE id = ?").get(outboxId) as { account_user_id: string | null } | undefined;
+      if (!row) return { ok: false, error: "Pozycja nie znaleziona" };
+      const canRetry = user.role === "ADMIN" || user.role === "BOSS" || row.account_user_id === user.id;
+      if (!canRetry) return { ok: false, error: "Forbidden" };
+      db.prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'queued', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
       return { ok: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };

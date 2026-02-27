@@ -338,7 +338,7 @@ function nextRetryAt(retryCount: number): string {
   return new Date(Date.now() + delay).toISOString();
 }
 
-export function processOutbox(
+export async function processOutbox(
   db: Db,
   logger: { info: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void }
 ): Promise<{ processed: number; failed: number }> {

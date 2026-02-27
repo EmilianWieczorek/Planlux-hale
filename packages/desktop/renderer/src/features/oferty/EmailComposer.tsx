@@ -129,10 +129,28 @@ export function EmailComposer({
             rows={6}
             placeholder="Szanowni Państwo,&#10;&#10;W załączeniu przesyłam ofertę..."
           />
+          {officeCcEmail && (
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={ccOfficeEnabled}
+                  onChange={(e) => setCcOfficeEnabled(e.target.checked)}
+                  color="primary"
+                />
+              }
+              label={`CC do biura (${officeCcEmail})`}
+            />
+          )}
           {pdfPath && pdfFileName && (
             <Typography variant="body2" color="text.secondary">
               Załącznik: {pdfFileName}
             </Typography>
+          )}
+          {resultMessage === "sent" && (
+            <Alert severity="success">E-mail wysłany.</Alert>
+          )}
+          {resultMessage === "queued" && (
+            <Alert severity="info">Dodano do kolejki – zostanie wysłany po powrocie połączenia.</Alert>
           )}
           {error && (
             <Typography color="error" variant="body2">

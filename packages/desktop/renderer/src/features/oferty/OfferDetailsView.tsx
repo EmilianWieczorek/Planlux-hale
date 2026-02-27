@@ -104,6 +104,12 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
   const [loading, setLoading] = useState(true);
   const [emailComposerOpen, setEmailComposerOpen] = useState(false);
   const [queueSnackbarOpen, setQueueSnackbarOpen] = useState(false);
+  const [emailPreview, setEmailPreview] = useState<{
+    subject: string;
+    body: string;
+    officeCcDefault: boolean;
+    officeCcEmail: string;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -302,7 +308,32 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
           <Button
             variant="outlined"
             startIcon={<Email />}
-            onClick={() => setEmailComposerOpen(true)}
+            onClick={async () => {
+              setEmailComposerOpen(true);
+              const prev = (await api("planlux:email:getOfferEmailPreview", offerId)) as {
+                ok: boolean;
+                subject?: string;
+                bodyHtml?: string;
+                bodyText?: string;
+                officeCcDefault?: boolean;
+                officeCcEmail?: string;
+              };
+              if (prev.ok) {
+                setEmailPreview({
+                  subject: prev.subject ?? `Oferta Planlux – ${offer.offerNumber}`,
+                  body: (prev.bodyText ?? prev.bodyHtml ?? "").replace(/<[^>]+>/g, "\n"),
+                  officeCcDefault: prev.officeCcDefault ?? true,
+                  officeCcEmail: prev.officeCcEmail ?? "biuro@planlux.pl",
+                });
+              } else {
+                setEmailPreview({
+                  subject: `Oferta Planlux – ${offer.offerNumber}`,
+                  body: `Szanowni Państwo,\n\nW załączeniu przesyłam ofertę ${offer.offerNumber}.\n\nPozdrawiam`,
+                  officeCcDefault: true,
+                  officeCcEmail: "biuro@planlux.pl",
+                });
+              }
+            }}
             sx={{ mr: 1 }}
           >
             Wyślij e-mail
@@ -314,23 +345,23 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
         open={emailComposerOpen}
         onClose={() => setEmailComposerOpen(false)}
         defaultTo={offer.email || ""}
-        defaultSubject={`Oferta PLANLUX ${offer.offerNumber} – ${offer.variantHali} ${offer.widthM}×${offer.lengthM} m`}
-        defaultBody={`Szanowni Państwo,\n\nW załączeniu przesyłam ofertę na halę stalową.\n\nPozdrawiam`}
+        defaultSubject={emailPreview?.subject ?? `Oferta Planlux – ${offer.offerNumber}`}
+        defaultBody={emailPreview?.body ?? `Szanowni Państwo,\n\nW załączeniu przesyłam ofertę ${offer.offerNumber}.\n\nPozdrawiam`}
+        officeCcDefault={emailPreview?.officeCcDefault ?? true}
+        officeCcEmail={emailPreview?.officeCcEmail ?? "biuro@planlux.pl"}
         pdfPath={pdfs[0]?.filePath ?? null}
         pdfFileName={pdfs[0]?.fileName}
         onSend={async (p) => {
-          const check = (await api("planlux:checkInternet")) as { online?: boolean };
-          if (!check.online) {
-            setQueueSnackbarOpen(true);
-          }
-          const r = (await api("planlux:sendOfferEmail", offerId, {
+          const res = (await api("planlux:email:sendOfferEmail", {
+            offerId,
             to: p.to,
-            subject: p.subject,
-            body: p.body,
-            pdfPath: p.pdfPath,
-          })) as { ok: boolean; error?: string };
-          if (r.ok) await refreshData();
-          return r;
+            ccOfficeEnabled: p.ccOfficeEnabled,
+            subjectOverride: p.subject || undefined,
+            bodyOverride: p.body ? p.body.replace(/\n/g, "<br>") : undefined,
+          })) as { ok: boolean; sent?: boolean; queued?: boolean; error?: string };
+          if (res.queued) setQueueSnackbarOpen(true);
+          if (res.ok) await refreshData();
+          return res;
         }}
       />
       <Snackbar

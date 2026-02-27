@@ -1,5 +1,5 @@
 /**
- * Panel admina – zakładka E-mail: konta SMTP, outbox, historia.
+ * Panel admina – zakładka E-mail: ustawienia globalne, SMTP per handlowiec, outbox, historia.
  */
 import { useState, useEffect, useCallback } from "react";
 import {
@@ -22,6 +22,8 @@ import {
   IconButton,
   Tabs,
   Tab,
+  FormControlLabel,
+  Checkbox,
 } from "@mui/material";
 import { Add, Edit, Delete, CheckCircle, Refresh, Send } from "@mui/icons-material";
 import { tokens } from "../../theme/tokens";
@@ -37,8 +39,10 @@ const styles = {
   h2: { marginTop: 0 } as React.CSSProperties,
 };
 
+type UserRow = { id: string; email: string; role: string; displayName: string; active: boolean };
 type SmtpAccount = {
   id: string;
+  user_id?: string | null;
   name: string;
   from_name: string;
   from_email: string;
@@ -47,10 +51,9 @@ type SmtpAccount = {
   secure: number;
   auth_user: string;
   reply_to: string | null;
-  is_default: number;
-  active: number;
-  created_at: string;
-  updated_at: string;
+  is_default?: number;
+  active?: number;
+  hasPassword?: boolean;
 };
 
 type OutboxItem = {
@@ -86,26 +89,58 @@ interface Props {
 
 export function AdminEmailTab({ api }: Props) {
   const [subTab, setSubTab] = useState(0);
+  const [users, setUsers] = useState<UserRow[]>([]);
   const [accounts, setAccounts] = useState<SmtpAccount[]>([]);
   const [outboxItems, setOutboxItems] = useState<OutboxItem[]>([]);
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [globalSettings, setGlobalSettings] = useState({
+    office_cc_email: "",
+    office_cc_default_enabled: true,
+    email_template_subject: "Oferta Planlux – {{offerNumber}}",
+    email_template_body_html: "<p>Szanowni Państwo,</p><p>W załączeniu przesyłam ofertę {{offerNumber}}.</p><p>Pozdrawiam,<br>{{salespersonName}}</p>",
+  });
   const [loading, setLoading] = useState(false);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [editingUser, setEditingUser] = useState<UserRow | null>(null);
   const [editingAccount, setEditingAccount] = useState<SmtpAccount | null>(null);
-  const [formName, setFormName] = useState("");
   const [formFromName, setFormFromName] = useState("");
-  const [formFromEmail, setFormFromEmail] = useState("");
-  const [formHost, setFormHost] = useState("");
+  const [formHost, setFormHost] = useState("mail.planlux.pl");
   const [formPort, setFormPort] = useState("587");
   const [formSecure, setFormSecure] = useState(false);
   const [formAuthUser, setFormAuthUser] = useState("");
   const [formPassword, setFormPassword] = useState("");
   const [formReplyTo, setFormReplyTo] = useState("");
-  const [formIsDefault, setFormIsDefault] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [testing, setTesting] = useState(false);
   const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: "success" | "error" | "info" }>({ open: false, message: "", severity: "info" });
   const [keytarAvailable, setKeytarAvailable] = useState(false);
+
+  const loadGlobalSettings = useCallback(async () => {
+    const r = (await api("planlux:settings:getEmailSettings")) as {
+      ok: boolean;
+      settings?: {
+        office_cc_email?: string;
+        office_cc_default_enabled?: boolean;
+        email_template_subject?: string;
+        email_template_body_html?: string;
+      };
+    };
+    if (r.ok && r.settings) {
+      setGlobalSettings((prev) => ({
+        ...prev,
+        office_cc_email: r.settings?.office_cc_email ?? prev.office_cc_email,
+        office_cc_default_enabled: r.settings?.office_cc_default_enabled ?? prev.office_cc_default_enabled,
+        email_template_subject: r.settings?.email_template_subject ?? prev.email_template_subject,
+        email_template_body_html: r.settings?.email_template_body_html ?? prev.email_template_body_html,
+      }));
+    }
+  }, [api]);
+
+  const loadUsers = useCallback(async () => {
+    const r = (await api("planlux:getUsers")) as { ok: boolean; users?: UserRow[] };
+    if (r.ok && r.users) setUsers(r.users.filter((u) => u.role === "SALESPERSON" && u.active));
+    else setUsers([]);
+  }, [api]);
 
   const loadAccounts = useCallback(async () => {
     const r = (await api("planlux:smtp:listAccounts")) as { ok: boolean; accounts?: SmtpAccount[] };
@@ -126,77 +161,82 @@ export function AdminEmailTab({ api }: Props) {
   }, [api]);
 
   useEffect(() => {
+    loadGlobalSettings();
+    loadUsers();
     loadAccounts();
     api("planlux:smtp:isKeytarAvailable").then((res) => {
       const r = res as { ok: boolean; available?: boolean };
       setKeytarAvailable(r.available ?? false);
     }).catch(() => {});
-  }, [loadAccounts, api]);
+  }, [loadGlobalSettings, loadUsers, loadAccounts, api]);
 
   useEffect(() => {
-    if (subTab === 1) loadOutbox();
+    if (subTab === 2) loadOutbox();
   }, [subTab, loadOutbox]);
 
   useEffect(() => {
-    if (subTab === 2) loadHistory();
+    if (subTab === 3) loadHistory();
   }, [subTab, loadHistory]);
 
-  const openCreateAccount = () => {
-    setEditingAccount(null);
-    setFormName("");
-    setFormFromName("");
-    setFormFromEmail("");
-    setFormHost("");
-    setFormPort("587");
-    setFormSecure(false);
-    setFormAuthUser("");
+  const openSmtpForm = (user: UserRow, acc?: SmtpAccount | null) => {
+    setEditingUser(user);
+    setEditingAccount(acc ?? null);
+    setFormFromName(acc?.from_name || user.displayName || "");
+    setFormHost(acc?.host || "mail.planlux.pl");
+    setFormPort(String(acc?.port || 587));
+    setFormSecure(acc?.secure === 1);
+    setFormAuthUser(acc?.auth_user || user.email || "");
     setFormPassword("");
-    setFormReplyTo("");
-    setFormIsDefault(accounts.length === 0);
+    setFormReplyTo(acc?.reply_to || "");
     setAccountModalOpen(true);
   };
 
-  const openEditAccount = (a: SmtpAccount) => {
-    setEditingAccount(a);
-    setFormName(a.name || "");
-    setFormFromName(a.from_name || "");
-    setFormFromEmail(a.from_email || "");
-    setFormHost(a.host || "");
-    setFormPort(String(a.port || 587));
-    setFormSecure(a.secure === 1);
-    setFormAuthUser(a.auth_user || "");
-    setFormPassword("");
-    setFormReplyTo(a.reply_to || "");
-    setFormIsDefault(a.is_default === 1);
-    setAccountModalOpen(true);
+  const handleSaveGlobalSettings = async () => {
+    setSubmitting(true);
+    try {
+      const r = (await api("planlux:settings:updateEmailSettings", {
+        office_cc_email: globalSettings.office_cc_email.trim(),
+        office_cc_default_enabled: globalSettings.office_cc_default_enabled,
+        email_template_subject: globalSettings.email_template_subject.trim(),
+        email_template_body_html: globalSettings.email_template_body_html.trim(),
+      })) as { ok: boolean; error?: string };
+      if (r.ok) {
+        setSnackbar({ open: true, message: "Ustawienia zapisane", severity: "success" });
+        loadGlobalSettings();
+      } else {
+        setSnackbar({ open: true, message: r.error ?? "Błąd zapisu", severity: "error" });
+      }
+    } catch (e) {
+      setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  const handleSaveAccount = async () => {
-    if (!formFromEmail.trim() || !formHost.trim()) {
-      setSnackbar({ open: true, message: "E-mail nadawcy i host SMTP są wymagane", severity: "error" });
+  const handleSaveSmtpAccount = async () => {
+    if (!editingUser || !formHost.trim()) {
+      setSnackbar({ open: true, message: "Host SMTP jest wymagany", severity: "error" });
       return;
     }
-    if (!editingAccount && !formPassword) {
-      setSnackbar({ open: true, message: "Hasło jest wymagane przy tworzeniu konta", severity: "error" });
+    if (!editingAccount?.hasPassword && !formPassword) {
+      setSnackbar({ open: true, message: "Hasło jest wymagane przy pierwszej konfiguracji", severity: "error" });
       return;
     }
     setSubmitting(true);
     try {
-      const r = (await api("planlux:smtp:upsertAccount", {
-        id: editingAccount?.id,
-        name: formName.trim(),
+      const r = (await api("planlux:smtp:upsertForUser", {
+        targetUserId: editingUser.id,
         from_name: formFromName.trim(),
-        from_email: formFromEmail.trim(),
+        from_email: editingUser.email,
         host: formHost.trim(),
         port: parseInt(formPort, 10) || 587,
         secure: formSecure,
-        auth_user: formAuthUser.trim() || formFromEmail.trim(),
-        password: formPassword || undefined,
+        auth_user: formAuthUser.trim() || editingUser.email,
+        smtpPass: formPassword || undefined,
         reply_to: formReplyTo.trim() || undefined,
-        is_default: formIsDefault,
       })) as { ok: boolean; error?: string };
       if (r.ok) {
-        setSnackbar({ open: true, message: editingAccount ? "Konto zaktualizowane" : "Konto dodane", severity: "success" });
+        setSnackbar({ open: true, message: "SMTP zapisane", severity: "success" });
         setAccountModalOpen(false);
         loadAccounts();
       } else {
@@ -209,41 +249,17 @@ export function AdminEmailTab({ api }: Props) {
     }
   };
 
-  const handleSetDefault = async (id: string) => {
-    try {
-      const r = (await api("planlux:smtp:setDefaultAccount", id)) as { ok: boolean };
-      if (r.ok) {
-        setSnackbar({ open: true, message: "Ustawiono domyślne konto", severity: "success" });
-        loadAccounts();
-      }
-    } catch {
-      setSnackbar({ open: true, message: "Błąd", severity: "error" });
-    }
-  };
-
-  const handleTestAccount = async (id: string) => {
+  const handleTestSmtpAccount = async () => {
+    if (!editingUser) return;
     setTesting(true);
     try {
-      const r = (await api("planlux:smtp:testAccount", id)) as { ok: boolean; error?: string };
+      const r = (await api("planlux:smtp:testForUser", editingUser.id)) as { ok: boolean; error?: string };
       if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
       else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
     } catch (e) {
       setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
     } finally {
       setTesting(false);
-    }
-  };
-
-  const handleDeleteAccount = async (id: string) => {
-    if (!confirm("Usunąć to konto SMTP? Hasło zostanie usunięte z magazynu.")) return;
-    try {
-      const r = (await api("planlux:smtp:deleteAccount", id)) as { ok: boolean };
-      if (r.ok) {
-        setSnackbar({ open: true, message: "Konto usunięte", severity: "success" });
-        loadAccounts();
-      }
-    } catch {
-      setSnackbar({ open: true, message: "Błąd", severity: "error" });
     }
   };
 
@@ -259,73 +275,135 @@ export function AdminEmailTab({ api }: Props) {
     }
   };
 
+  const getAccountForUser = (userId: string) => accounts.find((a) => a.user_id === userId);
+
   return (
     <Box>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        Konta SMTP (hasła w magazynie systemowym {keytarAvailable ? "keytar" : "AES"}),
+        Ustawienia e-mail, SMTP per handlowiec (hasła w {keytarAvailable ? "keytar" : "AES"}),
         kolejka outbox i historia wysłanych e-maili.
       </Typography>
       <Tabs value={subTab} onChange={(_, v) => setSubTab(v)} sx={{ mb: 2, borderBottom: 1, borderColor: "divider" }}>
-        <Tab label="Konta SMTP" />
+        <Tab label="Ustawienia globalne" />
+        <Tab label="SMTP per handlowiec" />
         <Tab label="Kolejka outbox" />
         <Tab label="Historia wysyłek" />
       </Tabs>
 
       {subTab === 0 && (
         <div style={styles.card}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-            <h2 style={styles.h2}>Konta SMTP</h2>
-            <Button variant="contained" startIcon={<Add />} onClick={openCreateAccount}>
-              Dodaj konto
+          <h2 style={styles.h2}>Ustawienia globalne e-mail</h2>
+          <Box sx={{ display: "flex", flexDirection: "column", gap: 2, maxWidth: 600 }}>
+            <TextField
+              label="CC do biura (np. biuro@planlux.pl)"
+              value={globalSettings.office_cc_email}
+              onChange={(e) => setGlobalSettings((s) => ({ ...s, office_cc_email: e.target.value }))}
+              fullWidth
+              placeholder="biuro@planlux.pl"
+            />
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={globalSettings.office_cc_default_enabled}
+                  onChange={(e) => setGlobalSettings((s) => ({ ...s, office_cc_default_enabled: e.target.checked }))}
+                  color="primary"
+                />
+              }
+              label="Domyślnie włącz CC do biura przy wysyłce"
+            />
+            <TextField
+              label="Szablon tematu"
+              value={globalSettings.email_template_subject}
+              onChange={(e) => setGlobalSettings((s) => ({ ...s, email_template_subject: e.target.value }))}
+              fullWidth
+              placeholder="Oferta Planlux – {{offerNumber}}"
+            />
+            <TextField
+              label="Szablon treści (HTML)"
+              value={globalSettings.email_template_body_html}
+              onChange={(e) => setGlobalSettings((s) => ({ ...s, email_template_body_html: e.target.value }))}
+              fullWidth
+              multiline
+              rows={6}
+              placeholder="<p>Szanowni Państwo,</p>..."
+            />
+            <Button variant="contained" onClick={handleSaveGlobalSettings} disabled={submitting}>
+              {submitting ? "Zapisywanie…" : "Zapisz"}
             </Button>
-          </div>
-          {accounts.length === 0 ? (
-            <Typography color="text.secondary">Brak kont. Dodaj konto SMTP, aby wysyłać e-maile z aplikacji.</Typography>
+          </Box>
+        </div>
+      )}
+
+      {subTab === 1 && (
+        <div style={styles.card}>
+          <h2 style={styles.h2}>SMTP per handlowiec</h2>
+          {users.length === 0 ? (
+            <Typography color="text.secondary">Brak handlowców (rola SALESPERSON).</Typography>
           ) : (
             <Table size="small">
               <TableHead>
                 <TableRow>
-                  <TableCell>Nazwa / Od</TableCell>
-                  <TableCell>Host</TableCell>
-                  <TableCell>Domyślne</TableCell>
+                  <TableCell>Handlowiec</TableCell>
+                  <TableCell>E-mail</TableCell>
+                  <TableCell>SMTP</TableCell>
                   <TableCell align="right">Akcje</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {accounts.map((a) => (
-                  <TableRow key={a.id}>
-                    <TableCell>
-                      {a.name || a.from_email}
-                      {a.from_name && <Typography variant="caption" display="block">{a.from_email}</Typography>}
-                    </TableCell>
-                    <TableCell>{a.host}:{a.port}</TableCell>
-                    <TableCell>
-                      {a.is_default === 1 ? (
-                        <Chip label="Domyślne" size="small" color="primary" />
-                      ) : (
-                        <Button size="small" onClick={() => handleSetDefault(a.id)}>Ustaw domyślne</Button>
-                      )}
-                    </TableCell>
-                    <TableCell align="right">
-                      <IconButton size="small" onClick={() => handleTestAccount(a.id)} disabled={testing} title="Test połączenia">
-                        <Refresh fontSize="small" />
-                      </IconButton>
-                      <IconButton size="small" onClick={() => openEditAccount(a)} title="Edytuj">
-                        <Edit fontSize="small" />
-                      </IconButton>
-                      <IconButton size="small" onClick={() => handleDeleteAccount(a.id)} title="Usuń">
-                        <Delete fontSize="small" color="error" />
-                      </IconButton>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {users.map((u) => {
+                  const acc = getAccountForUser(u.id);
+                  const status = acc
+                    ? acc.hasPassword
+                      ? "Skonfigurowane"
+                      : "Brak hasła"
+                    : "Brak";
+                  return (
+                    <TableRow key={u.id}>
+                      <TableCell>{u.displayName || u.email}</TableCell>
+                      <TableCell>{u.email}</TableCell>
+                      <TableCell>
+                        <Chip
+                          label={status}
+                          size="small"
+                          color={acc?.hasPassword ? "success" : "default"}
+                        />
+                      </TableCell>
+                      <TableCell align="right">
+                        {acc && (
+                          <IconButton
+                            size="small"
+                            onClick={async () => {
+                              setTesting(true);
+                              try {
+                                const r = (await api("planlux:smtp:testForUser", u.id)) as { ok: boolean; error?: string };
+                                if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
+                                else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
+                              } catch (e) {
+                                setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
+                              } finally {
+                                setTesting(false);
+                              }
+                            }}
+                            disabled={testing}
+                            title="Test połączenia"
+                          >
+                            <Refresh fontSize="small" />
+                          </IconButton>
+                        )}
+                        <IconButton size="small" onClick={() => openSmtpForm(u, acc)} title="Konfiguruj SMTP">
+                          <Edit fontSize="small" />
+                        </IconButton>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
         </div>
       )}
 
-      {subTab === 1 && (
+      {subTab === 2 && (
         <div style={styles.card}>
           <h2 style={styles.h2}>Kolejka outbox</h2>
           <Box sx={{ mb: 2 }}>
@@ -412,14 +490,17 @@ export function AdminEmailTab({ api }: Props) {
       )}
 
       <Dialog open={accountModalOpen} onClose={() => !submitting && setAccountModalOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>{editingAccount ? "Edytuj konto SMTP" : "Dodaj konto SMTP"}</DialogTitle>
+        <DialogTitle>Konfiguracja SMTP – {editingUser?.displayName || editingUser?.email}</DialogTitle>
         <DialogContent>
-          <TextField margin="dense" label="Nazwa (opcjonalnie)" fullWidth value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="np. Planlux" />
-          <TextField margin="dense" label="Nazwa nadawcy" fullWidth value={formFromName} onChange={(e) => setFormFromName(e.target.value)} placeholder="Planlux Hale" />
-          <TextField margin="dense" label="E-mail nadawcy" type="email" fullWidth required value={formFromEmail} onChange={(e) => setFormFromEmail(e.target.value)} />
-          <TextField margin="dense" label="Host SMTP" fullWidth required value={formHost} onChange={(e) => setFormHost(e.target.value)} placeholder="smtp.example.com" />
+          <TextField margin="dense" label="E-mail nadawcy" fullWidth value={editingUser?.email ?? ""} disabled />
+          <TextField margin="dense" label="Nazwa nadawcy (from)" fullWidth value={formFromName} onChange={(e) => setFormFromName(e.target.value)} placeholder="np. Paweł Kowalski" />
+          <TextField margin="dense" label="Host SMTP" fullWidth required value={formHost} onChange={(e) => setFormHost(e.target.value)} placeholder="mail.planlux.pl" />
           <TextField margin="dense" label="Port" type="number" fullWidth value={formPort} onChange={(e) => setFormPort(e.target.value)} />
-          <TextField margin="dense" label="Login (opcjonalnie, domyślnie e-mail)" fullWidth value={formAuthUser} onChange={(e) => setFormAuthUser(e.target.value)} />
+          <FormControlLabel
+            control={<Checkbox checked={formSecure} onChange={(e) => setFormSecure(e.target.checked)} color="primary" />}
+            label="Secure (SSL/TLS)"
+          />
+          <TextField margin="dense" label="Login (domyślnie e-mail)" fullWidth value={formAuthUser} onChange={(e) => setFormAuthUser(e.target.value)} />
           <TextField
             margin="dense"
             label="Hasło"
@@ -427,18 +508,17 @@ export function AdminEmailTab({ api }: Props) {
             fullWidth
             value={formPassword}
             onChange={(e) => setFormPassword(e.target.value)}
-            placeholder={editingAccount ? "Zostaw puste, aby nie zmieniać" : ""}
-            required={!editingAccount}
+            placeholder={editingAccount?.hasPassword ? "Zostaw puste, aby nie zmieniać" : "Wymagane przy pierwszej konfiguracji"}
           />
           <TextField margin="dense" label="Reply-To (opcjonalnie)" fullWidth value={formReplyTo} onChange={(e) => setFormReplyTo(e.target.value)} />
-          <Button size="small" onClick={() => setFormIsDefault(!formIsDefault)}>
-            {formIsDefault ? "✓ Domyślne konto" : "Ustaw jako domyślne"}
-          </Button>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setAccountModalOpen(false)} disabled={submitting}>Anuluj</Button>
-          <Button onClick={handleSaveAccount} variant="contained" disabled={submitting}>
-            {submitting ? "Zapisywanie…" : editingAccount ? "Zapisz" : "Dodaj"}
+          <Button onClick={handleTestSmtpAccount} disabled={submitting || testing}>
+            {testing ? "Testowanie…" : "Test połączenia"}
+          </Button>
+          <Button onClick={handleSaveSmtpAccount} variant="contained" disabled={submitting}>
+            {submitting ? "Zapisywanie…" : "Zapisz"}
           </Button>
         </DialogActions>
       </Dialog>
