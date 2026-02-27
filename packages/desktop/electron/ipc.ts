@@ -2590,6 +2590,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const smtpResponse = result.response ?? null;
         const accountId = account?.id ?? null;
         db.transaction(() => {
+          const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerId);
+          if (!offerExists) throw new Error("[email] FK/consistency: oferta nie istnieje przed zapisem outbox");
           db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
           db.prepare(
             `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)

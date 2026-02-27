@@ -1,5 +1,14 @@
 # Fix: FOREIGN KEY constraint failed przy wysyłce e-mail
 
+## Mapowanie tabel (ten projekt)
+
+W tym projekcie **nie ma** tabel `email_logs` ani `email_attachments`. Używane są:
+
+- **email_outbox** – kolejka / rekord wysyłki (nadrzędny dla wpisu w historii); załączniki w kolumnie `attachments_json`.
+- **email_history** – historia wysłanych/błędów (odpowiednik „logu”); powiązanie przez `outbox_id` → `email_outbox(id)`.
+
+Załączniki (PDF oferty + pliki użytkownika) są zapisywane jako JSON w `email_outbox.attachments_json`, bez osobnej tabeli z FK.
+
 ## Który FK powodował błąd
 
 Tabela **email_outbox** ma ograniczenia:
@@ -44,9 +53,24 @@ Przy zapisie po wysłaniu oferty e-mailem:
   `SELECT id FROM email_outbox WHERE id = ?`  
   Jeśli brak wiersza → rzucany błąd: *"[email] FK diagnostic: email_outbox row missing after INSERT"* (w IPC) lub *"[emailService] FK diagnostic: email_outbox row missing before history INSERT"* (w processOutbox).
 
+## PRAGMA foreign_keys = ON
+
+W `main.ts` przy pierwszym otwarciu bazy (w `getDb()` po `runMigrations`) ustawiane jest:
+
+- `db.exec("PRAGMA foreign_keys = ON");`
+
+Dzięki temu SQLite wymusza wszystkie FOREIGN KEY dla tego połączenia (po migracjach).
+
+## Walidacja przed INSERT
+
+- **Użytkownik nadawcy:** `SELECT id FROM users WHERE id = ? AND active = 1` – bez wiersza zwracany błąd, brak zapisu.
+- **Oferta:** wewnątrz transakcji `SELECT id FROM offers_crm WHERE id = ?` – brak wiersza → rzucany błąd (konsystencja `related_offer_id`).
+- **Outbox po INSERT:** `SELECT id FROM email_outbox WHERE id = ?` – brak wiersza → błąd diagnostyczny przed INSERT email_history.
+
 ## Zmienione pliki
 
-- `packages/desktop/electron/ipc.ts` – walidacja użytkownika, transakcje, account_id w outbox, diagnostyka (planlux:email:sendOfferEmail, planlux:email:send).
+- `packages/desktop/electron/main.ts` – `PRAGMA foreign_keys = ON` po otwarciu bazy.
+- `packages/desktop/electron/ipc.ts` – walidacja użytkownika, transakcje, account_id w outbox, sprawdzenie oferty w transakcji, diagnostyka (planlux:email:sendOfferEmail, planlux:email:send).
 - `packages/desktop/electron/emailService.ts` – transakcje w processOutbox (sent + failed po MAX_RETRIES), diagnostyka przed INSERT email_history.
 
 ## Kolejność zapisu (nie zmieniać)

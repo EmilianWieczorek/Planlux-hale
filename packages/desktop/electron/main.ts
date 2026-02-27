@@ -215,6 +215,7 @@ function getDb() {
     db = new Database(dbPath);
     db.exec(SCHEMA_SQL);
     runMigrations(db);
+    db.exec("PRAGMA foreign_keys = ON");
   }
   return db;
 }
