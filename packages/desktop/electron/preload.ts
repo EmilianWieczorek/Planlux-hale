@@ -105,6 +105,10 @@ const api = {
   pdfGenerate: (offerData: unknown) => safeInvoke("pdf:generate", offerData),
   sendEmail: (data: unknown) => safeInvoke("planlux:sendEmail", data),
   checkInternet: () => safeInvoke("planlux:checkInternet"),
+  smtp: {
+    listAccounts: () => safeInvoke("planlux:smtp:listAccounts"),
+    upsertAccount: (data: unknown) => safeInvoke("planlux:smtp:upsertAccount", data),
+  },
   smtpListAccounts: () => safeInvoke("planlux:smtp:listAccounts"),
   smtpUpsertAccount: (payload: unknown) => safeInvoke("planlux:smtp:upsertAccount", payload),
   smtpSetDefaultAccount: (accountId: string) => safeInvoke("planlux:smtp:setDefaultAccount", accountId),

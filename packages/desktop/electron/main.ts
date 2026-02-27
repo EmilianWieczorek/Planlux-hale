@@ -323,12 +323,13 @@ app.whenReady().then(async () => {
   });
 
   const database = getDb();
-  registerIpcHandlers({
+  await registerIpcHandlers({
     getDb,
     apiClient,
     config: { appVersion: config.appVersion },
     logger,
   });
+  console.log("[IPC] Planlux IPC handlers initialized");
   const existing = database.prepare("SELECT id FROM users WHERE email = ?").get("admin@planlux.pl");
   if (!existing) {
     const crypto = require("crypto");

@@ -105,7 +105,7 @@ function checkInternetNet(): Promise<boolean> {
   });
 }
 
-export function   registerIpcHandlers(deps: {
+export async function registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
   apiClient: import("@planlux/shared").ApiClient;
   config: { appVersion: string };
@@ -1800,6 +1800,7 @@ export function   registerIpcHandlers(deps: {
   /** Ogólny kanał e-mail: sprawdzenie internetu (net.request); offline → { ok: false, offline: true }. */
   ipcMain.handle("planlux:sendEmail", async (_, payload: unknown) => {
     try {
+    console.log("[IPC] planlux:sendEmail called");
       const user = requireAuth();
       if (!payload || typeof payload !== "object") {
         return { ok: false, error: "Invalid payload" };
@@ -2041,16 +2042,18 @@ export function   registerIpcHandlers(deps: {
     }
   });
 
-  /** Real Internet check via Electron net.request (no navigator.onLine). */
-  ipcMain.handle("planlux:checkInternet", async () => {
-    try {
-      const online = await checkInternetNet();
-      return { ok: true, online };
-    } catch (e) {
-      logger.warn("[checkInternet] error", e);
-      return { ok: true, online: false };
-    }
-  });
+/** Real Internet check via Electron net.request (no navigator.onLine). */
+ipcMain.handle("planlux:checkInternet", async () => {
+  try {
+    console.log("[IPC] planlux:checkInternet called");
+    const online = await checkInternetNet();
+    return { ok: true, online };
+  } catch (e) {
+    logger.warn("[checkInternet] error", e);
+    return { ok: true, online: false };
+  }
+});
+console.log("[IPC] handler registered: planlux:checkInternet");
 
   // ---------- SMTP accounts & email outbox (secure store, offline-first) ----------
   const {
@@ -2067,6 +2070,7 @@ export function   registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:smtp:listAccounts", async () => {
     try {
+      console.log("[IPC] planlux:smtp:listAccounts called");
       requireAuth();
       const rows = getDb().prepare("SELECT id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts ORDER BY is_default DESC, created_at ASC").all();
       return { ok: true, accounts: rows };
@@ -2076,9 +2080,11 @@ export function   registerIpcHandlers(deps: {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
+  console.log("[IPC] handler registered: planlux:smtp:listAccounts");
 
   ipcMain.handle("planlux:smtp:upsertAccount", async (_, payload: unknown) => {
     try {
+      console.log("[IPC] planlux:smtp:upsertAccount called");
       requireRole(["ADMIN"]);
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { id?: string; name?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; password?: string; reply_to?: string; is_default?: boolean };
@@ -2120,6 +2126,7 @@ export function   registerIpcHandlers(deps: {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
+  console.log("[IPC] handler registered: planlux:smtp:upsertAccount");
 
   ipcMain.handle("planlux:smtp:setDefaultAccount", async (_, accountId: string) => {
     try {
