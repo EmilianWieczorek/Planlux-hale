@@ -73,7 +73,7 @@ export interface OfferDraft {
 
 function createEmptyDraft(): OfferDraft {
   return {
-    draftId: crypto.randomUUID(),
+    draftId: window.crypto.randomUUID(),
     variantHali: "T18_T35_DACH",
     widthM: "",
     lengthM: "",

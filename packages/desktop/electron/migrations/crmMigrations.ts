@@ -7,7 +7,18 @@ export type Db = {
   prepare: (sql: string) => { run: (...args: unknown[]) => unknown; get: (...args: unknown[]) => unknown; all: (...args: unknown[]) => unknown[] };
 };
 
-export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: unknown) => void; warn: (m: string, e?: unknown) => void }): void {
+function hasTable(database: Db, tableName: string): boolean {
+  const row = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(tableName) as { name?: string } | undefined;
+  return row?.name === tableName;
+}
+
+function hasColumn(database: Db, tableName: string, columnName: string): boolean {
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName) || !/^[a-zA-Z0-9_]+$/.test(columnName)) return false;
+  const info = database.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  return info.some((c) => c.name === columnName);
+}
+
+export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: unknown) => void; warn: (m: string, e?: unknown) => void; error?: (m: string, e?: unknown) => void }): void {
   // 1. offers_crm – pełna tabela CRM ofert
   try {
     database.exec(`
@@ -193,11 +204,10 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     }
   }
 
-  // 6. smtp_accounts – konfiguracja SMTP w aplikacji (hasło NIE w DB, tylko w keychain/secureStore)
-  try {
-    // Nowe instalacje: pełna tabela z user_id (jeden rekord SMTP per użytkownik).
+  // 6. smtp_accounts – konfiguracja SMTP (pełna tabela z user_id). Idempotentna.
+  if (!hasTable(database, "smtp_accounts")) {
     database.exec(`
-      CREATE TABLE IF NOT EXISTS smtp_accounts (
+      CREATE TABLE smtp_accounts (
         id TEXT PRIMARY KEY,
         user_id TEXT UNIQUE REFERENCES users(id),
         name TEXT NOT NULL DEFAULT '',
@@ -215,10 +225,11 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
       );
       CREATE INDEX IF NOT EXISTS idx_smtp_accounts_active ON smtp_accounts(active);
       CREATE INDEX IF NOT EXISTS idx_smtp_accounts_is_default ON smtp_accounts(is_default);
+      CREATE INDEX IF NOT EXISTS idx_smtp_accounts_user_id ON smtp_accounts(user_id);
     `);
-    logger.info("[migration] smtp_accounts ready");
-  } catch (e) {
-    logger.warn("[migration] smtp_accounts skipped", e);
+    logger.info("[migration] smtp_accounts created");
+  } else {
+    logger.info("[migration] smtp_accounts table already exists");
   }
 
   // 7. email_outbox – kolejka offline-first z retry/backoff
@@ -287,18 +298,27 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] app_settings skipped", e);
   }
 
-  // 10. smtp_accounts: przebudowa z user_id (one account per user) – idempotent, dla istniejących instalacji.
-  try {
-    const info = database
-      .prepare("PRAGMA table_info(smtp_accounts)")
-      .all() as Array<{ name: string }>;
-    if (info.length > 0) {
-      const hasUserId = info.some((c) => c.name === "user_id");
-      if (hasUserId) {
-        logger.info("[migration] smtp_accounts user_id already present – skipping rebuild");
-      } else {
-        logger.info("[migration] smtp_accounts: rebuilding table to add user_id");
-        database.exec(`
+  // 10. smtp_accounts: dodanie user_id (one account per user) – idempotentne dla istniejącej tabeli bez user_id.
+  if (!hasTable(database, "smtp_accounts")) {
+    logger.info("[migration] smtp_accounts step 10 skipped (table created in step 6 with user_id)");
+  } else if (hasColumn(database, "smtp_accounts", "user_id")) {
+    logger.info("[migration] smtp_accounts user_id already present");
+  } else {
+    logger.info("[migration] smtp_accounts adding user_id via rebuild");
+    // Upewnij się, że stara tabela ma kolumny wymagane przez INSERT (ALTER ADD COLUMN ignoruje duplicate).
+    const addColumnIfMissing = (col: string, def: string) => {
+      try {
+        database.exec(`ALTER TABLE smtp_accounts ADD COLUMN ${col} ${def}`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes("duplicate column") && !msg.includes("already exists")) throw e;
+      }
+    };
+    addColumnIfMissing("name", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing("is_default", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing("active", "INTEGER NOT NULL DEFAULT 1");
+    try {
+      database.exec(`
 BEGIN TRANSACTION;
 
 CREATE TABLE smtp_accounts_new (
@@ -359,14 +379,16 @@ ALTER TABLE smtp_accounts_new RENAME TO smtp_accounts;
 
 CREATE INDEX IF NOT EXISTS idx_smtp_accounts_active ON smtp_accounts(active);
 CREATE INDEX IF NOT EXISTS idx_smtp_accounts_is_default ON smtp_accounts(is_default);
+CREATE INDEX IF NOT EXISTS idx_smtp_accounts_user_id ON smtp_accounts(user_id);
 
 COMMIT;
 `);
-        logger.info("[migration] smtp_accounts rebuilt with user_id");
-      }
+      logger.info("[migration] smtp_accounts rebuilt with user_id");
+    } catch (e) {
+      if (logger.error) logger.error("[migration] smtp_accounts user_id rebuild failed", e);
+      else logger.warn("[migration] smtp_accounts user_id rebuild failed", e);
+      throw e;
     }
-  } catch (e) {
-    logger.warn("[migration] smtp_accounts user_id rebuild failed", e);
   }
 
   // 11. email_outbox: add account_user_id (sender user)
@@ -404,5 +426,26 @@ COMMIT;
     }
   } catch (e) {
     logger.warn("[migration] email_history related_offer_id skipped", e);
+  }
+
+  // 14. email_history: add SMTP result columns (accepted_json, rejected_json, smtp_response)
+  try {
+    const info = database.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+    if (info.length > 0) {
+      if (!info.some((c) => c.name === "accepted_json")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN accepted_json TEXT DEFAULT NULL");
+        logger.info("[migration] email_history accepted_json added");
+      }
+      if (!info.some((c) => c.name === "rejected_json")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN rejected_json TEXT DEFAULT NULL");
+        logger.info("[migration] email_history rejected_json added");
+      }
+      if (!info.some((c) => c.name === "smtp_response")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN smtp_response TEXT DEFAULT NULL");
+        logger.info("[migration] email_history smtp_response added");
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history SMTP result columns skipped", e);
   }
 }

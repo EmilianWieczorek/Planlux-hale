@@ -11,6 +11,7 @@
  * - PLANLUX_SMTP_FROM / SMTP_FROM       (optional, defaults to USER)
  */
 import nodemailer from "nodemailer";
+import { validateSmtpPortSecure } from "./emailService";
 
 type SmtpConfig = {
   host: string;
@@ -56,14 +57,14 @@ function loadSmtpConfig(): SmtpConfig {
 function getTransporter(): nodemailer.Transporter {
   if (cachedTransporter) return cachedTransporter;
   const cfg = loadSmtpConfig();
+  validateSmtpPortSecure(cfg.port, cfg.secure);
+  const isDev = process.env.NODE_ENV === "development" || !!process.env.VITE_DEV_SERVER_URL;
   cachedTransporter = nodemailer.createTransport({
     host: cfg.host,
     port: cfg.port,
     secure: cfg.secure,
-    auth: {
-      user: cfg.user,
-      pass: cfg.pass,
-    },
+    auth: { user: cfg.user, pass: cfg.pass },
+    ...(isDev ? { tls: { rejectUnauthorized: false } } : {}),
   });
   return cachedTransporter;
 }
@@ -139,14 +140,16 @@ export async function sendSmtpEmail({
     throw new Error("Missing email parameters");
   }
 
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = false;
+  validateSmtpPortSecure(port, secure);
+  const isDev = process.env.NODE_ENV === "development" || !!process.env.VITE_DEV_SERVER_URL;
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: false,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
+    port,
+    secure,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    ...(isDev ? { tls: { rejectUnauthorized: false } } : {}),
   });
 
   return transporter.sendMail({

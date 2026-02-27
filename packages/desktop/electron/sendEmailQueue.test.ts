@@ -32,10 +32,10 @@ describe("sendEmail queue and flush", () => {
       markProcessed: vi.fn(),
       markFailed: vi.fn(),
     };
-    const api = {
-      heartbeat: vi.fn().mockResolvedValue(undefined),
-      logPdf: vi.fn().mockResolvedValue(undefined),
-      logEmail: vi.fn().mockResolvedValue(undefined),
+    const api: import("@planlux/shared").OutboxApi = {
+      heartbeat: vi.fn().mockResolvedValue({ ok: true }),
+      logPdf: vi.fn().mockResolvedValue({ ok: true }),
+      logEmail: vi.fn().mockResolvedValue({ ok: true }),
     };
 
     const result = await flushOutbox({
@@ -74,10 +74,10 @@ describe("sendEmail queue and flush", () => {
       markProcessed: vi.fn(),
       markFailed: vi.fn(),
     };
-    const api = {
-      heartbeat: vi.fn().mockResolvedValue(undefined),
-      logPdf: vi.fn().mockResolvedValue(undefined),
-      logEmail: vi.fn().mockResolvedValue(undefined),
+    const api: import("@planlux/shared").OutboxApi = {
+      heartbeat: vi.fn().mockResolvedValue({ ok: true }),
+      logPdf: vi.fn().mockResolvedValue({ ok: true }),
+      logEmail: vi.fn().mockResolvedValue({ ok: true }),
     };
 
     await flushOutbox({

@@ -1,5 +1,5 @@
 /**
- * Kompozytor e-mail – Do, Temat, Treść, CC do biura, Załączniki (PDF z oferty).
+ * Kompozytor e-mail – Do, Temat, Treść, CC do biura, Załączniki (PDF oferty + własne pliki).
  */
 
 import { useState, useEffect } from "react";
@@ -15,10 +15,17 @@ import {
   FormControlLabel,
   Checkbox,
   Alert,
+  IconButton,
+  List,
+  ListItem,
+  ListItemText,
+  ListItemSecondaryAction,
 } from "@mui/material";
-import { Send } from "@mui/icons-material";
+import { Send, AttachFile, Delete } from "@mui/icons-material";
 
 export type SendResult = { ok: boolean; error?: string; queued?: boolean };
+
+export type UserAttachment = { originalName: string; storedPath: string; size: number };
 
 interface Props {
   open: boolean;
@@ -26,13 +33,11 @@ interface Props {
   defaultTo: string;
   defaultSubject: string;
   defaultBody?: string;
-  /** Domyślnie włączone „Wyślij kopię do biura” (z ustawień). */
   officeCcDefault?: boolean;
-  /** Adres biura do CC (np. biuro@planlux.pl) – wyświetlany przy checkboxie. */
   officeCcEmail?: string;
   pdfPath?: string | null;
   pdfFileName?: string;
-  onSend: (params: { to: string; subject: string; body: string; ccOfficeEnabled: boolean; pdfPath?: string }) => Promise<SendResult>;
+  onSend: (params: { to: string; subject: string; body: string; ccOfficeEnabled: boolean; pdfPath?: string; extraAttachments?: Array<{ filename: string; path: string }> }) => Promise<SendResult>;
 }
 
 export function EmailComposer({
@@ -51,6 +56,7 @@ export function EmailComposer({
   const [subject, setSubject] = useState(defaultSubject);
   const [body, setBody] = useState(defaultBody);
   const [ccOfficeEnabled, setCcOfficeEnabled] = useState(officeCcDefault);
+  const [userAttachments, setUserAttachments] = useState<UserAttachment[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resultMessage, setResultMessage] = useState<"sent" | "queued" | null>(null);
@@ -61,6 +67,7 @@ export function EmailComposer({
       setSubject(defaultSubject);
       setBody(defaultBody);
       setCcOfficeEnabled(officeCcDefault);
+      setUserAttachments([]);
       setError(null);
       setResultMessage(null);
     }
@@ -81,6 +88,7 @@ export function EmailComposer({
         body: body.trim(),
         ccOfficeEnabled,
         pdfPath: pdfPath ?? undefined,
+        extraAttachments: userAttachments.length > 0 ? userAttachments.map((a) => ({ filename: a.originalName, path: a.storedPath })) : undefined,
       });
       if (res.ok) {
         if (res.queued) {
@@ -141,11 +149,39 @@ export function EmailComposer({
               label={`CC do biura (${officeCcEmail})`}
             />
           )}
-          {pdfPath && pdfFileName && (
-            <Typography variant="body2" color="text.secondary">
-              Załącznik: {pdfFileName}
+          <Typography variant="body2" color="text.secondary">
+            PDF oferty zostanie dołączony automatycznie.
+          </Typography>
+          <Box>
+            <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 0.5 }}>
+              Załączniki
             </Typography>
-          )}
+            <List dense sx={{ bgcolor: "action.hover", borderRadius: 1, maxHeight: 120, overflow: "auto" }}>
+              {userAttachments.map((a, i) => (
+                <ListItem key={`${a.storedPath}-${i}`}>
+                  <ListItemText primary={a.originalName} secondary={`${(a.size / 1024).toFixed(1)} KB`} />
+                  <ListItemSecondaryAction>
+                    <IconButton size="small" onClick={() => setUserAttachments((prev) => prev.filter((_, j) => j !== i))} aria-label="Usuń">
+                      <Delete fontSize="small" />
+                    </IconButton>
+                  </ListItemSecondaryAction>
+                </ListItem>
+              ))}
+            </List>
+            <Button
+              size="small"
+              startIcon={<AttachFile />}
+              onClick={async () => {
+                const invoke = typeof window !== "undefined" && (window as unknown as { planlux?: { invoke: (ch: string, ...a: unknown[]) => Promise<unknown> } }).planlux?.invoke;
+                if (!invoke) return;
+                const r = (await invoke("planlux:attachments:pickFiles")) as { ok: boolean; files?: Array<{ originalName: string; storedPath: string; size: number }> };
+                if (r.ok && r.files?.length) setUserAttachments((prev) => [...prev, ...r.files!]);
+              }}
+              sx={{ mt: 0.5 }}
+            >
+              Dodaj pliki…
+            </Button>
+          </Box>
           {resultMessage === "sent" && (
             <Alert severity="success">E-mail wysłany.</Alert>
           )}

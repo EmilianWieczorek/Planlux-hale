@@ -3,6 +3,8 @@ declare module "electron-updater" {
     autoDownload: boolean;
     autoInstallOnAppQuit: boolean;
     checkForUpdatesAndNotify(): Promise<unknown>;
-    on(channel: string, cb: (arg?: unknown) => void): void;
+    downloadUpdate(): Promise<unknown>;
+    quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void;
+    on(channel: string, cb: (...args: unknown[]) => void): void;
   };
 }

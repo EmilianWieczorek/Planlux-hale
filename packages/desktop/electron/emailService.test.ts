@@ -3,7 +3,32 @@
  * @vitest-environment node
  */
 import { describe, it, expect, vi } from "vitest";
-import { enqueueEmail } from "./emailService";
+import { enqueueEmail, parseRecipients } from "./emailService";
+
+describe("parseRecipients", () => {
+  it("splits by space into separate addresses", () => {
+    const got = parseRecipients("a@b.com b@c.com");
+    expect(got).toHaveLength(2);
+    expect(got[0]).toBe("a@b.com");
+    expect(got[1]).toBe("b@c.com");
+  });
+
+  it("splits by comma, semicolon, newline", () => {
+    expect(parseRecipients("a@b.com,b@c.com")).toEqual(["a@b.com", "b@c.com"]);
+    expect(parseRecipients("a@b.com; b@c.com")).toEqual(["a@b.com", "b@c.com"]);
+    expect(parseRecipients("a@b.com\nb@c.com")).toEqual(["a@b.com", "b@c.com"]);
+  });
+
+  it("trims and drops empty", () => {
+    expect(parseRecipients("  a@b.com  ,  b@c.com  ")).toEqual(["a@b.com", "b@c.com"]);
+    expect(parseRecipients("a@b.com,,b@c.com")).toEqual(["a@b.com", "b@c.com"]);
+  });
+
+  it("returns empty array for empty or whitespace-only input", () => {
+    expect(parseRecipients("")).toEqual([]);
+    expect(parseRecipients("  ,  ")).toEqual([]);
+  });
+});
 
 describe("emailService", () => {
   it("enqueueEmail returns id and calls db.prepare().run with queued status", () => {

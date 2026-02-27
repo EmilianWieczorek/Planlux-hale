@@ -17,7 +17,7 @@ export { syncPricingIfNewer } from "./sync/pricingSync";
 export type { PricingSyncStorage, PricingSyncResult } from "./sync/pricingSync";
 export { flushOutbox, generateOutboxId } from "./sync/outbox";
 export type { OutboxStorage, OutboxRecord } from "./sync/outbox";
-export type { FlushOutboxDeps } from "./sync/outbox";
+export type { FlushOutboxDeps, OutboxApi } from "./sync/outbox";
 
 export { calculatePrice, runPricingSelfTest } from "./pricing/pricingEngine";
 export type { PricingEngineData } from "./pricing/pricingEngine";

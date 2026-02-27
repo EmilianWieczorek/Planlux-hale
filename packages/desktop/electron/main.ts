@@ -33,16 +33,20 @@ const apiClient = new ApiClient({
 });
 
 function runMigrations(database: ReturnType<typeof Database>) {
-  // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON) + mapowanie starych ról.
-  try {
-    database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
-    const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_roles_3");
+  // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON) – idempotentna, bez cichego skip.
+  database.exec("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)");
+  const done = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_roles_3");
+  if (done) {
+    logger.info("[migration] users_roles_3 ALREADY_APPLIED");
+  } else {
     const usersExists =
       (database
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
         .get() as { name?: string } | undefined)?.name === "users";
-    if (!done && usersExists) {
-      logger.info("[migration] users_roles_3 START");
+    if (!usersExists) {
+      logger.info("[migration] users_roles_3 skipped (no users table)");
+      database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_3");
+    } else {
       const sqlRow = database
         .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
         .get() as { sql: string } | undefined;
@@ -52,15 +56,25 @@ function runMigrations(database: ReturnType<typeof Database>) {
         sqlDef.includes("('USER', 'ADMIN')") ||
         !sqlDef.includes("BOSS") ||
         !sqlDef.includes("SALESPERSON");
-      if (needsRebuild) {
+      if (!needsRebuild) {
+        database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_3");
+        logger.info("[migration] users_roles_3 already has target schema (ADMIN/BOSS/SALESPERSON)");
+      } else {
+        logger.info("[migration] users_roles_3 START");
+        database.exec("PRAGMA foreign_keys = OFF");
+        database.exec("DROP TABLE IF EXISTS users_new");
         const cols = database
           .prepare("PRAGMA table_info(users)")
           .all() as Array<{ name: string }>;
         const hasActive = cols.some((c) => c.name === "active");
         const hasDisplayName = cols.some((c) => c.name === "display_name");
         const hasFullName = cols.some((c) => c.name === "full_name");
+        const hasCreatedAt = cols.some((c) => c.name === "created_at");
+        const hasUpdatedAt = cols.some((c) => c.name === "updated_at");
         const nameColumn = hasDisplayName ? "display_name" : hasFullName ? "full_name" : "email";
         const activeExpr = hasActive ? "COALESCE(active,1)" : "1";
+        const createdExpr = hasCreatedAt ? "COALESCE(created_at, datetime('now'))" : "datetime('now')";
+        const updatedExpr = hasUpdatedAt ? "COALESCE(updated_at, datetime('now'))" : "datetime('now')";
 
         const sql = `
 BEGIN TRANSACTION;
@@ -89,8 +103,8 @@ SELECT
   END AS role,
   ${nameColumn} AS display_name,
   ${activeExpr} AS active,
-  COALESCE(created_at, datetime('now')) AS created_at,
-  COALESCE(updated_at, datetime('now')) AS updated_at
+  ${createdExpr} AS created_at,
+  ${updatedExpr} AS updated_at
 FROM users;
 DROP TABLE users;
 ALTER TABLE users_new RENAME TO users;
@@ -98,18 +112,18 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 COMMIT;
 `;
-        database.exec(sql);
-        database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_roles_3");
-        logger.info("[migration] users_roles_3 DONE");
-      } else {
-        database
-          .prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)")
-          .run("users_roles_3");
-        logger.info("[migration] users_roles_3 SKIP (already has BOSS/SALESPERSON)");
+        try {
+          database.exec(sql);
+          database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_roles_3");
+          logger.info("[migration] users_roles_3 APPLIED");
+        } catch (e) {
+          logger.error("[migration] users_roles_3 failed", e);
+          throw e;
+        } finally {
+          database.exec("PRAGMA foreign_keys = ON");
+        }
       }
     }
-  } catch (e) {
-    logger.warn("[migration] users_roles_3 failed", e);
   }
 
   // Proste, idempotentne migracje kolumnowe.
@@ -311,6 +325,15 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  try {
+    await runStartup();
+  } catch (e) {
+    logger.error("[app] startup failed (migrations or init)", e);
+    process.exit(1);
+  }
+});
+
+async function runStartup(): Promise<void> {
   if (process.argv.includes("--test-pdf")) {
     const { generatePdfFromTemplate } = await import("./pdf/generatePdfFromTemplate");
     const mock = {
@@ -392,9 +415,10 @@ app.whenReady().then(async () => {
     autoUpdater.checkForUpdatesAndNotify().catch((err: unknown) => {
       logger.warn("[autoUpdater] check failed", err);
     });
-    autoUpdater.on("update-available", (info: { version: string }) => {
-      logger.info("[autoUpdater] update available", info.version);
-      mainWindow?.webContents.send("planlux:update-available", { version: info.version });
+    autoUpdater.on("update-available", (info: unknown) => {
+      const version = (info != null && typeof info === "object" && "version" in info) ? (info as { version: string }).version : undefined;
+      logger.info("[autoUpdater] update available", version);
+      mainWindow?.webContents.send("planlux:update-available", { version });
     });
     autoUpdater.on("update-downloaded", () => {
       mainWindow?.webContents.send("planlux:update-downloaded");
@@ -429,7 +453,7 @@ app.whenReady().then(async () => {
       logger.error("[outbox] flush error", e);
     }
   }, config.outboxFlushIntervalMs);
-});
+}
 
 app.on("window-all-closed", () => {
   if (db) {

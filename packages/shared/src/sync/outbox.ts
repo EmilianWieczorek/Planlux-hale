@@ -6,6 +6,9 @@
 import type { ApiClient } from "../api/client";
 import type { OutboxOperationType, OutboxPayloadMap } from "../api/types";
 
+/** Minimal API required by flushOutbox (heartbeat, logPdf, logEmail). */
+export type OutboxApi = Pick<ApiClient, "heartbeat" | "logPdf" | "logEmail">;
+
 export interface OutboxRecord<T extends OutboxOperationType = OutboxOperationType> {
   id: string;
   operation_type: T;
@@ -30,7 +33,7 @@ function delay(ms: number): Promise<void> {
 }
 
 export interface FlushOutboxDeps {
-  api: ApiClient;
+  api: OutboxApi;
   storage: OutboxStorage;
   sendEmail?: (payload: OutboxPayloadMap["SEND_EMAIL"]) => Promise<void>;
   sendGenericEmail?: (payload: OutboxPayloadMap["SEND_GENERIC_EMAIL"]) => Promise<void>;

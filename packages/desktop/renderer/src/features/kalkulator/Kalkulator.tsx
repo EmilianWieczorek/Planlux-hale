@@ -500,15 +500,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
         if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
       }
-      if (!offerNumber && typeof localStorage !== "undefined") {
-        const initial = (userDisplayName?.trim().split(/\s+/)[0]?.[0] ?? "X").toUpperCase().replace(/[^A-Z]/, "X") || "X";
-        const year = new Date().getFullYear();
-        const key = `offerCounter:PLX-${initial}:${year}`;
-        const nextSeq = parseInt(localStorage.getItem(key) ?? "1", 10);
-        localStorage.setItem(key, String(nextSeq + 1));
-        offerNumber = `PLX-${initial}${String(nextSeq).padStart(4, "0")}/${year}`;
-      }
-      if (!offerNumber) throw new Error("Nie udało się wygenerować numeru oferty. Spróbuj ponownie.");
+      if (!offerNumber) throw new Error("Nie udało się wygenerować numeru oferty. Użyj IPC (main). Spróbuj ponownie.");
       actions.setOfferNumber(offerNumber);
     }
     const payload = {
@@ -704,14 +696,6 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                         const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
                         if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
                       }
-                      if (!offerNumber && typeof localStorage !== "undefined") {
-                        const initial = (userDisplayName?.trim().split(/\s+/)[0]?.[0] ?? "X").toUpperCase().replace(/[^A-Z]/, "X") || "X";
-                        const year = new Date().getFullYear();
-                        const key = `offerCounter:PLX-${initial}:${year}`;
-                        const nextSeq = parseInt(localStorage.getItem(key) ?? "1", 10);
-                        localStorage.setItem(key, String(nextSeq + 1));
-                        offerNumber = `PLX-${initial}${String(nextSeq).padStart(4, "0")}/${year}`;
-                      }
                       if (offerNumber) actions.setOfferNumber(offerNumber);
                       else showToast("Nie udało się wygenerować numeru. Spróbuj ponownie.");
                     } finally {
@@ -775,15 +759,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                       const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
                       if (res?.ok && res.offerNumber) offerNumber = res.offerNumber;
                     }
-                    if (!offerNumber && typeof localStorage !== "undefined") {
-                      const initial = (userDisplayName?.trim().split(/\s+/)[0]?.[0] ?? "X").toUpperCase().replace(/[^A-Z]/, "X") || "X";
-                      const year = new Date().getFullYear();
-                      const key = `offerCounter:PLX-${initial}:${year}`;
-                      const nextSeq = parseInt(localStorage.getItem(key) ?? "1", 10);
-                      localStorage.setItem(key, String(nextSeq + 1));
-                      offerNumber = `PLX-${initial}${String(nextSeq).padStart(4, "0")}/${year}`;
-                    }
                     if (offerNumber) actions.setOfferNumber(offerNumber);
+                    else showToast("Nie udało się wygenerować numeru. Spróbuj ponownie.");
                   }}
                 >
                   Tak

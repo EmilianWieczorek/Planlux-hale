@@ -3,7 +3,7 @@
  * Auth: session lives in main; never trust userId from renderer.
  */
 
-import { ipcMain, app, shell, net } from "electron";
+import { ipcMain, app, shell, net, dialog } from "electron";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
@@ -14,6 +14,7 @@ import { getTestPdfFileName } from "./pdf/generatePdf";
 import { getPdfTemplateDir } from "./pdf/pdfPaths";
 import { createSendEmailForFlush } from "./smtpSend";
 import { sendEmail as sendSmtpEmail } from "./mail";
+import { parseRecipients } from "./emailService";
 import { createFilePdfTemplateConfigStore } from "./pdf/pdfTemplateConfigStore";
 import { getPreviewHtmlWithInlinedAssets } from "./pdf/renderTemplate";
 import { getNextOfferNumber as getNextOfferNumberLocal } from "./offerCounters";
@@ -44,6 +45,18 @@ function requireRole(allowedRoles: string[]): SessionUser {
 }
 
 const SALT = "planlux-hale-v1";
+
+/** Safe serialization for IPC and logging – never pass raw Error (TLS/socket have circular refs). */
+function serializeError(err: unknown): { message: string; code: string | null; reason: string | null; stack: string | null } {
+  if (err == null) return { message: "Unknown error", code: null, reason: null, stack: null };
+  const e = err as { message?: string; code?: string; reason?: string; stack?: string };
+  return {
+    message: e?.message ?? String(err),
+    code: e?.code ?? null,
+    reason: e?.reason ?? null,
+    stack: e?.stack ?? null,
+  };
+}
 
 const ALLOWED_ROLES = ["ADMIN", "BOSS", "SALESPERSON"] as const;
 type AllowedRole = (typeof ALLOWED_ROLES)[number];
@@ -895,6 +908,85 @@ export async function registerIpcHandlers(deps: {
 
   const pdfTemplateConfigStore = createFilePdfTemplateConfigStore(app.getPath("userData"));
 
+  /** Ensure offer has a PDF; return path and name for attachment. Generates if missing. */
+  ipcMain.handle("planlux:pdf:ensureOfferPdf", async (_, offerId: string) => {
+    try {
+      const user = requireAuth();
+      const db = getDb();
+      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", filePath: null, fileName: null };
+      const existing = db.prepare("SELECT file_path, file_name FROM pdfs WHERE offer_id = ? AND file_path IS NOT NULL AND file_path != '' ORDER BY created_at DESC LIMIT 1").get(offerId) as { file_path: string; file_name: string } | undefined;
+      if (existing?.file_path && fs.existsSync(existing.file_path)) {
+        logger.info("[pdf] ensureOfferPdf existing", { offerId, filePath: existing.file_path });
+        return { ok: true, filePath: existing.file_path, fileName: existing.file_name || "oferta.pdf" };
+      }
+      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
+      if (!row) return { ok: false, error: "Oferta nie znaleziona", filePath: null, fileName: null };
+      const clientName = [row.client_first_name, row.client_last_name].filter(Boolean).join(" ").trim() || (row.company_name as string) || "Klient";
+      const addons = (() => { try { return JSON.parse((row.addons_snapshot as string) || "[]"); } catch { return []; } })();
+      const standardInPrice = (() => { try { return JSON.parse((row.standard_snapshot as string) || "[]"); } catch { return []; } })();
+      const areaM2 = Number(row.area_m2) || 0;
+      const basePrice = Number(row.base_price_pln) || 0;
+      const payload: GeneratePdfPayload = {
+        userId: row.user_id as string,
+        offer: {
+          clientName,
+          clientNip: (row.nip as string) ?? undefined,
+          clientEmail: (row.email as string) ?? undefined,
+          clientPhone: (row.phone as string) ?? undefined,
+          widthM: Number(row.width_m) || 0,
+          lengthM: Number(row.length_m) || 0,
+          heightM: row.height_m != null ? Number(row.height_m) : undefined,
+          areaM2,
+          variantNazwa: (row.variant_hali as string) || "",
+          variantHali: (row.variant_hali as string) || "",
+        },
+        pricing: {
+          base: { totalBase: basePrice, cenaPerM2: areaM2 > 0 ? basePrice / areaM2 : undefined },
+          additions: addons,
+          standardInPrice,
+          totalPln: Number(row.total_pln) || 0,
+        },
+        offerNumber: (row.offer_number as string) || "PLX-?",
+        sellerName: "Planlux",
+      };
+      const templateConfig = await pdfTemplateConfigStore.load(offerId).catch(() => null);
+      const result = await generatePdfFromTemplate(
+        payload,
+        logger,
+        templateConfig ?? undefined,
+        undefined,
+        undefined
+      );
+      if (!result.ok) {
+        logger.warn("[pdf] ensureOfferPdf generate failed", { offerId, error: result.error });
+        return { ok: false, error: result.error ?? "Generowanie PDF nie powiodło się", filePath: null, fileName: null };
+      }
+      const pdfId = uuid();
+      const { insertPdf } = await import("../src/infra/db");
+      insertPdf(getDb(), {
+        id: pdfId,
+        offerId,
+        userId: (row.user_id as string) || user.id,
+        clientName,
+        fileName: result.fileName,
+        filePath: result.filePath,
+        status: "PDF_CREATED",
+        totalPln: payload.pricing.totalPln,
+        widthM: payload.offer.widthM,
+        lengthM: payload.offer.lengthM,
+        heightM: payload.offer.heightM ?? undefined,
+        areaM2: payload.offer.areaM2,
+        variantHali: payload.offer.variantHali,
+      });
+      logger.info("[pdf] ensureOfferPdf generated", { offerId, filePath: result.filePath, fileName: result.fileName });
+      return { ok: true, filePath: result.filePath, fileName: result.fileName };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.error("[pdf] ensureOfferPdf failed", e);
+      return { ok: false, error: msg, filePath: null, fileName: null };
+    }
+  });
+
   ipcMain.handle("planlux:loadPdfTemplateConfig", async (_, offerIdOrDraftId: string) => {
     try {
       const config = await pdfTemplateConfigStore.load(offerIdOrDraftId);
@@ -1734,6 +1826,10 @@ export async function registerIpcHandlers(deps: {
       const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerId);
       if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
 
+      const toEmails = parseRecipients(params.to.trim());
+      const toNormalized = toEmails.join(", ");
+      if (!toNormalized) return { ok: false, error: "Adres odbiorcy jest wymagany" };
+
       const emailId = uuid();
       const fromEmail = userRow.email;
       const attachments = params.pdfPath ? [params.pdfPath] : [];
@@ -1747,7 +1843,7 @@ export async function registerIpcHandlers(deps: {
         offerId,
         user.id,
         fromEmail,
-        params.to.trim(),
+        toNormalized,
         params.subject.trim() || "Oferta PLANLUX",
         params.body.trim(),
         JSON.stringify(attachments),
@@ -1775,25 +1871,37 @@ export async function registerIpcHandlers(deps: {
           return { ok: false, error: "Skonfiguruj SMTP w ustawieniach" };
         }
         try {
-          await sendMail(creds, {
+          const info = await sendMail(creds, {
             from: fromEmail,
-            to: params.to.trim(),
+            to: toNormalized,
             subject: params.subject.trim() || "Oferta PLANLUX",
             body: params.body.trim(),
             attachmentPath: params.pdfPath,
           });
-          db.prepare("UPDATE email_history SET status = 'SENT', sent_at = ? WHERE id = ?").run(nowIso, emailId);
-          db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(nowIso, nowIso, offerId);
-          const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
-          if (auditTables.length > 0) {
-            db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
-              uuid(),
-              offerId,
-              user.id,
-              JSON.stringify({ emailId, to: params.to })
-            );
+          logger.info("[email] sendMail result", { messageId: info.messageId, accepted: info.accepted, rejected: info.rejected, response: info.response });
+          const accepted = (info.accepted ?? []).length > 0;
+          const rejected = (info.rejected ?? []).length > 0;
+          const sent = accepted && !rejected;
+          if (sent) {
+            db.prepare("UPDATE email_history SET status = 'SENT', sent_at = ? WHERE id = ?").run(nowIso, emailId);
+            db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(nowIso, nowIso, offerId);
+            const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+            if (auditTables.length > 0) {
+              db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
+                uuid(),
+                offerId,
+                user.id,
+                JSON.stringify({ emailId, to: toNormalized })
+              );
+            }
+            return { ok: true };
           }
-          return { ok: true };
+          const errMsg = rejected
+            ? `SMTP odrzucił adresy: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
+            : (info.response ?? "Serwer nie przyjął wiadomości");
+          db.prepare("UPDATE email_history SET status = 'FAILED', error_message = ? WHERE id = ?").run(errMsg, emailId);
+          logger.error("[email] send not accepted", { rejected: info.rejected, response: info.response });
+          return { ok: false, error: errMsg };
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           db.prepare("UPDATE email_history SET status = 'FAILED', error_message = ? WHERE id = ?").run(msg, emailId);
@@ -1808,7 +1916,7 @@ export async function registerIpcHandlers(deps: {
         "INSERT INTO outbox (id, operation_type, payload_json, retry_count, max_retries) VALUES (?, 'SEND_EMAIL', ?, 0, 5)"
       ).run(outboxId, JSON.stringify({
         emailId,
-        to: params.to.trim(),
+        to: toNormalized,
         subject: params.subject.trim() || "Oferta PLANLUX",
         body: params.body.trim(),
         attachmentPath: params.pdfPath ?? undefined,
@@ -1820,7 +1928,7 @@ export async function registerIpcHandlers(deps: {
           uuid(),
           offerId,
           user.id,
-          JSON.stringify({ emailId, to: params.to })
+          JSON.stringify({ emailId, to: toNormalized })
         );
       }
       return { ok: true, queued: true };
@@ -2125,8 +2233,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       return { ok: true, accounts: withPasswordStatus };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
-      logger.error("[smtp] listAccounts failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const ser = serializeError(e);
+      logger.error("[smtp] listAccounts failed", { message: ser.message, code: ser.code, reason: ser.reason });
+      return { ok: false, error: ser.message };
     }
   });
 
@@ -2170,8 +2279,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       return { ok: true, id };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
-      logger.error("[smtp] upsertAccount failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const ser = serializeError(e);
+      logger.error("[smtp] upsertAccount failed", { message: ser.message, code: ser.code, reason: ser.reason });
+      return { ok: false, error: ser.message };
     }
   });
   console.log("[IPC] handler registered: planlux:smtp:upsertAccount");
@@ -2198,9 +2308,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       await transporter.verify();
       return { ok: true };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logger.warn("[smtp] testAccount failed", e);
-      return { ok: false, error: msg };
+      const ser = serializeError(e);
+      logger.warn("[smtp] testAccount failed", { message: ser.message, code: ser.code, reason: ser.reason });
+      return { ok: false, error: ser.message };
     }
   });
 
@@ -2269,8 +2379,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       return { ok: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
-      logger.error("[smtp] upsertForUser failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const ser = serializeError(e);
+      logger.error("[smtp] upsertForUser failed", { message: ser.message, code: ser.code, reason: ser.reason });
+      return { ok: false, error: ser.message };
     }
   });
 
@@ -2281,13 +2392,24 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const targetUserId = (typeof userId === "string" ? userId : null) ?? user.id;
       if (user.role === "SALESPERSON" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
       const db = getDb() as import("./emailService").Db;
+      const { getAccountByUserId, buildTransportForUser, validateSmtpPortSecure } = await import("./emailService");
+      const account = getAccountByUserId(db, targetUserId);
+      if (!account) return { ok: false, error: "Brak konfiguracji SMTP dla użytkownika" };
+      const port = Number(account.port) || 587;
+      const secure = account.secure === 1;
+      const connectionType = secure ? "SSL (implicit)" : "STARTTLS";
+      logger.info("[smtp] testForUser", { host: account.host, port, secure, connectionType });
+      if (/gmail\.com|googlemail\.com/i.test(account.host)) {
+        logger.warn("[smtp] Gmail: upewnij się, że używasz Hasła aplikacji (App Password), nie zwykłego hasła do konta Google.");
+      }
+      validateSmtpPortSecure(port, secure);
       const transporter = await buildTransportForUser(db, targetUserId);
       await transporter.verify();
       return { ok: true };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logger.warn("[smtp] testForUser failed", e);
-      return { ok: false, error: msg };
+      const ser = serializeError(e);
+      logger.warn("[smtp] testForUser failed", { message: ser.message, code: ser.code, reason: ser.reason });
+      return { ok: false, error: ser.message, code: ser.code, reason: ser.reason, stack: ser.stack };
     }
   });
 
@@ -2355,9 +2477,11 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     try {
       const user = requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
-      const p = payload as { offerId: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string };
+      const p = payload as { offerId: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string; extraAttachments?: Array<{ filename: string; path: string }> };
       const offerId = typeof p.offerId === "string" ? p.offerId : "";
-      const to = typeof p.to === "string" ? p.to.trim() : "";
+      const toInput = typeof p.to === "string" ? p.to.trim() : "";
+      const toEmails = parseRecipients(toInput);
+      const to = toEmails.join(", ");
       if (!offerId || !to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
       const db = getDb();
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
@@ -2365,6 +2489,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };
       const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
       if (!account) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)" };
+      const senderExists = db.prepare("SELECT id FROM users WHERE id = ? AND active = 1").get(senderUserId);
+      if (!senderExists) return { ok: false, error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
 
       const settings = getEmailSettings(db as import("./emailService").Db);
       const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(offerId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
@@ -2397,25 +2523,38 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         cc = settings.office_cc_email.trim();
       }
 
-      const eventRows = db.prepare("SELECT details_json FROM event_log WHERE offer_id = ? AND event_type = 'OFFER_CREATED'").all(offerId) as Array<{ details_json: string }>;
-      const pdfIds = eventRows.map((r) => {
-        try {
-          const d = JSON.parse(r.details_json || "{}");
-          return d.pdfId;
-        } catch {
-          return null;
-        }
-      }).filter(Boolean) as string[];
-      let pdfPath: string | null = null;
-      let pdfFileName: string | null = null;
-      if (pdfIds.length > 0) {
-        const pdfRow = db.prepare("SELECT file_path, file_name FROM pdfs WHERE id = ?").get(pdfIds[0]) as { file_path: string; file_name: string } | undefined;
-        if (pdfRow?.file_path) {
-          pdfPath = pdfRow.file_path;
-          pdfFileName = pdfRow.file_name || "oferta.pdf";
-        }
-      }
-      const attachments = pdfPath && pdfFileName ? [{ filename: pdfFileName, path: pdfPath }] : undefined;
+      const ensurePdfResult = await (async (): Promise<{ ok: boolean; filePath: string | null; fileName: string | null; error?: string }> => {
+        const db = getDb();
+        const existing = db.prepare("SELECT file_path, file_name FROM pdfs WHERE offer_id = ? AND file_path IS NOT NULL AND file_path != '' ORDER BY created_at DESC LIMIT 1").get(offerId) as { file_path: string; file_name: string } | undefined;
+        if (existing?.file_path && fs.existsSync(existing.file_path)) return { ok: true, filePath: existing.file_path, fileName: existing.file_name || "oferta.pdf" };
+        const { generatePdfFromTemplate } = await import("./pdf/generatePdfFromTemplate");
+        const store = createFilePdfTemplateConfigStore(app.getPath("userData"));
+        const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
+        if (!row) return { ok: false, filePath: null, fileName: null, error: "Oferta nie znaleziona" };
+        const clientName = [row.client_first_name, row.client_last_name].filter(Boolean).join(" ").trim() || (row.company_name as string) || "Klient";
+        const addons = (() => { try { return JSON.parse((row.addons_snapshot as string) || "[]"); } catch { return []; } })();
+        const standardInPrice = (() => { try { return JSON.parse((row.standard_snapshot as string) || "[]"); } catch { return []; } })();
+        const areaM2 = Number(row.area_m2) || 0;
+        const basePrice = Number(row.base_price_pln) || 0;
+        const payload: GeneratePdfPayload = {
+          userId: row.user_id as string,
+          offer: { clientName, clientNip: (row.nip as string) ?? undefined, clientEmail: (row.email as string) ?? undefined, clientPhone: (row.phone as string) ?? undefined, widthM: Number(row.width_m) || 0, lengthM: Number(row.length_m) || 0, heightM: row.height_m != null ? Number(row.height_m) : undefined, areaM2, variantNazwa: (row.variant_hali as string) || "", variantHali: (row.variant_hali as string) || "" },
+          pricing: { base: { totalBase: basePrice, cenaPerM2: areaM2 > 0 ? basePrice / areaM2 : undefined }, additions: addons, standardInPrice, totalPln: Number(row.total_pln) || 0 },
+          offerNumber: (row.offer_number as string) || "PLX-?", sellerName: "Planlux",
+        };
+        const templateConfig = await store.load(offerId).catch(() => null);
+        const result = await generatePdfFromTemplate(payload, logger, templateConfig ?? undefined, undefined, undefined);
+        if (!result.ok) return { ok: false, filePath: null, fileName: null, error: result.error ?? "Generowanie PDF nie powiodło się" };
+        const pdfId = uuid();
+        const { insertPdf } = await import("../src/infra/db");
+        insertPdf(getDb(), { id: pdfId, offerId, userId: (row.user_id as string) || user.id, clientName, fileName: result.fileName, filePath: result.filePath, status: "PDF_CREATED", totalPln: payload.pricing.totalPln, widthM: payload.offer.widthM, lengthM: payload.offer.lengthM, heightM: payload.offer.heightM ?? undefined, areaM2: payload.offer.areaM2, variantHali: payload.offer.variantHali });
+        return { ok: true, filePath: result.filePath, fileName: result.fileName };
+      })();
+      if (!ensurePdfResult.ok) return { ok: false, error: ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail." };
+      const extraAttachments = p.extraAttachments ?? [];
+      const attachments: Array<{ filename: string; path: string }> = ensurePdfResult.filePath && ensurePdfResult.fileName
+        ? [{ filename: ensurePdfResult.fileName, path: ensurePdfResult.filePath }, ...extraAttachments]
+        : extraAttachments;
 
       const online = await checkInternetEmail();
       if (!online) {
@@ -2444,31 +2583,46 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
       if (result.ok) {
         const now = new Date().toISOString();
-        db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
         const outboxId = uuid();
-        db.prepare(
-          `INSERT INTO email_outbox (id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
-        ).run(
-          outboxId,
-          senderUserId,
-          to,
-          cc || null,
-          subject,
-          bodyText,
-          bodyHtml,
-          JSON.stringify(attachments || []),
-          offerId,
-          now,
-          now,
-          now
-        );
-        const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
-        if (auditTables.length > 0) {
-          db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
-            uuid(), offerId, user.id, JSON.stringify({ to, outboxId })
+        const historyId = uuid();
+        const acceptedJson = result.accepted != null ? JSON.stringify(result.accepted) : null;
+        const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
+        const smtpResponse = result.response ?? null;
+        const accountId = account?.id ?? null;
+        db.transaction(() => {
+          db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
+          db.prepare(
+            `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
+          ).run(
+            outboxId,
+            accountId,
+            senderUserId,
+            to,
+            cc || null,
+            subject,
+            bodyText,
+            bodyHtml,
+            JSON.stringify(attachments || []),
+            offerId,
+            now,
+            now,
+            now
           );
-        }
+          const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(outboxId);
+          if (!outboxExists) {
+            throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
+          }
+          db.prepare(
+            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
+          ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+          const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+          if (auditTables.length > 0) {
+            db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
+              uuid(), offerId, user.id, JSON.stringify({ to, outboxId })
+            );
+          }
+        })();
         return { ok: true, sent: true };
       }
 
@@ -2482,11 +2636,61 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         relatedOfferId: offerId,
         accountUserId: senderUserId,
       }, logger);
-      return { ok: true, queued: true, error: result.error };
+      return { ok: false, error: result.error ?? "Serwer SMTP nie przyjął wiadomości", queued: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       logger.error("[email] sendOfferEmail failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
+  const DANGEROUS_EXT = /\.(exe|bat|cmd|com|msi|scr|vbs|js|jar)$/i;
+  ipcMain.handle("planlux:attachments:pickFiles", async () => {
+    try {
+      requireAuth();
+      const { BrowserWindow } = await import("electron");
+      const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+      const result = await dialog.showOpenDialog(win ?? undefined, {
+        properties: ["openFile", "multiSelections"],
+        title: "Dodaj załączniki",
+      });
+      if (result.canceled || !result.filePaths?.length) return { ok: true, files: [] };
+      const baseDir = path.join(app.getPath("userData"), "attachments", uuid());
+      if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
+      const files: Array<{ token: string; originalName: string; storedPath: string; size: number; mime: string }> = [];
+      let totalBytes = 0;
+      for (const src of result.filePaths) {
+        if (totalBytes >= MAX_ATTACHMENTS_TOTAL_BYTES) {
+          logger.warn("[attachments] max total size reached");
+          break;
+        }
+        const originalName = path.basename(src);
+        if (DANGEROUS_EXT.test(originalName)) {
+          logger.warn("[attachments] skipped dangerous extension", { originalName });
+          continue;
+        }
+        const stat = fs.statSync(src);
+        if (!stat.isFile()) continue;
+        if (totalBytes + stat.size > MAX_ATTACHMENTS_TOTAL_BYTES) continue;
+        const safeName = originalName.replace(/[^\w\s.-]/gi, "_").slice(0, 200) || "file";
+        const dest = path.join(baseDir, safeName);
+        fs.copyFileSync(src, dest);
+        totalBytes += stat.size;
+        files.push({
+          token: dest,
+          originalName,
+          storedPath: dest,
+          size: stat.size,
+          mime: "application/octet-stream",
+        });
+      }
+      logger.info("[attachments] pickFiles", { count: files.length, totalBytes });
+      return { ok: true, files };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.error("[attachments] pickFiles failed", e);
+      return { ok: false, error: msg, files: [] };
     }
   });
 
@@ -2495,7 +2699,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { to?: string; cc?: string; bcc?: string; subject?: string; text?: string; html?: string; attachments?: Array<{ filename: string; path: string }>; relatedOfferId?: string; accountId?: string | null };
-      const to = typeof p.to === "string" ? p.to.trim() : "";
+      const toInput = typeof p.to === "string" ? p.to.trim() : "";
+      const toEmails = parseRecipients(toInput);
+      const to = toEmails.join(", ");
       const subject = typeof p.subject === "string" ? p.subject.trim() : "";
       if (!to || !subject) return { ok: false, error: "Do i temat są wymagane" };
       const online = await checkInternetEmail();
@@ -2543,13 +2749,42 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       };
       const result = await sendNow(db, outboxRow, logger);
       if (result.ok) {
-        db.prepare(
-          "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?)"
-        ).run(uuid(), tempId, account.id, to, subject, result.messageId || null, new Date().toISOString(), new Date().toISOString());
+        const now = new Date().toISOString();
+        const acceptedJson = result.accepted != null ? JSON.stringify(result.accepted) : null;
+        const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
+        const smtpResponse = result.response ?? null;
+        const historyId = uuid();
+        const runTx = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
+          db.prepare(
+            `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, bcc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
+          ).run(
+            tempId,
+            account.id,
+            (account as { user_id?: string | null }).user_id ?? null,
+            to,
+            p.cc || null,
+            p.bcc || null,
+            subject,
+            p.text || null,
+            p.html || null,
+            outboxRow.attachments_json,
+            p.relatedOfferId || null,
+            now,
+            now,
+            now
+          );
+          const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(tempId);
+          if (!outboxExists) throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
+          db.prepare(
+            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
+          ).run(historyId, tempId, account.id, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+        });
+        runTx();
         return { ok: true, sent: true };
       }
       enqueueEmail(db, { to, cc: p.cc, bcc: p.bcc, subject, text: p.text, html: p.html, attachments: p.attachments, relatedOfferId: p.relatedOfferId, accountId: account.id }, logger);
-      return { ok: true, queued: true, outboxId: tempId };
+      return { ok: true, queued: true, outboxId: tempId, error: result.error };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       logger.error("[email] send failed", e);

@@ -8,6 +8,17 @@ import nodemailer from "nodemailer";
 import type Mail from "nodemailer/lib/mailer";
 import { getPassword, getSmtpPassword } from "./secureStore";
 
+/**
+ * Parse "To" field: comma, semicolon, space, newline.
+ * Returns array of non-empty trimmed addresses; use emails.join(", ") for nodemailer.
+ */
+export function parseRecipients(input: string): string[] {
+  return input
+    .split(/[\s,;]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 const CHECK_INTERNET_URL = "https://example.com/favicon.ico";
 const CHECK_INTERNET_TIMEOUT_MS = 3000;
 const OUTBOX_POLL_INTERVAL_MS = 15_000;
@@ -116,6 +127,29 @@ function getAccountById(db: Db, accountId: string): SmtpAccountRow | null {
   return row ?? null;
 }
 
+/**
+ * Validate port + secure for SMTP (avoids WRONG_VERSION_NUMBER / TLS mismatch).
+ * - 587 → STARTTLS, secure must be false
+ * - 465 → implicit SSL, secure must be true
+ * - 25  → plain/STARTTLS, secure must be false
+ */
+export function validateSmtpPortSecure(port: number, secure: boolean): void {
+  const p = Number(port);
+  if (p === 587 && secure !== false) {
+    throw new Error("SMTP configuration mismatch: port 587 requires secure=false (STARTTLS).");
+  }
+  if (p === 465 && secure !== true) {
+    throw new Error("SMTP configuration mismatch: port 465 requires secure=true (implicit SSL).");
+  }
+  if (p === 25 && secure !== false) {
+    throw new Error("SMTP configuration mismatch: port 25 requires secure=false.");
+  }
+}
+
+function isDev(): boolean {
+  return process.env.NODE_ENV === "development" || !!process.env.VITE_DEV_SERVER_URL;
+}
+
 /** Resolve account for outbox row: by account_user_id (per-user) or account_id (legacy). */
 function getAccountForOutboxRow(db: Db, row: EmailOutboxRow): SmtpAccountRow | null {
   if (row.account_user_id) {
@@ -130,15 +164,19 @@ export async function buildTransport(
   db: Db,
   account: SmtpAccountRow
 ): Promise<nodemailer.Transporter> {
+  const port = Number(account.port) || 587;
+  const secure = account.secure === 1;
+  validateSmtpPortSecure(port, secure);
   const pass = account.user_id
     ? await getSmtpPassword(account.user_id)
     : await getPassword(account.id);
   if (!pass) throw new Error(`Brak hasła SMTP dla konta: ${account.name || account.from_email}`);
   return nodemailer.createTransport({
     host: account.host,
-    port: account.port,
-    secure: account.secure === 1,
+    port,
+    secure,
     auth: { user: account.auth_user || account.from_email, pass },
+    ...(isDev() ? { tls: { rejectUnauthorized: false } } : {}),
   });
 }
 
@@ -220,14 +258,33 @@ export type SendOfferEmailNowParams = {
   accountUserId: string;
 };
 
+export type SendMailResult = {
+  ok: boolean;
+  messageId?: string;
+  accepted?: string[];
+  rejected?: string[];
+  response?: string;
+  error?: string;
+};
+
 /** Send one offer email immediately (main process only). */
 export async function sendOfferEmailNow(
   db: Db,
   params: SendOfferEmailNowParams,
   logger: { info: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void }
-): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+): Promise<SendMailResult> {
   const account = getAccountByUserId(db, params.accountUserId);
   if (!account) return { ok: false, error: "Brak konfiguracji SMTP dla użytkownika" };
+  const port = Number(account.port) || 587;
+  const secure = account.secure === 1;
+  logger.info("[emailService] sendOfferEmailNow", {
+    host: account.host,
+    port,
+    secure,
+    auth_user: account.auth_user || account.from_email,
+    to: params.to,
+    subject: params.subject,
+  });
   const transporter = await buildTransport(db, account);
   const from = account.from_name
     ? `"${account.from_name.replace(/"/g, '\\"')}" <${account.from_email}>`
@@ -247,8 +304,35 @@ export async function sendOfferEmailNow(
   }
   try {
     const info = await transporter.sendMail(mailOptions);
-    logger.info("[emailService] sendOfferEmailNow ok", { to: params.to, messageId: info.messageId });
-    return { ok: true, messageId: info.messageId as string };
+    const accepted = (info.accepted ?? []).length > 0;
+    const rejected = (info.rejected ?? []).length > 0;
+    const sent = accepted && !rejected;
+    logger.info("[emailService] sendOfferEmailNow result", {
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      response: info.response,
+    });
+    if (sent) {
+      return {
+        ok: true,
+        messageId: info.messageId as string,
+        accepted: info.accepted as string[],
+        rejected: info.rejected as string[],
+        response: typeof info.response === "string" ? info.response : undefined,
+      };
+    }
+    const errMsg = rejected
+      ? `SMTP odrzucił: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
+      : (info.response ?? "Serwer nie przyjął wiadomości");
+    return {
+      ok: false,
+      error: errMsg,
+      messageId: info.messageId as string | undefined,
+      accepted: info.accepted as string[] | undefined,
+      rejected: info.rejected as string[] | undefined,
+      response: typeof info.response === "string" ? info.response : undefined,
+    };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[emailService] sendOfferEmailNow failed", e);
@@ -260,11 +344,21 @@ export async function sendNow(
   db: Db,
   outboxItem: EmailOutboxRow,
   logger: { info: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void }
-): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+): Promise<SendMailResult> {
   const account = getAccountForOutboxRow(db, outboxItem);
   if (!account) {
     return { ok: false, error: "Brak aktywnego konta SMTP" };
   }
+  const port = Number(account.port) || 587;
+  const secure = account.secure === 1;
+  logger.info("[emailService] sendNow", {
+    host: account.host,
+    port,
+    secure,
+    auth_user: account.auth_user || account.from_email,
+    to: outboxItem.to_addr,
+    subject: outboxItem.subject,
+  });
   const transporter = await buildTransport(db, account);
   const from = account.from_name
     ? `"${account.from_name.replace(/"/g, '\\"')}" <${account.from_email}>`
@@ -290,10 +384,38 @@ export async function sendNow(
   }
   try {
     const info = await transporter.sendMail(mailOptions);
-    logger.info("[emailService] sendNow ok", { outboxId: outboxItem.id, messageId: info.messageId });
-    const now = new Date().toISOString();
-    db.prepare("UPDATE email_outbox SET sent_at = ? WHERE id = ?").run(now, outboxItem.id);
-    return { ok: true, messageId: info.messageId as string };
+    const accepted = (info.accepted ?? []).length > 0;
+    const rejected = (info.rejected ?? []).length > 0;
+    const sent = accepted && !rejected;
+    logger.info("[emailService] sendNow result", {
+      outboxId: outboxItem.id,
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      response: info.response,
+    });
+    if (sent) {
+      const now = new Date().toISOString();
+      db.prepare("UPDATE email_outbox SET sent_at = ? WHERE id = ?").run(now, outboxItem.id);
+      return {
+        ok: true,
+        messageId: info.messageId as string,
+        accepted: info.accepted as string[],
+        rejected: info.rejected as string[],
+        response: typeof info.response === "string" ? info.response : undefined,
+      };
+    }
+    const errMsg = rejected
+      ? `SMTP odrzucił: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
+      : (info.response ?? "Serwer nie przyjął wiadomości");
+    return {
+      ok: false,
+      error: errMsg,
+      messageId: info.messageId as string | undefined,
+      accepted: info.accepted as string[] | undefined,
+      rejected: info.rejected as string[] | undefined,
+      response: typeof info.response === "string" ? info.response : undefined,
+    };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[emailService] sendNow failed", e);
@@ -351,25 +473,36 @@ export async function processOutbox(
   for (const row of rows) {
     db.prepare("UPDATE email_outbox SET status = 'sending', updated_at = ? WHERE id = ?").run(now, row.id);
     const result = await sendNow(db, { ...row, status: "sending" }, logger);
+    const acceptedJson = result.accepted != null ? JSON.stringify(result.accepted) : null;
+    const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
+    const smtpResponse = result.response ?? null;
     if (result.ok) {
-      db.prepare(
-        "UPDATE email_outbox SET status = 'sent', updated_at = ? WHERE id = ?"
-      ).run(now, row.id);
-      db.prepare(
-        `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, sent_at, created_at)
-         VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?)`
-      ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.messageId || null, now, now);
+      const runTx = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
+        db.prepare(
+          "UPDATE email_outbox SET status = 'sent', updated_at = ? WHERE id = ?"
+        ).run(now, row.id);
+        const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(row.id);
+        if (!outboxExists) throw new Error("[emailService] FK diagnostic: email_outbox row missing before history INSERT");
+        db.prepare(
+          `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at)
+           VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)`
+        ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+      });
+      runTx();
       processed++;
     } else {
       const nextRetry = row.retry_count + 1;
       if (nextRetry >= MAX_RETRIES) {
-        db.prepare(
-          "UPDATE email_outbox SET status = 'failed', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?"
-        ).run(result.error || "Max retries", nextRetry, now, row.id);
-        db.prepare(
-          `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, created_at)
-           VALUES (?, ?, ?, ?, ?, 'failed', ?, ?)`
-        ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.error || null, now);
+        const runTxFail = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
+          db.prepare(
+            "UPDATE email_outbox SET status = 'failed', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?"
+          ).run(result.error || "Max retries", nextRetry, now, row.id);
+          db.prepare(
+            `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, accepted_json, rejected_json, smtp_response, created_at)
+             VALUES (?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)`
+          ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.error || null, acceptedJson, rejectedJson, smtpResponse, now);
+        });
+        runTxFail();
         failed++;
       } else {
         const nextAt = nextRetryAt(nextRetry);
