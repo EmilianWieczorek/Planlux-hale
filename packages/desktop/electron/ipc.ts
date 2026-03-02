@@ -1525,6 +1525,19 @@ export async function registerIpcHandlers(deps: {
 
   const ROLES_SEE_ALL = ["ADMIN", "BOSS"];
 
+  /**
+   * Resolve offer identifier to offers_crm.id (PK for FK).
+   * Accepts either offers_crm.id or offer_number (e.g. "PLX-X0020/2026").
+   * Use the returned id for email_history.offer_id, email_outbox.related_offer_id, etc.
+   */
+  function resolveOfferId(db: ReturnType<typeof getDb>, offerIdOrNumber: string): string | null {
+    if (!offerIdOrNumber || !offerIdOrNumber.trim()) return null;
+    const byId = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerIdOrNumber.trim()) as { id: string } | undefined;
+    if (byId) return byId.id;
+    const byNumber = db.prepare("SELECT id FROM offers_crm WHERE offer_number = ?").get(offerIdOrNumber.trim()) as { id: string } | undefined;
+    return byNumber?.id ?? null;
+  }
+
   function canAccessOffer(db: ReturnType<typeof getDb>, offerId: string, userId: string): boolean {
     const offer = db.prepare("SELECT user_id FROM offers_crm WHERE id = ?").get(offerId) as { user_id: string } | undefined;
     if (!offer) return false;
@@ -1815,16 +1828,18 @@ export async function registerIpcHandlers(deps: {
   });
 
 /** CRM: wyślij e-mail oferty (online: SMTP + SENT; offline: QUEUED + outbox). */
-  ipcMain.handle("planlux:sendOfferEmail", async (_, offerId: string, params: { to: string; subject: string; body: string; pdfPath?: string }) => {
+  ipcMain.handle("planlux:sendOfferEmail", async (_, offerIdParam: string, params: { to: string; subject: string; body: string; pdfPath?: string }) => {
     try {
       const user = requireAuth();
       const db = getDb();
+      const offerId = resolveOfferId(db, offerIdParam);
+      if (!offerId) return { ok: false, error: "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)" };
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
       const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(user.id) as { email: string } | undefined;
       if (!userRow?.email) return { ok: false, error: "Użytkownik nie znaleziony" };
 
       const offerRow = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerId);
-      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
+      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona (FK: rekord oferty nie istnieje)" };
 
       const toEmails = parseRecipients(params.to.trim());
       const toNormalized = toEmails.join(", ");
@@ -2478,12 +2493,14 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const user = requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { offerId: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string; extraAttachments?: Array<{ filename: string; path: string }> };
-      const offerId = typeof p.offerId === "string" ? p.offerId : "";
+      const offerIdParam = typeof p.offerId === "string" ? p.offerId.trim() : "";
       const toInput = typeof p.to === "string" ? p.to.trim() : "";
       const toEmails = parseRecipients(toInput);
       const to = toEmails.join(", ");
-      if (!offerId || !to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      if (!offerIdParam || !to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
       const db = getDb();
+      const offerId = resolveOfferId(db, offerIdParam);
+      if (!offerId) return { ok: false, error: "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)" };
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
       const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
       if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };

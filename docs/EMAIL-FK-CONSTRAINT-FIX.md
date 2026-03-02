@@ -9,6 +9,18 @@ W tym projekcie **nie ma** tabel `email_logs` ani `email_attachments`. Używane 
 
 Załączniki (PDF oferty + pliki użytkownika) są zapisywane jako JSON w `email_outbox.attachments_json`, bez osobnej tabeli z FK.
 
+## Mapowanie offer_id (identyfikator vs numer oferty)
+
+Kolumny **email_history.offer_id** i **email_outbox.related_offer_id** muszą zawierać **offers_crm.id** (klucz główny), a nie numer oferty (np. `offer_number` typu "PLX-X0020/2026"). W przeciwnym razie FK `email_history.offer_id REFERENCES offers_crm(id)` powoduje błąd.
+
+**Rozwiązanie:** Na początku obsługi wysyłki (planlux:sendOfferEmail, planlux:email:sendOfferEmail) używana jest funkcja **resolveOfferId(db, offerIdOrNumber)**:
+
+1. `SELECT id FROM offers_crm WHERE id = ?` – jeśli przekazano już id.
+2. Jeśli brak wiersza: `SELECT id FROM offers_crm WHERE offer_number = ?`.
+3. Zwraca `offers_crm.id` lub `null`; przy `null` zwracany jest błąd: *"Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)"*.
+
+Do wszystkich zapisów (email_history.offer_id, email_outbox.related_offer_id, UPDATE offers_crm, offer_audit.offer_id) używana jest wyłącznie ta rozpoznana wartość **id**.
+
 ## Który FK powodował błąd
 
 Tabela **email_outbox** ma ograniczenia:
@@ -70,7 +82,7 @@ Dzięki temu SQLite wymusza wszystkie FOREIGN KEY dla tego połączenia (po migr
 ## Zmienione pliki
 
 - `packages/desktop/electron/main.ts` – `PRAGMA foreign_keys = ON` po otwarciu bazy.
-- `packages/desktop/electron/ipc.ts` – walidacja użytkownika, transakcje, account_id w outbox, sprawdzenie oferty w transakcji, diagnostyka (planlux:email:sendOfferEmail, planlux:email:send).
+- `packages/desktop/electron/ipc.ts` – **resolveOfferId(db, offerIdOrNumber)** (id lub offer_number → offers_crm.id); użycie rozpoznanego id w planlux:sendOfferEmail i planlux:email:sendOfferEmail; walidacja użytkownika, transakcje, account_id w outbox, sprawdzenie oferty w transakcji, diagnostyka.
 - `packages/desktop/electron/emailService.ts` – transakcje w processOutbox (sent + failed po MAX_RETRIES), diagnostyka przed INSERT email_history.
 
 ## Kolejność zapisu (nie zmieniać)
