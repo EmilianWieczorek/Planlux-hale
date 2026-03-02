@@ -1,5 +1,13 @@
 # Fix: FOREIGN KEY constraint failed przy wysyłce e-mail
 
+## Schema / FK mapping (skrót)
+
+- **offers_crm** – id (PK), offer_number, user_id REFERENCES users(id). Główna tabela ofert.
+- **pdfs** – id (PK), offer_id REFERENCES offers(id) lub offers_crm(id) (zależnie od migracji). Zawsze ustawiać **offers_crm.id**, nigdy null ani numer oferty.
+- **email_history** – id (PK), offer_id REFERENCES offers_crm(id) (legacy), outbox_id, account_id. Historia maili.
+- **email_outbox** – id (PK), account_id REFERENCES smtp_accounts(id), account_user_id REFERENCES users(id), related_offer_id (bez FK). Załączniki w **attachments_json** (brak tabeli email_attachments).
+- Kolejność zapisu: najpierw email_outbox (lub oferta), potem email_history; pdfs tylko z prawidłowym offer_id.
+
 ## Mapowanie tabel (ten projekt)
 
 W tym projekcie **nie ma** tabel `email_logs` ani `email_attachments`. Używane są:

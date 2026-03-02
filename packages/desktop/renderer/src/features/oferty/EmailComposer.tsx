@@ -60,6 +60,7 @@ export function EmailComposer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resultMessage, setResultMessage] = useState<"sent" | "queued" | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -70,6 +71,7 @@ export function EmailComposer({
       setUserAttachments([]);
       setError(null);
       setResultMessage(null);
+      setWarning(null);
     }
   }, [open, defaultTo, defaultSubject, defaultBody, officeCcDefault]);
 
@@ -81,6 +83,7 @@ export function EmailComposer({
     setSending(true);
     setError(null);
     setResultMessage(null);
+    setWarning(null);
     try {
       const res = await onSend({
         to: to.trim(),
@@ -95,6 +98,7 @@ export function EmailComposer({
           setResultMessage("queued");
         } else {
           setResultMessage("sent");
+          if ((res as { warning?: string }).warning) setWarning((res as { warning?: string }).warning);
           setTimeout(() => onClose(), 1500);
         }
       } else {
@@ -188,10 +192,15 @@ export function EmailComposer({
           {resultMessage === "queued" && (
             <Alert severity="info">Dodano do kolejki – zostanie wysłany po powrocie połączenia.</Alert>
           )}
+          {warning && (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              {warning}
+            </Alert>
+          )}
           {error && (
-            <Typography color="error" variant="body2">
+            <Alert severity="error" sx={{ mt: 1 }}>
               {error}
-            </Typography>
+            </Alert>
           )}
         </Box>
       </DialogContent>

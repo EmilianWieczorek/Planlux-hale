@@ -448,4 +448,84 @@ COMMIT;
   } catch (e) {
     logger.warn("[migration] email_history SMTP result columns skipped", e);
   }
+
+  // 15. email_history: ensure new-schema columns (outbox_id, account_id, to_addr, provider_message_id, error) for outbox-linked inserts
+  try {
+    if (!hasTable(database, "email_history")) {
+      logger.info("[migration] email_history step 15 skipped (no table)");
+    } else {
+      const addIfMissing = (col: string, def: string) => {
+        if (!hasColumn(database, "email_history", col)) {
+          database.exec(`ALTER TABLE email_history ADD COLUMN ${col} ${def}`);
+          logger.info("[migration] email_history column added", { column: col });
+        }
+      };
+      addIfMissing("outbox_id", "TEXT DEFAULT NULL");
+      addIfMissing("account_id", "TEXT DEFAULT NULL");
+      addIfMissing("to_addr", "TEXT DEFAULT NULL");
+      addIfMissing("provider_message_id", "TEXT DEFAULT NULL");
+      addIfMissing("error", "TEXT DEFAULT NULL");
+      addIfMissing("offer_id", "TEXT DEFAULT NULL");
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history new-schema columns skipped", e);
+  }
+
+  // 16. pdfs: rebuild with offer_id REFERENCES offers_crm(id) when current FK points to offers (legacy)
+  try {
+    if (!hasTable(database, "pdfs") || !hasTable(database, "offers_crm")) {
+      logger.info("[migration] pdfs FK step 16 skipped (no pdfs or offers_crm)");
+    } else {
+      const fkList = database.prepare("PRAGMA foreign_key_list('pdfs')").all() as Array<{ from: string; table: string }>;
+      const refsOffers = fkList.some((fk) => fk.from === "offer_id" && fk.table === "offers");
+      if (!refsOffers) {
+        logger.info("[migration] pdfs already references offers_crm or other, skip FK migration");
+      } else {
+        database.exec("PRAGMA foreign_keys = OFF");
+        try {
+          database.exec(`
+            BEGIN TRANSACTION;
+            ALTER TABLE pdfs RENAME TO pdfs_old;
+            CREATE TABLE pdfs (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL REFERENCES users(id),
+              offer_id TEXT REFERENCES offers_crm(id),
+              client_name TEXT NOT NULL,
+              variant_hali TEXT,
+              width_m REAL,
+              length_m REAL,
+              height_m REAL,
+              area_m2 REAL,
+              total_pln REAL,
+              file_path TEXT NOT NULL,
+              file_name TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'LOCAL' CHECK (status IN ('LOCAL', 'LOGGED', 'PDF_CREATED', 'PDF_FAILED')),
+              error_message TEXT,
+              logged_at TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO pdfs (id, user_id, offer_id, client_name, variant_hali, width_m, length_m, height_m, area_m2, total_pln, file_path, file_name, status, error_message, logged_at, created_at)
+            SELECT p.id, p.user_id, p.offer_id, p.client_name, p.variant_hali, p.width_m, p.length_m, p.height_m, p.area_m2, p.total_pln, p.file_path, p.file_name, p.status, p.error_message, p.logged_at, p.created_at
+            FROM pdfs_old p
+            WHERE p.offer_id IN (SELECT id FROM offers_crm);
+            DROP TABLE pdfs_old;
+            COMMIT;
+          `);
+          database.exec("CREATE INDEX IF NOT EXISTS idx_pdfs_user_id ON pdfs(user_id)");
+          database.exec("CREATE INDEX IF NOT EXISTS idx_pdfs_created_at ON pdfs(created_at)");
+          database.exec("CREATE INDEX IF NOT EXISTS idx_pdfs_status ON pdfs(status)");
+          logger.info("[migration] pdfs rebuilt with offer_id REFERENCES offers_crm(id)");
+        } finally {
+          database.exec("PRAGMA foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] pdfs FK migration skipped", e);
+    try {
+      database.exec("PRAGMA foreign_keys = ON");
+    } catch {
+      // ignore
+    }
+  }
 }

@@ -484,9 +484,9 @@ export async function processOutbox(
         const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(row.id);
         if (!outboxExists) throw new Error("[emailService] FK diagnostic: email_outbox row missing before history INSERT");
         db.prepare(
-          `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at)
-           VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)`
-        ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+          `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id)
+           VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)`
+        ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, row.related_offer_id ?? null);
       });
       runTx();
       processed++;
@@ -498,9 +498,9 @@ export async function processOutbox(
             "UPDATE email_outbox SET status = 'failed', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?"
           ).run(result.error || "Max retries", nextRetry, now, row.id);
           db.prepare(
-            `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, accepted_json, rejected_json, smtp_response, created_at)
-             VALUES (?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)`
-          ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.error || null, acceptedJson, rejectedJson, smtpResponse, now);
+            `INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, accepted_json, rejected_json, smtp_response, created_at, offer_id)
+             VALUES (?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?)`
+          ).run(uuid(), row.id, row.account_id, row.to_addr, row.subject, result.error || null, acceptedJson, rejectedJson, smtpResponse, now, row.related_offer_id ?? null);
         });
         runTxFail();
         failed++;

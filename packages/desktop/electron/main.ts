@@ -14,6 +14,7 @@ import { config } from "../src/config";
 import { logger } from "../src/logger";
 import { createOutboxStorage, type Db } from "../src/db/outboxStorage";
 import { getRemoteMeta } from "../src/infra/baseSync";
+import { dumpFkInfo } from "../src/infra/db";
 import { createSendEmailForFlush } from "./smtpSend";
 import { checkInternet } from "./checkInternet";
 import { sendEmail as sendGenericEmailSmtp } from "./mail";
@@ -208,6 +209,22 @@ COMMIT;
   } catch (e) {
     logger.warn("[schema] log failed", e);
   }
+
+  // DEV: table_info and foreign_key_list for email_history and pdfs (diagnose missing columns / FK mismatch).
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const emailHistoryInfo = database.prepare("PRAGMA table_info('email_history')").all() as Array<{ name: string; type: string }>;
+      const pdfsInfo = database.prepare("PRAGMA table_info('pdfs')").all() as Array<{ name: string; type: string }>;
+      const pdfsFk = database.prepare("PRAGMA foreign_key_list('pdfs')").all() as Array<{ table: string; from: string; to: string }>;
+      const emailHistoryFk = database.prepare("PRAGMA foreign_key_list('email_history')").all() as Array<{ table: string; from: string; to: string }>;
+      logger.info("[schema] DEV email_history table_info", { columns: emailHistoryInfo.map((c) => c.name) });
+      logger.info("[schema] DEV pdfs table_info", { columns: pdfsInfo.map((c) => c.name) });
+      logger.info("[schema] DEV pdfs foreign_key_list", pdfsFk);
+      logger.info("[schema] DEV email_history foreign_key_list", emailHistoryFk);
+    } catch (e) {
+      logger.warn("[schema] DEV table_info/fk log failed", e);
+    }
+  }
 }
 
 function getDb() {
@@ -216,6 +233,22 @@ function getDb() {
     db.exec(SCHEMA_SQL);
     runMigrations(db);
     db.exec("PRAGMA foreign_keys = ON");
+    try {
+      const hasPdfs = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pdfs'").get() as { name?: string } | undefined)?.name === "pdfs";
+      if (hasPdfs) {
+        const r = db.prepare("DELETE FROM pdfs WHERE offer_id IS NULL OR offer_id = ''").run();
+        if (r.changes > 0) logger.info("[db] cleanup: removed pdfs rows with null/empty offer_id", { count: r.changes });
+      }
+    } catch (e) {
+      logger.warn("[db] pdfs cleanup skipped", e);
+    }
+    if (process.env.NODE_ENV !== "production") {
+      try {
+        dumpFkInfo(db);
+      } catch (e) {
+        logger.warn("[db] dumpFkInfo failed", e);
+      }
+    }
   }
   return db;
 }
@@ -394,6 +427,7 @@ async function runStartup(): Promise<void> {
   const database = getDb();
   await registerIpcHandlers({
     getDb,
+    getDbPath: () => dbPath,
     apiClient,
     config: { appVersion: config.appVersion },
     logger,

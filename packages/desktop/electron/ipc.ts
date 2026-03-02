@@ -120,11 +120,12 @@ function checkInternetNet(): Promise<boolean> {
 
 export async function registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
+  getDbPath?: () => string;
   apiClient: import("@planlux/shared").ApiClient;
   config: { appVersion: string };
   logger: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void };
 }) {
-  const { getDb, config, apiClient, logger } = deps;
+  const { getDb, getDbPath, config, apiClient, logger } = deps;
 
   ipcMain.handle("planlux:login", async (_, email: string, password: string) => {
     try {
@@ -698,7 +699,7 @@ export async function registerIpcHandlers(deps: {
 
     insertPdf(getDb(), {
       id: pdfId,
-      offerId: null,
+      offerId,
       userId,
       clientName: p.offer.clientName,
       fileName: result.fileName,
@@ -746,28 +747,40 @@ export async function registerIpcHandlers(deps: {
     return { ok: true, pdfId, filePath: result.filePath, fileName: result.fileName };
   }
 
+  /** Log failed PDF only when we have a valid offerId (pdfs.offer_id FK). Skip insert otherwise. */
   async function insertPdfFailed(offerData: unknown, errorMessage: string): Promise<void> {
-    const { insertPdf } = await import("../src/infra/db");
-    const p = offerData as { userId?: string; offer: { clientName: string; widthM: number; lengthM: number; heightM: number; areaM2: number; variantHali: string }; pricing?: { totalPln: number } };
-    const pdfId = uuid();
+    const db = getDb();
+    const p = offerData as { userId?: string; draftId?: string; offer?: { clientName: string; widthM: number; lengthM: number; heightM: number; areaM2: number; variantHali: string }; pricing?: { totalPln: number }; offerNumber?: string } | undefined;
+    let offerId: string | null = null;
+    if (p?.draftId) {
+      const row = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(p.draftId) as { id: string } | undefined;
+      if (row) offerId = p.draftId;
+    }
+    if (!offerId) {
+      logger.warn("[pdf] insertPdfFailed skipped (no valid offerId for FK)");
+      return;
+    }
     try {
-      insertPdf(getDb(), {
-        id: pdfId,
-        offerId: null,
-        userId: p.userId ?? "",
+      const { insertPdf } = await import("../src/infra/db");
+      insertPdf(db, {
+        id: uuid(),
+        offerId,
+        userId: p?.userId ?? "",
         clientName: p?.offer?.clientName ?? "",
         fileName: "(failed)",
         filePath: "(failed)",
         status: "PDF_FAILED",
         errorMessage,
-        totalPln: p.pricing?.totalPln,
-        widthM: p.offer.widthM,
-        lengthM: p.offer.lengthM,
-        heightM: p.offer.heightM,
-        areaM2: p.offer.areaM2,
-        variantHali: p.offer.variantHali,
+        totalPln: p?.pricing?.totalPln,
+        widthM: p?.offer?.widthM ?? 0,
+        lengthM: p?.offer?.lengthM ?? 0,
+        heightM: p?.offer?.heightM ?? 0,
+        areaM2: p?.offer?.areaM2 ?? 0,
+        variantHali: p?.offer?.variantHali ?? "",
       });
-    } catch (_) {}
+    } catch (e) {
+      logger.warn("[pdf] insertPdfFailed insert error", e);
+    }
   }
 
   async function runPdfGenerateWithTimeout(
@@ -2492,16 +2505,33 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     try {
       const user = requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
-      const p = payload as { offerId: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string; extraAttachments?: Array<{ filename: string; path: string }> };
-      const offerIdParam = typeof p.offerId === "string" ? p.offerId.trim() : "";
+      const p = payload as { offerId?: string; offerNumber?: string; offer_number?: string; number?: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string; extraAttachments?: Array<{ filename: string; path: string }> };
+      const db = getDb();
+      const offerInputRaw = p.offerId ?? p.offerNumber ?? p.offer_number ?? p.number;
+      const offerInput = (typeof offerInputRaw === "string" ? offerInputRaw : "").trim();
+      if (!offerInput) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      let resolvedOfferId: string | null = resolveOfferId(db, offerInput);
+      if (!resolvedOfferId) {
+        try {
+          const { ensureOfferCrmRow } = await import("../src/infra/db");
+          resolvedOfferId = ensureOfferCrmRow(db, offerInput);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { ok: false, error: msg.includes("nie istnieje w bazie CRM") ? msg : "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)" };
+        }
+      }
+      if (!resolvedOfferId) {
+        throw new Error("sendOfferEmail: resolvedOfferId is null – cannot insert email_history");
+      }
+      const parent = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(resolvedOfferId);
+      if (!parent) {
+        throw new Error("sendOfferEmail: offers_crm row missing for offer_id=" + resolvedOfferId);
+      }
       const toInput = typeof p.to === "string" ? p.to.trim() : "";
       const toEmails = parseRecipients(toInput);
       const to = toEmails.join(", ");
-      if (!offerIdParam || !to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
-      const db = getDb();
-      const offerId = resolveOfferId(db, offerIdParam);
-      if (!offerId) return { ok: false, error: "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)" };
-      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
+      if (!to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      if (!canAccessOffer(db, resolvedOfferId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
       const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
       if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };
       const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
@@ -2510,7 +2540,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (!senderExists) return { ok: false, error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
 
       const settings = getEmailSettings(db as import("./emailService").Db);
-      const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(offerId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
+      const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(resolvedOfferId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
       if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
       const salespersonRow = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(senderUserId) as { display_name: string | null; email: string } | undefined;
       const clientName = [offerRow.client_first_name, offerRow.client_last_name].filter(Boolean).join(" ") || offerRow.company_name || "";
@@ -2542,11 +2572,11 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
       const ensurePdfResult = await (async (): Promise<{ ok: boolean; filePath: string | null; fileName: string | null; error?: string }> => {
         const db = getDb();
-        const existing = db.prepare("SELECT file_path, file_name FROM pdfs WHERE offer_id = ? AND file_path IS NOT NULL AND file_path != '' ORDER BY created_at DESC LIMIT 1").get(offerId) as { file_path: string; file_name: string } | undefined;
+        const existing = db.prepare("SELECT file_path, file_name FROM pdfs WHERE offer_id = ? AND file_path IS NOT NULL AND file_path != '' ORDER BY created_at DESC LIMIT 1").get(resolvedOfferId) as { file_path: string; file_name: string } | undefined;
         if (existing?.file_path && fs.existsSync(existing.file_path)) return { ok: true, filePath: existing.file_path, fileName: existing.file_name || "oferta.pdf" };
         const { generatePdfFromTemplate } = await import("./pdf/generatePdfFromTemplate");
         const store = createFilePdfTemplateConfigStore(app.getPath("userData"));
-        const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
+        const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(resolvedOfferId) as Record<string, unknown> | undefined;
         if (!row) return { ok: false, filePath: null, fileName: null, error: "Oferta nie znaleziona" };
         const clientName = [row.client_first_name, row.client_last_name].filter(Boolean).join(" ").trim() || (row.company_name as string) || "Klient";
         const addons = (() => { try { return JSON.parse((row.addons_snapshot as string) || "[]"); } catch { return []; } })();
@@ -2559,12 +2589,20 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           pricing: { base: { totalBase: basePrice, cenaPerM2: areaM2 > 0 ? basePrice / areaM2 : undefined }, additions: addons, standardInPrice, totalPln: Number(row.total_pln) || 0 },
           offerNumber: (row.offer_number as string) || "PLX-?", sellerName: "Planlux",
         };
-        const templateConfig = await store.load(offerId).catch(() => null);
+        const templateConfig = await store.load(resolvedOfferId).catch(() => null);
         const result = await generatePdfFromTemplate(payload, logger, templateConfig ?? undefined, undefined, undefined);
         if (!result.ok) return { ok: false, filePath: null, fileName: null, error: result.error ?? "Generowanie PDF nie powiodło się" };
+        // Prevent duplicate insert: PDF must be inserted only once per offer. Reuse existing row if present.
+        const existingPdf = db.prepare("SELECT id, file_path, file_name FROM pdfs WHERE offer_id = ? ORDER BY created_at DESC LIMIT 1").get(resolvedOfferId) as { id: string; file_path: string; file_name: string } | undefined;
+        if (existingPdf?.file_path && fs.existsSync(existingPdf.file_path)) {
+          return { ok: true, filePath: existingPdf.file_path, fileName: existingPdf.file_name || "oferta.pdf" };
+        }
+        const { insertPdf, getLatestPdfByOfferId } = await import("../src/infra/db");
+        const parentExists = db.prepare("SELECT 1 FROM offers_crm WHERE id = ?").get(resolvedOfferId) != null;
+        const pdfExists = getLatestPdfByOfferId(db, resolvedOfferId) != null;
+        logger.info("[email] ensurePdf", { offerId: resolvedOfferId, offerNumber: (row.offer_number as string) ?? "(unknown)", parentExists, pdfExists, dbPath: getDbPath?.() ?? "(unknown)" });
         const pdfId = uuid();
-        const { insertPdf } = await import("../src/infra/db");
-        insertPdf(getDb(), { id: pdfId, offerId, userId: (row.user_id as string) || user.id, clientName, fileName: result.fileName, filePath: result.filePath, status: "PDF_CREATED", totalPln: payload.pricing.totalPln, widthM: payload.offer.widthM, lengthM: payload.offer.lengthM, heightM: payload.offer.heightM ?? undefined, areaM2: payload.offer.areaM2, variantHali: payload.offer.variantHali });
+        insertPdf(getDb(), { id: pdfId, offerId: resolvedOfferId, userId: (row.user_id as string) || user.id, clientName, fileName: result.fileName, filePath: result.filePath, status: "PDF_CREATED", totalPln: payload.pricing.totalPln, widthM: payload.offer.widthM, lengthM: payload.offer.lengthM, heightM: payload.offer.heightM ?? undefined, areaM2: payload.offer.areaM2, variantHali: payload.offer.variantHali });
         return { ok: true, filePath: result.filePath, fileName: result.fileName };
       })();
       if (!ensurePdfResult.ok) return { ok: false, error: ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail." };
@@ -2582,7 +2620,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           html: bodyHtml,
           text: bodyText,
           attachments,
-          relatedOfferId: offerId,
+          relatedOfferId: resolvedOfferId,
           accountUserId: senderUserId,
         }, logger);
         return { ok: true, queued: true, outboxId: id };
@@ -2607,9 +2645,9 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const smtpResponse = result.response ?? null;
         const accountId = account?.id ?? null;
         db.transaction(() => {
-          const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(offerId);
+          const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(resolvedOfferId);
           if (!offerExists) throw new Error("[email] FK/consistency: oferta nie istnieje przed zapisem outbox");
-          db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
+          db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, resolvedOfferId);
           db.prepare(
             `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
@@ -2623,7 +2661,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
             bodyText,
             bodyHtml,
             JSON.stringify(attachments || []),
-            offerId,
+            resolvedOfferId,
             now,
             now,
             now
@@ -2632,17 +2670,39 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           if (!outboxExists) {
             throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
           }
-          db.prepare(
-            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-          ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
           const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
           if (auditTables.length > 0) {
             db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
-              uuid(), offerId, user.id, JSON.stringify({ to, outboxId })
+              uuid(), resolvedOfferId, user.id, JSON.stringify({ to, outboxId })
             );
           }
         })();
-        return { ok: true, sent: true };
+        let historySaved = true;
+        const offerIdForHistory = resolvedOfferId;
+        try {
+          if (!offerIdForHistory) {
+            throw new Error("sendOfferEmail: resolvedOfferId is null – cannot insert email_history");
+          }
+          console.info("[email_history insert]", {
+            resolvedOfferId: offerIdForHistory,
+            typeofOfferId: typeof offerIdForHistory,
+            payloadOfferId: p.offerId,
+            payloadOfferNumber: p.offerNumber,
+          });
+          db.prepare(
+            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)"
+          ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, offerIdForHistory);
+        } catch (historyErr) {
+          historySaved = false;
+          console.error("[email_history failed]", historyErr);
+          console.error("[email] email_history insert failed", {
+            resolvedOfferId: offerIdForHistory,
+            userId: senderUserId,
+            error: String(historyErr),
+          });
+          logger.error("[email] email_history insert failed", historyErr);
+        }
+        return { ok: true, sent: true, historySaved, warning: historySaved ? undefined : "E-mail wysłany, ale nie zapisano w historii (sprawdź bazę/logi)." };
       }
 
       enqueueEmail(db as import("./emailService").Db, {
@@ -2652,14 +2712,19 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         html: bodyHtml,
         text: bodyText,
         attachments,
-        relatedOfferId: offerId,
+        relatedOfferId: resolvedOfferId,
         accountUserId: senderUserId,
       }, logger);
       return { ok: false, error: result.error ?? "Serwer SMTP nie przyjął wiadomości", queued: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       logger.error("[email] sendOfferEmail failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      let friendly = msg;
+      if (msg.includes("Oferta nie istnieje w bazie CRM")) friendly = msg;
+      else if (msg.includes("FOREIGN KEY") || msg.includes("constraint failed")) friendly = "Błąd zapisu powiązań (oferta lub użytkownik). Odśwież ofertę i spróbuj ponownie.";
+      else if (msg.includes("insertPdf") || msg.includes("zapisać PDF")) friendly = "Nie udało się zapisać PDF w bazie. Sprawdź logi i spróbuj ponownie.";
+      return { ok: false, error: friendly };
     }
   });
 
