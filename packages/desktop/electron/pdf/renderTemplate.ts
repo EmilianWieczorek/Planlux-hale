@@ -22,6 +22,8 @@ export interface OfferPdfPayload {
   sellerEmail?: string;
   sellerPhone?: string;
   clientName: string;
+  companyName?: string;
+  personName?: string;
   clientNip?: string;
   clientEmail?: string;
   clientPhone?: string;
@@ -64,10 +66,12 @@ function buildReplacements(p: OfferPdfPayload): Record<string, string> {
     "{{sellerEmail}}": p.sellerEmail ? escapeHtml(p.sellerEmail) : "",
     "{{sellerPhone}}": p.sellerPhone ? escapeHtml(p.sellerPhone) : "",
     "{{clientName}}": escapeHtml(p.clientName),
+    "{{companyName}}": escapeHtml(p.companyName ?? ""),
+    "{{personName}}": escapeHtml(p.personName ?? ""),
+    "{{clientAddressOrInstall}}": escapeHtml(p.clientAddressOrInstall ?? "–"),
     "{{clientNip}}": escapeHtml(p.clientNip ?? ""),
     "{{clientEmail}}": escapeHtml(p.clientEmail ?? ""),
     "{{clientPhone}}": escapeHtml(p.clientPhone ?? ""),
-    "{{clientAddressOrInstall}}": escapeHtml(p.clientAddressOrInstall ?? "–"),
     "{{variantName}}": escapeHtml(p.variantName),
     "{{widthM}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.widthM),
     "{{lengthM}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.lengthM),

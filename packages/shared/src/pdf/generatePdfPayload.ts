@@ -4,10 +4,17 @@
  */
 
 export interface GeneratePdfOffer {
+  /** Legacy: pełna nazwa klienta (fallback gdy brak companyName/personName). */
   clientName: string;
   clientNip?: string;
   clientEmail?: string;
   clientPhone?: string;
+  /** Nazwa firmy. */
+  companyName?: string;
+  /** Imię i nazwisko (osoba). */
+  personName?: string;
+  /** Adres klienta. */
+  clientAddress?: string;
   widthM: number;
   lengthM: number;
   heightM?: number;

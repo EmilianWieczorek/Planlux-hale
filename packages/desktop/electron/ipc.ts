@@ -625,16 +625,22 @@ export async function registerIpcHandlers(deps: {
     const userId = p.userId ?? "";
     const nowIso = now.toISOString();
 
-    // Parse clientName → clientFirstName, clientLastName, companyName
-    const clientName = p.offer.clientName?.trim() || "Klient";
-    const isCompany = /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
+    // Parse: companyName/personName (nowe) lub clientName (legacy) → clientFirstName, clientLastName, companyName
+    const companyName = (p.offer.companyName ?? "").trim();
+    const personName = (p.offer.personName ?? "").trim();
+    const clientAddress = (p.offer.clientAddress ?? "").trim();
+    const clientName = personName || companyName || p.offer.clientName?.trim() || "Klient";
+    const isCompany = companyName ? true : /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
     let clientFirstName = "";
     let clientLastName = "";
-    let companyName = "";
-    if (isCompany) {
-      companyName = clientName;
-    } else {
+    let resolvedCompanyName = companyName;
+    if (!resolvedCompanyName && isCompany) resolvedCompanyName = clientName;
+    if (!personName && !companyName) {
       const parts = clientName.split(/\s+/).filter(Boolean);
+      clientFirstName = parts[0] ?? "";
+      clientLastName = parts.slice(1).join(" ") ?? "";
+    } else if (personName) {
+      const parts = personName.split(/\s+/).filter(Boolean);
       clientFirstName = parts[0] ?? "";
       clientLastName = parts.slice(1).join(" ") ?? "";
     }
@@ -649,17 +655,22 @@ export async function registerIpcHandlers(deps: {
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length > 0) {
-        db.prepare(
-          `INSERT INTO offers_crm (id, offer_number, user_id, status, pdf_generated_at, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
-           VALUES (?, ?, ?, 'GENERATED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, '', 1, ?, ?)`
-        ).run(
+        const hasClientAddress = (db.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>).some((c) => c.name === "client_address");
+        const insCols = hasClientAddress
+          ? "id, offer_number, user_id, status, pdf_generated_at, client_first_name, client_last_name, company_name, client_address, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at"
+          : "id, offer_number, user_id, status, pdf_generated_at, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at";
+        const insVals = hasClientAddress
+          ? "?, ?, ?, 'GENERATED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, '', 1, ?, ?"
+          : "?, ?, ?, 'GENERATED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, '', 1, ?, ?";
+        db.prepare(`INSERT INTO offers_crm (${insCols}) VALUES (${insVals})`).run(
           offerId,
           p.offerNumber,
           userId,
           nowIso,
           clientFirstName,
           clientLastName,
-          companyName,
+          resolvedCompanyName,
+          ...(hasClientAddress ? [clientAddress] : []),
           p.offer.clientNip ?? "",
           p.offer.clientPhone ?? "",
           p.offer.clientEmail ?? "",
@@ -701,7 +712,7 @@ export async function registerIpcHandlers(deps: {
       id: pdfId,
       offerId,
       userId,
-      clientName: p.offer.clientName,
+      clientName: clientName || p.offer.clientName || "Klient",
       fileName: result.fileName,
       filePath: result.filePath,
       status: "PDF_CREATED",
@@ -1182,6 +1193,9 @@ export async function registerIpcHandlers(deps: {
         draftId?: string;
         offerNumber?: string;
         clientName?: string;
+        companyName?: string;
+        personName?: string;
+        clientAddress?: string;
         clientNip?: string;
         clientEmail?: string;
         clientPhone?: string;
@@ -1190,7 +1204,10 @@ export async function registerIpcHandlers(deps: {
         lengthM?: string;
         heightM?: string;
       };
-      const clientName = (d?.clientName ?? "").trim();
+      const companyNameRaw = (d?.companyName ?? "").trim();
+      const personNameRaw = (d?.personName ?? "").trim();
+      const clientAddressVal = (d?.clientAddress ?? "").trim();
+      const clientName = personNameRaw || companyNameRaw || (d?.clientName ?? "").trim();
       const w = parseFloat(String(d?.widthM ?? 0)) || 0;
       const l = parseFloat(String(d?.lengthM ?? 0)) || 0;
       const hasData = clientName.length > 0 && w > 0 && l > 0;
@@ -1210,47 +1227,85 @@ export async function registerIpcHandlers(deps: {
             }
             const areaM2 = w * l;
             const h = d.heightM ? parseFloat(String(d.heightM)) : null;
-            const isCompany = /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
+            const isCompany = companyNameRaw ? true : /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
             let clientFirstName = "";
             let clientLastName = "";
-            let companyName = "";
-            if (isCompany) {
-              companyName = clientName;
-            } else {
+            let companyName = companyNameRaw;
+            if (!companyName && isCompany) companyName = clientName;
+            if (personNameRaw) {
+              const parts = personNameRaw.split(/\s+/).filter(Boolean);
+              clientFirstName = parts[0] ?? "";
+              clientLastName = parts.slice(1).join(" ") ?? "";
+            } else if (!companyNameRaw) {
               const parts = clientName.split(/\s+/).filter(Boolean);
               clientFirstName = parts[0] ?? "";
               clientLastName = parts.slice(1).join(" ") ?? "";
             }
             const nowIso = new Date().toISOString();
+            const hasClientAddress = (db.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>).some((c) => c.name === "client_address");
             if (existing) {
-              db.prepare(
-                `UPDATE offers_crm SET
+              if (hasClientAddress) {
+                db.prepare(
+                  `UPDATE offers_crm SET
+                  client_first_name=?, client_last_name=?, company_name=?, client_address=?, nip=?, phone=?, email=?, variant_hali=?,
+                  width_m=?, length_m=?, height_m=?, area_m2=?, updated_at=?
+                  WHERE id=?`
+                ).run(clientFirstName, clientLastName, companyName, clientAddressVal, d.clientNip ?? "", d.clientPhone ?? "", d.clientEmail ?? "", d.variantHali ?? "T18_T35_DACH", w, l, h, areaM2, nowIso, offerId);
+              } else {
+                db.prepare(
+                  `UPDATE offers_crm SET
                   client_first_name=?, client_last_name=?, company_name=?, nip=?, phone=?, email=?, variant_hali=?,
                   width_m=?, length_m=?, height_m=?, area_m2=?, updated_at=?
                   WHERE id=?`
-              ).run(clientFirstName, clientLastName, companyName, d.clientNip ?? "", d.clientPhone ?? "", d.clientEmail ?? "", d.variantHali ?? "T18_T35_DACH", w, l, h, areaM2, nowIso, offerId);
+                ).run(clientFirstName, clientLastName, companyName, d.clientNip ?? "", d.clientPhone ?? "", d.clientEmail ?? "", d.variantHali ?? "T18_T35_DACH", w, l, h, areaM2, nowIso, offerId);
+              }
             } else {
-              db.prepare(
-                `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+              if (hasClientAddress) {
+                db.prepare(
+                  `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, client_address, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+                 VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
+                ).run(
+                  offerId,
+                  offerNumber,
+                  user.id,
+                  clientFirstName,
+                  clientLastName,
+                  companyName,
+                  clientAddressVal,
+                  d.clientNip ?? "",
+                  d.clientPhone ?? "",
+                  d.clientEmail ?? "",
+                  d.variantHali ?? "T18_T35_DACH",
+                  w,
+                  l,
+                  h,
+                  areaM2,
+                  nowIso,
+                  nowIso
+                );
+              } else {
+                db.prepare(
+                  `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
                  VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
-              ).run(
-                offerId,
-                offerNumber,
-                user.id,
-                clientFirstName,
-                clientLastName,
-                companyName,
-                d.clientNip ?? "",
-                d.clientPhone ?? "",
-                d.clientEmail ?? "",
-                d.variantHali ?? "T18_T35_DACH",
-                w,
-                l,
-                h,
-                areaM2,
-                nowIso,
-                nowIso
-              );
+                ).run(
+                  offerId,
+                  offerNumber,
+                  user.id,
+                  clientFirstName,
+                  clientLastName,
+                  companyName,
+                  d.clientNip ?? "",
+                  d.clientPhone ?? "",
+                  d.clientEmail ?? "",
+                  d.variantHali ?? "T18_T35_DACH",
+                  w,
+                  l,
+                  h,
+                  areaM2,
+                  nowIso,
+                  nowIso
+                );
+              }
             }
             const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
             if (auditTables.length > 0) {
@@ -1423,20 +1478,20 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: znajdź potencjalne duplikaty (imię/nazwisko, firma, NIP, telefon, e-mail). */
-  ipcMain.handle("planlux:findDuplicateOffers", async (_, params: { clientName: string; nip?: string; phone?: string; email?: string }) => {
+  /** CRM: znajdź potencjalne duplikaty – tylko dane klienta, minimum jedno pole dokładnie pasuje 1:1 (po normalizacji). Bez substring/includes. */
+  ipcMain.handle("planlux:findDuplicateOffers", async (_, params: { clientName?: string; companyName?: string; personName?: string; nip?: string; phone?: string; email?: string }) => {
     try {
+      const { digits, norm } = await import("./offerDuplicateNorm");
       const user = requireAuth();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, duplicates: [] };
 
-      const norm = (s: string) => (s ?? "").trim().toLowerCase();
-      const digits = (s: string) => (s ?? "").replace(/\D/g, "");
-      const nameNorm = norm(params.clientName ?? "").replace(/\s+/g, " ");
       const nipNorm = digits(params.nip ?? "");
       const phoneNorm = digits(params.phone ?? "");
       const emailNorm = norm(params.email ?? "");
+      const companyNorm = norm(params.companyName ?? "");
+      const personNorm = norm(params.personName ?? params.clientName ?? "");
 
       const rows = db.prepare(
         `SELECT id, offer_number, status, client_first_name, client_last_name, company_name, nip, phone, email, width_m, length_m, area_m2, total_pln, created_at
@@ -1469,14 +1524,12 @@ export async function registerIpcHandlers(deps: {
           : [r.client_first_name, r.client_last_name].filter(Boolean).join(" ").trim() || "—";
 
         let match = false;
-        if (nipNorm.length >= 4 && dbNip.length >= 4 && nipNorm === dbNip) match = true;
-        if (phoneNorm.length >= 6 && dbPhone.length >= 6 && phoneNorm === dbPhone) match = true;
-        if (emailNorm.length >= 3 && dbEmail.length >= 3 && emailNorm === dbEmail) match = true;
-        if (nameNorm.length >= 3) {
-          if (dbCompany && dbCompany.includes(nameNorm)) match = true;
-          if (dbFullName && dbFullName.includes(nameNorm)) match = true;
-          if (nameNorm.includes(dbCompany) || nameNorm.includes(dbFullName)) match = true;
-        }
+        if (nipNorm.length > 0 && nipNorm === dbNip) match = true;
+        if (phoneNorm.length > 0 && phoneNorm === dbPhone) match = true;
+        if (emailNorm.length > 0 && emailNorm === dbEmail) match = true;
+        if (companyNorm.length > 0 && companyNorm === dbCompany) match = true;
+        if (personNorm.length > 0 && personNorm === dbFullName) match = true;
+
         if (match) {
           duplicates.push({
             id: r.id as string,
@@ -1533,6 +1586,45 @@ export async function registerIpcHandlers(deps: {
     } catch (e) {
       logger.error("[crm] markOfferRealized failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** CRM: usuń ofertę tylko gdy status = IN_PROGRESS. Usuwa powiązane: pdfs, email_history, offer_audit, outbox, offers_crm. */
+  ipcMain.handle("planlux:deleteOffer", async (_, offerId: string) => {
+    try {
+      const user = requireAuth();
+      const db = getDb();
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
+      if (tables.length === 0) return { ok: false, error: "Brak tabeli ofert", code: "ERR_NO_TABLE" };
+      const offer = db.prepare("SELECT id, status, user_id FROM offers_crm WHERE id = ?").get(offerId) as { id: string; status: string; user_id: string } | undefined;
+      if (!offer) return { ok: false, error: "Oferta nie znaleziona", code: "ERR_NOT_FOUND" };
+      if (offer.status !== "IN_PROGRESS") {
+        return { ok: false, error: "Nie można usunąć oferty po zatwierdzeniu", code: "ERR_STATUS" };
+      }
+      const canAccess = offer.user_id === user.id || (user.role === "ADMIN" || user.role === "BOSS");
+      if (!canAccess) return { ok: false, error: "Forbidden", code: "ERR_AUTH" };
+      db.transaction(() => {
+        db.prepare("DELETE FROM pdfs WHERE offer_id = ?").run(offerId);
+        const ehInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+        const hasOfferId = ehInfo.some((c) => c.name === "offer_id");
+        if (hasOfferId) db.prepare("DELETE FROM email_history WHERE offer_id = ?").run(offerId);
+        db.prepare("DELETE FROM offer_audit WHERE offer_id = ?").run(offerId);
+        try {
+          db.prepare("DELETE FROM event_log WHERE offer_id = ?").run(offerId);
+        } catch {
+          // event_log może nie mieć offer_id
+        }
+        const outboxInfo = db.prepare("PRAGMA table_info(email_outbox)").all() as Array<{ name: string }>;
+        if (outboxInfo.some((c) => c.name === "related_offer_id")) {
+          db.prepare("DELETE FROM email_outbox WHERE related_offer_id = ?").run(offerId);
+        }
+        db.prepare("DELETE FROM offers_crm WHERE id = ?").run(offerId);
+      })();
+      logger.info("[crm] deleteOffer", { offerId, userId: user.id });
+      return { ok: true };
+    } catch (e) {
+      logger.error("[crm] deleteOffer failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e), code: "ERR_DB", stack: e instanceof Error ? e.stack : undefined };
     }
   });
 
@@ -1693,28 +1785,17 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: pliki PDF powiązane z ofertą (z event_log). Owner lub BOSS/ADMIN ma dostęp. */
+  /** CRM: pliki PDF powiązane z ofertą (z tabeli pdfs po offer_id). Najnowszy pierwszy. Owner lub BOSS/ADMIN ma dostęp. */
   ipcMain.handle("planlux:getPdfsForOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
       const db = getDb();
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
-      const eventRows = db.prepare(
-        "SELECT details_json FROM event_log WHERE offer_id = ? AND event_type = 'OFFER_CREATED'"
-      ).all(offerId) as Array<{ details_json: string }>;
-      const pdfIds = eventRows.map((r) => {
-        try {
-          const d = JSON.parse(r.details_json || "{}");
-          return d.pdfId;
-        } catch {
-          return null;
-        }
-      }).filter(Boolean) as string[];
-      if (pdfIds.length === 0) return { ok: true, pdfs: [] };
-      const placeholders = pdfIds.map(() => "?").join(",");
+      const hasOfferId = (db.prepare("PRAGMA table_info(pdfs)").all() as Array<{ name: string }>).some((c) => c.name === "offer_id");
+      if (!hasOfferId) return { ok: true, pdfs: [] };
       const pdfRows = db.prepare(
-        `SELECT id, file_name, file_path, status, created_at FROM pdfs WHERE id IN (${placeholders})`
-      ).all(...pdfIds) as Array<{ id: string; file_name: string; file_path: string; status: string; created_at: string }>;
+        "SELECT id, file_name, file_path, status, created_at FROM pdfs WHERE offer_id = ? ORDER BY created_at DESC"
+      ).all(offerId) as Array<{ id: string; file_name: string; file_path: string; status: string; created_at: string }>;
       const pdfs = pdfRows.map((r) => ({
         id: r.id,
         fileName: r.file_name,
@@ -2530,12 +2611,12 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const toInput = typeof p.to === "string" ? p.to.trim() : "";
       const toEmails = parseRecipients(toInput);
       const to = toEmails.join(", ");
-      if (!to) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      if (!to) return { ok: false, error: "Adres odbiorcy jest wymagany", code: "ERR_NO_TO" };
       if (!canAccessOffer(db, resolvedOfferId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
       const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
       if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };
       const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
-      if (!account) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)" };
+      if (!account) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)", code: "ERR_AUTH" };
       const senderExists = db.prepare("SELECT id FROM users WHERE id = ? AND active = 1").get(senderUserId);
       if (!senderExists) return { ok: false, error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
 
@@ -2605,11 +2686,12 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         insertPdf(getDb(), { id: pdfId, offerId: resolvedOfferId, userId: (row.user_id as string) || user.id, clientName, fileName: result.fileName, filePath: result.filePath, status: "PDF_CREATED", totalPln: payload.pricing.totalPln, widthM: payload.offer.widthM, lengthM: payload.offer.lengthM, heightM: payload.offer.heightM ?? undefined, areaM2: payload.offer.areaM2, variantHali: payload.offer.variantHali });
         return { ok: true, filePath: result.filePath, fileName: result.fileName };
       })();
-      if (!ensurePdfResult.ok) return { ok: false, error: ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail." };
+      if (!ensurePdfResult.ok) return { ok: false, error: ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail.", code: "ERR_NO_ATTACHMENT" };
       const extraAttachments = p.extraAttachments ?? [];
       const attachments: Array<{ filename: string; path: string }> = ensurePdfResult.filePath && ensurePdfResult.fileName
         ? [{ filename: ensurePdfResult.fileName, path: ensurePdfResult.filePath }, ...extraAttachments]
         : extraAttachments;
+      if (attachments.length === 0) return { ok: false, error: "Brak załącznika PDF do oferty", code: "ERR_NO_ATTACHMENT" };
 
       const online = await checkInternetEmail();
       if (!online) {
@@ -2705,6 +2787,38 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         return { ok: true, sent: true, historySaved, warning: historySaved ? undefined : "E-mail wysłany, ale nie zapisano w historii (sprawdź bazę/logi)." };
       }
 
+      const errMsg = result.error ?? "Serwer SMTP nie przyjął wiadomości";
+      const errLower = errMsg.toLowerCase();
+      const code = /timeout|etimedout/i.test(errMsg) ? "ERR_TIMEOUT" : /auth|login|credentials|invalid.*user|535/i.test(errLower) ? "ERR_AUTH" : "ERR_SMTP";
+      const now = new Date().toISOString();
+      const historyId = uuid();
+      try {
+        const ehCols = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+        const hasOfferId = ehCols.some((c) => c.name === "offer_id");
+        const hasError = ehCols.some((c) => c.name === "error");
+        const hasErrorMessage = ehCols.some((c) => c.name === "error_message");
+        const hasToAddr = ehCols.some((c) => c.name === "to_addr");
+        const hasToEmail = ehCols.some((c) => c.name === "to_email");
+        if (hasOfferId) {
+          if (hasToAddr && hasError) {
+            db.prepare(
+              "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, created_at, offer_id) VALUES (?, NULL, ?, ?, ?, 'failed', ?, ?, ?)"
+            ).run(historyId, account?.id ?? null, to, subject, errMsg, now, resolvedOfferId);
+          } else if (hasToEmail && hasErrorMessage) {
+            db.prepare(
+              "INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, '', 'FAILED', ?, ?)"
+            ).run(historyId, resolvedOfferId, user.id, account?.from_email ?? "", to, subject, errMsg, now);
+          }
+        }
+        const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+        if (auditTables.length > 0) {
+          db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_FAILED', ?)").run(
+            uuid(), resolvedOfferId, user.id, JSON.stringify({ to, error: errMsg, code })
+          );
+        }
+      } catch (auditErr) {
+        logger.error("[email] sendOfferEmail FAILED audit/history insert", auditErr);
+      }
       enqueueEmail(db as import("./emailService").Db, {
         to,
         cc: cc || undefined,
@@ -2715,7 +2829,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         relatedOfferId: resolvedOfferId,
         accountUserId: senderUserId,
       }, logger);
-      return { ok: false, error: result.error ?? "Serwer SMTP nie przyjął wiadomości", queued: true };
+      return { ok: false, error: errMsg, code, queued: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       logger.error("[email] sendOfferEmail failed", e);
@@ -2724,7 +2838,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (msg.includes("Oferta nie istnieje w bazie CRM")) friendly = msg;
       else if (msg.includes("FOREIGN KEY") || msg.includes("constraint failed")) friendly = "Błąd zapisu powiązań (oferta lub użytkownik). Odśwież ofertę i spróbuj ponownie.";
       else if (msg.includes("insertPdf") || msg.includes("zapisać PDF")) friendly = "Nie udało się zapisać PDF w bazie. Sprawdź logi i spróbuj ponownie.";
-      return { ok: false, error: friendly };
+      return { ok: false, error: friendly, code: "ERR_SMTP", stack: e instanceof Error ? e.stack : undefined };
     }
   });
 

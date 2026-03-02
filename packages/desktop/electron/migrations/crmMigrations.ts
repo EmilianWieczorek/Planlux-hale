@@ -528,4 +528,14 @@ COMMIT;
       // ignore
     }
   }
+
+  // 17. offers_crm: client_address (adres klienta)
+  try {
+    if (hasTable(database, "offers_crm") && !hasColumn(database, "offers_crm", "client_address")) {
+      database.exec("ALTER TABLE offers_crm ADD COLUMN client_address TEXT NOT NULL DEFAULT ''");
+      logger.info("[migration] offers_crm client_address added");
+    }
+  } catch (e) {
+    logger.warn("[migration] offers_crm client_address skipped", e);
+  }
 }

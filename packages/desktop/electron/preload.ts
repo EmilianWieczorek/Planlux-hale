@@ -29,6 +29,7 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:getOffersCrm",
   "planlux:findDuplicateOffers",
   "planlux:markOfferRealized",
+  "planlux:deleteOffer",
   "planlux:getOfferDetails",
   "planlux:getOfferAudit",
   "planlux:getEmailHistoryForOffer",

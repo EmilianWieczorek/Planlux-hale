@@ -147,17 +147,22 @@ export function mapOfferDataToPayload(
     })
     .join("");
 
+  const clientAddressOrInstall = (o.clientAddress ?? input.clientAddressOrInstall ?? "").trim() || undefined;
+  const clientNameDisplay = (o.personName || o.companyName || o.clientName || "Klient").trim();
+
   return {
     offerNumber: input.offerNumber,
     offerDate,
     sellerName: input.sellerName ?? "Planlux",
     sellerEmail: input.sellerEmail,
     sellerPhone: input.sellerPhone,
-    clientName: o.clientName,
+    clientName: clientNameDisplay,
+    companyName: o.companyName?.trim() || undefined,
+    personName: o.personName?.trim() || undefined,
+    clientAddressOrInstall: clientAddressOrInstall ?? input.clientAddressOrInstall,
     clientNip: o.clientNip,
     clientEmail: o.clientEmail,
     clientPhone: o.clientPhone,
-    clientAddressOrInstall: input.clientAddressOrInstall,
     variantName,
     widthM: o.widthM,
     lengthM: o.lengthM,

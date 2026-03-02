@@ -40,7 +40,11 @@ export interface OfferDraft {
   widthM: string;
   lengthM: string;
   heightM: string;
+  /** Legacy: pełna nazwa (fallback). Preferowane: companyName + personName. */
   clientName: string;
+  companyName: string;
+  personName: string;
+  clientAddress: string;
   clientNip: string;
   clientEmail: string;
   clientPhone: string;
@@ -80,6 +84,9 @@ function createEmptyDraft(): OfferDraft {
     heightM: "",
     heightSurchargeAuto: true,
     clientName: "",
+    companyName: "",
+    personName: "",
+    clientAddress: "",
     clientNip: "",
     clientEmail: "",
     clientPhone: "",
@@ -231,6 +238,9 @@ export const offerDraftStore = {
   setLengthM: (v: string) => setState((s) => ({ ...s, lengthM: v })),
   setHeightM: (v: string) => setState((s) => ({ ...s, heightM: v })),
   setClientName: (v: string) => setState((s) => ({ ...s, clientName: v })),
+  setCompanyName: (v: string) => setState((s) => ({ ...s, companyName: v })),
+  setPersonName: (v: string) => setState((s) => ({ ...s, personName: v })),
+  setClientAddress: (v: string) => setState((s) => ({ ...s, clientAddress: v })),
   setClientNip: (v: string) => setState((s) => ({ ...s, clientNip: v })),
   setClientEmail: (v: string) => setState((s) => ({ ...s, clientEmail: v })),
   setClientPhone: (v: string) => setState((s) => ({ ...s, clientPhone: v })),
@@ -283,12 +293,15 @@ export const offerDraftStore = {
     })),
   restoreVersion: (v: OfferVersion) =>
     setState((s) => {
-      const p = v.payload as { offer?: { clientName?: string; clientNip?: string; clientEmail?: string; clientPhone?: string; widthM?: number; lengthM?: number; heightM?: number; variantHali?: string }; offerNumber?: string };
+      const p = v.payload as { offer?: { clientName?: string; companyName?: string; personName?: string; clientAddress?: string; clientNip?: string; clientEmail?: string; clientPhone?: string; widthM?: number; lengthM?: number; heightM?: number; variantHali?: string }; offerNumber?: string };
       const o = p?.offer;
       return {
         ...s,
         ...(o && {
           clientName: o.clientName ?? s.clientName,
+          companyName: o.companyName ?? s.companyName,
+          personName: o.personName ?? s.personName,
+          clientAddress: o.clientAddress ?? s.clientAddress,
           clientNip: o.clientNip ?? s.clientNip,
           clientEmail: o.clientEmail ?? s.clientEmail,
           clientPhone: o.clientPhone ?? s.clientPhone,
@@ -310,6 +323,10 @@ export const offerDraftStore = {
       ...createEmptyDraft(),
       ...rest,
       draftId: loaded.draftId ?? state.draftId,
+      companyName: loaded.companyName ?? state.companyName ?? "",
+      personName: loaded.personName ?? state.personName ?? "",
+      clientAddress: loaded.clientAddress ?? state.clientAddress ?? "",
+      clientName: loaded.clientName ?? state.clientName ?? "",
       standardSnapshot: loaded.standardSnapshot ?? state.standardSnapshot,
       rainGuttersAuto: loaded.rainGuttersAuto ?? state.rainGuttersAuto,
       gates: loaded.gates ?? state.gates,
@@ -360,7 +377,10 @@ export function buildPayloadFromDraft(
     offerNumber: d.offerNumber?.trim() || "—",
     sellerName: opts?.sellerName?.trim() || "Planlux",
     offer: {
-      clientName: d.clientName || "Klient",
+      clientName: d.personName || d.companyName || d.clientName || "Klient",
+      companyName: d.companyName || undefined,
+      personName: d.personName || undefined,
+      clientAddress: d.clientAddress || undefined,
       clientNip: d.clientNip || undefined,
       clientEmail: d.clientEmail || undefined,
       clientPhone: d.clientPhone || undefined,
@@ -377,6 +397,6 @@ export function buildPayloadFromDraft(
       additions: pricing.additions,
       standardInPrice: pricing.standardInPrice,
     },
-    clientAddressOrInstall: "Adres montażu – do uzupełnienia",
+    clientAddressOrInstall: d.clientAddress || "Adres montażu – do uzupełnienia",
   };
 }

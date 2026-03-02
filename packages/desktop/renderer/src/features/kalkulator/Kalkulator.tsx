@@ -120,7 +120,10 @@ interface Props {
 export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }: Props) {
   const draft = useOfferDraft();
   const { actions } = draft;
-  const clientName = draft.clientName;
+  const clientName = draft.personName || draft.companyName || draft.clientName;
+  const companyName = draft.companyName;
+  const personName = draft.personName;
+  const clientAddress = draft.clientAddress;
   const clientEmail = draft.clientEmail;
   const clientNip = draft.clientNip;
   const clientPhone = draft.clientPhone;
@@ -204,12 +207,13 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   useEffect(() => {
     const w = parseFloat(widthM) || 0;
     const l = parseFloat(lengthM) || 0;
-    const hasData = clientName.trim().length > 0 && w > 0 && l > 0;
+    const hasData = (companyName.trim() || personName.trim() || draft.clientName.trim()).length > 0 && w > 0 && l > 0;
     if (!hasData || draft.offerNumber || draft.offerNumberLocked || createOfferRequestedRef.current) return;
     const invoke = (window as unknown as { planlux?: { invoke?: (c: string, ...a: unknown[]) => Promise<unknown> } }).planlux?.invoke;
     if (!invoke) return;
     createOfferRequestedRef.current = true;
-    invoke("planlux:createOffer", { clientName: clientName.trim(), widthM: w, lengthM: l })
+    const createClientName = (personName.trim() || companyName.trim() || draft.clientName.trim()) || "Klient";
+    invoke("planlux:createOffer", { clientName: createClientName, widthM: w, lengthM: l })
       .then((res: unknown) => {
         const r = res as { ok?: boolean; offerId?: string; offerNumber?: string };
         if (r?.ok && r?.offerId && r?.offerNumber) {
@@ -222,7 +226,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       .catch(() => {
         createOfferRequestedRef.current = false;
       });
-  }, [clientName, widthM, lengthM, draft.offerNumber, draft.offerNumberLocked, userId, actions]);
+  }, [companyName, personName, draft.clientName, widthM, lengthM, draft.offerNumber, draft.offerNumberLocked, userId, actions]);
 
   const prevOnlineRef = useRef<boolean | undefined>(undefined);
   useEffect(() => {
@@ -474,7 +478,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   }, []);
 
   const doGeneratePdf = async () => {
-    if (!result?.success || !clientName.trim()) return;
+    if (!result?.success || !(companyName.trim() || personName.trim() || draft.clientName.trim())) return;
     const w = parseFloat(widthM) || 0;
     const l = parseFloat(lengthM) || 0;
     const h = heightM ? parseFloat(heightM) : undefined;
@@ -507,7 +511,10 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       userId,
       sellerName: userDisplayName?.trim() || "Planlux",
       offer: {
-        clientName,
+        clientName: clientName || "Klient",
+        companyName: companyName || undefined,
+        personName: personName || undefined,
+        clientAddress: clientAddress || undefined,
         clientNip: clientNip || undefined,
         clientEmail: clientEmail || undefined,
         clientPhone: clientPhone || undefined,
@@ -542,14 +549,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   };
 
   const generatePdf = async () => {
-    if (!result?.success || !clientName.trim()) {
+    if (!result?.success || !(companyName.trim() || personName.trim() || draft.clientName.trim())) {
       showToast("Uzupełnij klienta i upewnij się, że wycena jest poprawna");
       return;
     }
     setGenerating(true);
     try {
       const dupRes = (await api("planlux:findDuplicateOffers", {
-        clientName,
+        clientName: clientName || undefined,
+        companyName: companyName || undefined,
+        personName: personName || undefined,
         nip: clientNip || undefined,
         phone: clientPhone || undefined,
         email: clientEmail || undefined,
@@ -582,12 +591,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
             <Typography variant="subtitle2">Klient</Typography>
             <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
-              {clientName || "—"}
+              {clientName || companyName || "—"}
             </Typography>
           </AccordionSummary>
           <AccordionDetails>
-            <label style={styles.label}>Nazwa firmy / Imię i nazwisko</label>
-            <input style={styles.input} value={clientName} onChange={(e) => actions.setClientName(e.target.value)} placeholder="np. Firma ABC Sp. z o.o." />
+            <label style={styles.label}>Nazwa firmy</label>
+            <input style={styles.input} value={companyName} onChange={(e) => actions.setCompanyName(e.target.value)} placeholder="np. Firma ABC Sp. z o.o." />
+            <label style={styles.label}>Imię i nazwisko</label>
+            <input style={styles.input} value={personName} onChange={(e) => actions.setPersonName(e.target.value)} placeholder="np. Jan Kowalski" />
+            <label style={styles.label}>Adres</label>
+            <input style={styles.input} value={clientAddress} onChange={(e) => actions.setClientAddress(e.target.value)} placeholder="ul. Przykładowa 1, 00-001 Warszawa" />
             <label style={styles.label}>NIP</label>
             <input style={styles.input} value={clientNip} onChange={(e) => actions.setClientNip(e.target.value)} placeholder="np. 123-456-78-90" />
             <label style={styles.label}>E-mail</label>
@@ -916,6 +929,21 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                   )}
                 </div>
               )}
+              {(() => {
+                const standard = (result as { standardInPrice?: Array<{ element: string; ilosc: number; jednostka: string; pricingMode?: string }> }).standardInPrice ?? [];
+                const inPrice = standard.filter((s) => (s.pricingMode ?? "INCLUDED_FREE") !== "CHARGE_EXTRA");
+                if (inPrice.length === 0) return null;
+                return (
+                  <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>
+                    <div style={{ fontWeight: tokens.font.weight.medium, marginBottom: 4 }}>W cenie zawarte:</div>
+                    <ul style={{ margin: 0, paddingLeft: 20 }}>
+                      {inPrice.map((s, i) => (
+                        <li key={i}>{s.element} – {s.ilosc} {s.jednostka}</li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })()}
               <p style={styles.total}>{new Intl.NumberFormat("pl-PL").format(result.totalPln ?? 0)} zł netto</p>
             </>
           )}

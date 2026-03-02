@@ -17,7 +17,7 @@ import {
   Stack,
   Snackbar,
 } from "@mui/material";
-import { ArrowBack, Email } from "@mui/icons-material";
+import { ArrowBack, Email, Delete as DeleteIcon, PictureAsPdf } from "@mui/icons-material";
 import { EmailComposer } from "./EmailComposer";
 
 interface Offer {
@@ -104,6 +104,10 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
   const [loading, setLoading] = useState(true);
   const [emailComposerOpen, setEmailComposerOpen] = useState(false);
   const [queueSnackbarOpen, setQueueSnackbarOpen] = useState(false);
+  const [lastGeneratedPdf, setLastGeneratedPdf] = useState<{ filePath: string; fileName: string } | null>(null);
+  const [snackbarMessage, setSnackbarMessage] = useState<string | null>(null);
+  const [generatingPdf, setGeneratingPdf] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [emailPreview, setEmailPreview] = useState<{
     subject: string;
     body: string;
@@ -151,6 +155,44 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
       if (pdfRes.ok && pdfRes.pdfs) setPdfs(pdfRes.pdfs);
     } catch {
       /* ignore */
+    }
+  };
+
+  const effectivePdf = lastGeneratedPdf ?? pdfs[0] ?? null;
+  const handleGeneratePdf = async () => {
+    setGeneratingPdf(true);
+    try {
+      const res = (await api("planlux:pdf:ensureOfferPdf", offerId)) as { ok: boolean; filePath?: string; fileName?: string; error?: string };
+      if (res.ok && res.filePath && res.fileName) {
+        setLastGeneratedPdf({ filePath: res.filePath, fileName: res.fileName });
+        await refreshData();
+        setSnackbarMessage(`PDF wygenerowany: ${res.fileName}`);
+      } else {
+        setSnackbarMessage(res.error ?? "Nie udało się wygenerować PDF");
+      }
+    } catch (e) {
+      setSnackbarMessage(e instanceof Error ? e.message : "Błąd generowania PDF");
+    } finally {
+      setGeneratingPdf(false);
+    }
+  };
+
+  const handleDeleteOffer = async () => {
+    if (offer?.status !== "IN_PROGRESS") return;
+    if (!window.confirm("Czy na pewno chcesz usunąć tę ofertę? Tej operacji nie można cofnąć.")) return;
+    setDeleting(true);
+    try {
+      const res = (await api("planlux:deleteOffer", offerId)) as { ok: boolean; error?: string; code?: string };
+      if (res.ok) {
+        setSnackbarMessage("Oferta usunięta");
+        onBack();
+      } else {
+        setSnackbarMessage(res.error ?? "Nie udało się usunąć oferty");
+      }
+    } catch (e) {
+      setSnackbarMessage(e instanceof Error ? e.message : "Błąd usuwania");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -307,6 +349,15 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
           </Button>
           <Button
             variant="outlined"
+            startIcon={<PictureAsPdf />}
+            onClick={handleGeneratePdf}
+            disabled={generatingPdf}
+            sx={{ mr: 1 }}
+          >
+            {generatingPdf ? "Generowanie…" : "Generuj PDF"}
+          </Button>
+          <Button
+            variant="outlined"
             startIcon={<Email />}
             onClick={async () => {
               setEmailComposerOpen(true);
@@ -338,6 +389,18 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
           >
             Wyślij e-mail
           </Button>
+          {offer.status === "IN_PROGRESS" && (
+            <Button
+              variant="outlined"
+              color="error"
+              startIcon={<DeleteIcon />}
+              onClick={handleDeleteOffer}
+              disabled={deleting}
+              sx={{ mr: 1 }}
+            >
+              {deleting ? "Usuwanie…" : "Usuń ofertę"}
+            </Button>
+          )}
         </>
       )}
 
@@ -349,8 +412,8 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
         defaultBody={emailPreview?.body ?? `Szanowni Państwo,\n\nW załączeniu przesyłam ofertę ${offer.offerNumber}.\n\nPozdrawiam`}
         officeCcDefault={emailPreview?.officeCcDefault ?? true}
         officeCcEmail={emailPreview?.officeCcEmail ?? "biuro@planlux.pl"}
-        pdfPath={pdfs[0]?.filePath ?? null}
-        pdfFileName={pdfs[0]?.fileName}
+        pdfPath={effectivePdf?.filePath ?? null}
+        pdfFileName={effectivePdf?.fileName}
         onSend={async (p) => {
           const res = (await api("planlux:email:sendOfferEmail", {
             offerId,
@@ -358,10 +421,17 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
             ccOfficeEnabled: p.ccOfficeEnabled,
             subjectOverride: p.subject || undefined,
             bodyOverride: p.body ? p.body.replace(/\n/g, "<br>") : undefined,
-          })) as { ok: boolean; sent?: boolean; queued?: boolean; error?: string };
+          })) as { ok: boolean; sent?: boolean; queued?: boolean; error?: string; code?: string };
           if (res.queued) setQueueSnackbarOpen(true);
           if (res.ok) await refreshData();
-          return res;
+          const messageByCode: Record<string, string> = {
+            ERR_NO_TO: "Podaj adres e-mail odbiorcy.",
+            ERR_NO_ATTACHMENT: "Brak załącznika PDF. Wygeneruj PDF oferty przed wysłaniem.",
+            ERR_AUTH: "Błąd autoryzacji SMTP. Sprawdź ustawienia konta e-mail w Panelu admina.",
+            ERR_TIMEOUT: "Przekroczono limit czasu połączenia. Sprawdź internet i spróbuj ponownie.",
+          };
+          const friendlyError = res.error && res.code && messageByCode[res.code] ? messageByCode[res.code] : res.error;
+          return { ...res, error: friendlyError };
         }}
       />
       <Snackbar
@@ -369,6 +439,13 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
         autoHideDuration={6000}
         onClose={() => setQueueSnackbarOpen(false)}
         message="Brak prawdziwego połączenia z internetem — e-maile trafią do kolejki."
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      />
+      <Snackbar
+        open={!!snackbarMessage}
+        autoHideDuration={4000}
+        onClose={() => setSnackbarMessage(null)}
+        message={snackbarMessage ?? ""}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       />
     </Box>
