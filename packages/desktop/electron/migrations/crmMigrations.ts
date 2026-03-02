@@ -7,6 +7,9 @@ export type Db = {
   prepare: (sql: string) => { run: (...args: unknown[]) => unknown; get: (...args: unknown[]) => unknown; all: (...args: unknown[]) => unknown[] };
 };
 
+/** Result of better-sqlite3 Statement.run() */
+type SqliteRunResult = { changes: number; lastInsertRowid?: number };
+
 function hasTable(database: Db, tableName: string): boolean {
   const row = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(tableName) as { name?: string } | undefined;
   return row?.name === tableName;
@@ -548,5 +551,23 @@ COMMIT;
     }
   } catch (e) {
     logger.warn("[migration] email_history idempotency_key skipped", e);
+  }
+
+  // 19. email_history: backfill user_id where NULL (idempotent; if column is NOT NULL there are no NULL rows)
+  try {
+    if (!hasTable(database, "email_history") || !hasColumn(database, "email_history", "user_id")) {
+      logger.info("[migration] email_history user_id backfill skipped (no table or no user_id column)");
+    } else {
+      const first = database.prepare("SELECT id FROM users WHERE active = 1 ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined;
+      if (first) {
+        const result = database.prepare("UPDATE email_history SET user_id = ? WHERE user_id IS NULL").run(first.id) as SqliteRunResult;
+        if (result.changes > 0) logger.info("[migration] email_history user_id backfilled", { count: result.changes });
+        else logger.info("[migration] email_history user_id backfill OK (no NULL rows)");
+      } else {
+        logger.warn("[migration] email_history user_id backfill skipped (no active user for fallback)");
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history user_id backfill skipped", e);
   }
 }

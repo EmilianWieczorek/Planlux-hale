@@ -118,13 +118,13 @@ export function createSendEmailForFlush(getDb: () => unknown) {
     const rejected = (info.rejected ?? []).length > 0;
     const sent = accepted && !rejected;
     if (sent) {
-      db.prepare("UPDATE email_history SET status = 'SENT', sent_at = ? WHERE id = ?").run(now, payload.emailId);
+      db.prepare("UPDATE email_history SET status = 'sent', sent_at = ? WHERE id = ?").run(now, payload.emailId);
       db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, row.offer_id);
     } else {
       const errMsg = rejected
         ? `SMTP rejected: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
         : (info.response ?? "Serwer nie przyjął wiadomości");
-      db.prepare("UPDATE email_history SET status = 'FAILED', error_message = ? WHERE id = ?").run(errMsg, payload.emailId);
+      db.prepare("UPDATE email_history SET status = 'failed', error_message = ? WHERE id = ?").run(errMsg, payload.emailId);
     }
   };
 }

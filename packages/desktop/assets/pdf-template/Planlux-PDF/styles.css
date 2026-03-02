@@ -299,9 +299,12 @@ html, body{
 }
 
 /* ================= PAGE 2 ================= */
+/* Hero: 15px od ostatniego elementu (chips) do dolnej krawędzi headera; nie zmniejszać headera. */
+.plx-spec .hero{ padding-bottom: 15px; }
 .plx-spec .spec{ padding: 22px 53px 18px; }
+.page--spec .spec{ padding-top: 15px; }
 .plx-spec .spec-grid{
-  margin-top: 50px;
+  margin-top: 15px;
   display:grid;
   grid-template-columns: 1fr 1fr;
   gap: 40px;
@@ -563,9 +566,11 @@ html, body{
   .plx-spec .spec-grid,
   .plx-offer .card,
   .xd-terrain .stepCard{ page-break-inside: avoid; break-inside: avoid; }
-  .page--spec .hero{ min-height: 180px; height: 180px; padding-top: 0; }
+  /* Page 2 (SPECYFIKACJA TECHNICZNA): nie zmniejszać headera; 15px od ostatniego elementu do dołu headera; bez dużego białego pasa. */
+  .page--spec .hero{ min-height: 234px !important; height: 234px !important; padding-top: 0; padding-bottom: 15px !important; }
   .page--spec .hero__inner{ padding-top: 20px; }
-  .page--spec .spec{ padding-top: 12px; }
+  .page--spec .spec{ padding-top: 15px !important; }
+  .page--spec .spec-grid{ margin-top: 15px !important; }
   .hero{
     position: relative;
     overflow: hidden;
@@ -581,8 +586,7 @@ html, body{
     page-break-inside: avoid;
     break-inside: avoid;
   }
-  .plx-spec .hero{ min-height: 200px; height: 200px; }
-  .plx-spec .spec{ padding-top: 18px; }
+  /* Do NOT add .plx-spec .hero here – page 2 uses .page--spec .hero above to avoid conflict. */
   .metaBox{
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
