@@ -538,4 +538,15 @@ COMMIT;
   } catch (e) {
     logger.warn("[migration] offers_crm client_address skipped", e);
   }
+
+  // 18. email_history: idempotency_key (unikanie duplikatów wysyłki)
+  try {
+    if (hasTable(database, "email_history") && !hasColumn(database, "email_history", "idempotency_key")) {
+      database.exec("ALTER TABLE email_history ADD COLUMN idempotency_key TEXT DEFAULT NULL");
+      database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_idempotency_key ON email_history(idempotency_key)");
+      logger.info("[migration] email_history idempotency_key added");
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history idempotency_key skipped", e);
+  }
 }

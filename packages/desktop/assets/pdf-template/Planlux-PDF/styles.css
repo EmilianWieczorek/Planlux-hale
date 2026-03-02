@@ -537,31 +537,52 @@ html, body{
 
 @media print{
   html, body { margin: 0 !important; padding: 0 !important; background: #fff !important; }
-  .wrap { margin: 0 !important; padding: 0 !important; background: #fff !important; min-height: auto !important; }
+  .wrap { margin: 0 !important; padding: 0 !important; background: #fff !important; min-height: auto !important; display: block !important; }
   .page{
     width: 210mm !important;
-    height: 297mm !important;
-    max-height: 297mm !important;
+    height: auto !important;
+    min-height: 297mm !important;
+    max-height: none !important;
     margin: 0 !important;
     border-radius: 0 !important;
     box-shadow: none !important;
-    overflow: hidden !important;
+    overflow: visible !important;
     page-break-after: always;
+    break-after: page;
     page-break-inside: avoid;
+    break-inside: avoid;
     background: #fff;
+    display: flex !important;
+    flex-direction: column !important;
   }
   .page + .page{ margin-top: 0 !important; }
-  .page:last-child{ page-break-after: auto; }
+  .page:last-child{ page-break-after: auto; break-after: auto; }
+  .section, .card, .module, .chip,
+  .plx-spec .spec,
+  .plx-spec .spec-card,
+  .plx-spec .spec-grid,
+  .plx-offer .card,
+  .xd-terrain .stepCard{ page-break-inside: avoid; break-inside: avoid; }
+  .page--spec .hero{ min-height: 180px; height: 180px; padding-top: 0; }
+  .page--spec .hero__inner{ padding-top: 20px; }
+  .page--spec .spec{ padding-top: 12px; }
   .hero{
     position: relative;
     overflow: hidden;
+    flex-shrink: 0;
+    min-height: 234px;
+    height: 234px;
     background-image: url('./assets/hero-bg-print-safe.png');
     background-repeat: no-repeat;
     background-size: 100% 100%;
     background-position: left top;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
+    page-break-inside: avoid;
+    break-inside: avoid;
   }
+  .plx-spec .hero{ min-height: 200px; height: 200px; }
+  .plx-spec .spec{ padding-top: 18px; }
   .metaBox{
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
@@ -569,5 +590,5 @@ html, body{
     background: rgba(255,255,255,0.10) !important;
     border: 1px solid rgba(255,255,255,0.14) !important;
   }
-  .footer{ page-break-inside: avoid; }
+  .footer{ page-break-inside: avoid; break-inside: avoid; flex-shrink: 0; }
 }

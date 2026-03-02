@@ -31,6 +31,10 @@ const apiClient = new ApiClient({
   retries: config.backend.retries,
   retryDelayMs: config.backend.retryDelayMs,
   retryBackoffMultiplier: config.backend.retryBackoffMultiplier,
+  log: (level, message, data) => {
+    if (level === "error") logger.error(message, data);
+    else logger.warn(message, data);
+  },
 });
 
 function runMigrations(database: ReturnType<typeof Database>) {
@@ -484,6 +488,7 @@ async function runStartup(): Promise<void> {
         },
       });
       if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush", r);
+      if (r.firstError) logger.error("[outbox] flush firstError (np. ERR_SHEETS_BAD_JSON)", r.firstError);
     } catch (e) {
       logger.error("[outbox] flush error", e);
     }

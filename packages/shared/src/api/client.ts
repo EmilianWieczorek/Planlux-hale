@@ -25,6 +25,36 @@ export interface ApiClientConfig {
   retries?: number;
   retryDelayMs?: number;
   retryBackoffMultiplier?: number;
+  /** Opcjonalny logger do diagnostyki (np. przy ERR_SHEETS_BAD_JSON). */
+  log?: (level: "error" | "warn", message: string, data?: unknown) => void;
+}
+
+/** Błąd gdy Apps Script zwróci nie-JSON (HTML/redirect). */
+export interface SheetsBadJsonDetails {
+  status: number;
+  contentType: string;
+  bodySnippet: string;
+  url?: string;
+  method?: string;
+}
+
+export class SheetsBadJsonError extends Error {
+  code = "ERR_SHEETS_BAD_JSON" as const;
+  details: SheetsBadJsonDetails;
+  constructor(message: string, details: SheetsBadJsonDetails) {
+    super(message);
+    this.name = "SheetsBadJsonError";
+    this.details = details;
+  }
+}
+
+const BODY_SNIPPET_MAX = 2000;
+
+function isJsonLike(contentType: string, bodyTrim: string): boolean {
+  const ct = (contentType || "").toLowerCase();
+  if (ct.includes("application/json")) return true;
+  const first = bodyTrim.slice(0, 50).trim();
+  return first.startsWith("{") || first.startsWith("[");
 }
 
 export class ApiClient {
@@ -35,6 +65,7 @@ export class ApiClient {
   private retries: number;
   private retryDelayMs: number;
   private retryBackoffMultiplier: number;
+  private log?: ApiClientConfig["log"];
 
   constructor(config: ApiClientConfig) {
     this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
@@ -44,9 +75,11 @@ export class ApiClient {
     this.retries = config.retries ?? 3;
     this.retryDelayMs = config.retryDelayMs ?? 1000;
     this.retryBackoffMultiplier = config.retryBackoffMultiplier ?? 2;
+    this.log = config.log;
   }
 
   private async request<T>(url: string, options?: RequestInit): Promise<T> {
+    const method = (options?.method ?? "GET").toUpperCase();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...((options?.headers as Record<string, string>) ?? {}),
@@ -68,10 +101,61 @@ export class ApiClient {
         });
         clearTimeout(timeoutId);
 
-        const data = (await res.json()) as T & { ok?: boolean; error?: string };
-        if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+        const contentType = res.headers.get("content-type") ?? "";
+        const rawBody = await res.text();
+        const bodyTrim = rawBody.trim();
+
+        if (!isJsonLike(contentType, bodyTrim)) {
+          const bodySnippet = bodyTrim.slice(0, BODY_SNIPPET_MAX);
+          const details: SheetsBadJsonDetails = {
+            status: res.status,
+            contentType,
+            bodySnippet,
+            url,
+            method,
+          };
+          if (this.log) {
+            this.log("error", "[API] Apps Script zwrócił nie-JSON (HISTORIA_EMAIL / logEmail)", {
+              url,
+              method,
+              status: res.status,
+              contentType,
+              bodySnippet: bodySnippet.slice(0, 500),
+            });
+          }
+          throw new SheetsBadJsonError("Apps Script zwrócił nieprawidłową odpowiedź (nie JSON).", details);
+        }
+
+        let data: T & { ok?: boolean; error?: string };
+        try {
+          data = JSON.parse(rawBody) as T & { ok?: boolean; error?: string };
+        } catch (parseErr) {
+          const bodySnippet = bodyTrim.slice(0, BODY_SNIPPET_MAX);
+          const details: SheetsBadJsonDetails = {
+            status: res.status,
+            contentType,
+            bodySnippet,
+            url,
+            method,
+          };
+          if (this.log) {
+            this.log("error", "[API] Nieprawidłowa odpowiedź JSON – parse error", {
+              url,
+              method,
+              status: res.status,
+              bodySnippet: bodySnippet.slice(0, 500),
+            });
+          }
+          throw new SheetsBadJsonError("Apps Script zwrócił nieprawidłową odpowiedź (błąd parsowania JSON).", details);
+        }
+
+        if (!res.ok) throw new Error((data?.error as string) ?? `HTTP ${res.status}`);
         return data as T;
       } catch (e) {
+        if (e instanceof SheetsBadJsonError) {
+          clearTimeout(timeoutId);
+          throw e;
+        }
         lastErr = e instanceof Error ? e : new Error(String(e));
         if (attempt < this.retries && (lastErr.name === "AbortError" || lastErr.message.includes("fetch"))) {
           await new Promise((r) => setTimeout(r, delay));

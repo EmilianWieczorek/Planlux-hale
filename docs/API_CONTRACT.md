@@ -4,6 +4,12 @@ Base URL: `https://script.google.com/macros/s/AKfycbzOCqNNK5c2trwE-Q-w6ti89Q-Img
 
 Wszystkie odpowiedzi JSON. Opcjonalnie: nagłówek `X-App-Token: <token>` dla operacji POST (jeśli backend weryfikuje).
 
+**Wymaganie odpowiedzi:** Backend (doGet/doPost) **musi zawsze** zwracać odpowiedź w formacie JSON:
+- Sukces: `Content-Type: application/json` i body np. `{ "ok": true, "message": "...", "id": "..." }`.
+- Błąd: `{ "ok": false, "error": "opis", "code": "ERR_..." }` (np. `ERR_SERVER`, `ERR_AUTH`, `VALIDATION_ERROR`).
+- W przypadku wyjątku w Apps Script: zwrócić JSON `{ "ok": false, "code": "ERR_SERVER", "error": e.message }`, **nie** HTML ani przekierowanie.  
+Aplikacja kliencka traktuje nie-JSON (np. stronę błędu HTML) jako `ERR_SHEETS_BAD_JSON` i loguje status/content-type/fragment body.
+
 ---
 
 ## 1. GET META (wersja bazy – lekki check)

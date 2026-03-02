@@ -2581,16 +2581,16 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     }
   });
 
-  /** Send offer email: templates, CC to office, auto PDF. SALESPERSON = own account; BOSS/ADMIN may send as another user. */
+  /** Send offer email: templates, CC to office, auto PDF. Idempotencja: jeden mail na (offerId+to+subject+pdf) w 5 min. */
   ipcMain.handle("planlux:email:sendOfferEmail", async (_, payload: unknown) => {
     try {
       const user = requireAuth();
-      if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
+      if (!payload || typeof payload !== "object") return { ok: false, code: "ERR_INVALID_PAYLOAD", message: "Invalid payload", error: "Invalid payload" };
       const p = payload as { offerId?: string; offerNumber?: string; offer_number?: string; number?: string; to: string; ccOfficeEnabled?: boolean; subjectOverride?: string; bodyOverride?: string; sendAsUserId?: string; extraAttachments?: Array<{ filename: string; path: string }> };
       const db = getDb();
       const offerInputRaw = p.offerId ?? p.offerNumber ?? p.offer_number ?? p.number;
       const offerInput = (typeof offerInputRaw === "string" ? offerInputRaw : "").trim();
-      if (!offerInput) return { ok: false, error: "Oferta i adres odbiorcy są wymagane" };
+      if (!offerInput) return { ok: false, code: "ERR_MISSING_OFFER", message: "Oferta i adres odbiorcy są wymagane", error: "Oferta i adres odbiorcy są wymagane" };
       let resolvedOfferId: string | null = resolveOfferId(db, offerInput);
       if (!resolvedOfferId) {
         try {
@@ -2598,7 +2598,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           resolvedOfferId = ensureOfferCrmRow(db, offerInput);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          return { ok: false, error: msg.includes("nie istnieje w bazie CRM") ? msg : "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)" };
+          const errMsg = msg.includes("nie istnieje w bazie CRM") ? msg : "Oferta nie znaleziona (nieprawidłowy identyfikator lub numer oferty)";
+          return { ok: false, code: "ERR_NOT_FOUND", message: errMsg, error: errMsg };
         }
       }
       if (!resolvedOfferId) {
@@ -2611,18 +2612,24 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const toInput = typeof p.to === "string" ? p.to.trim() : "";
       const toEmails = parseRecipients(toInput);
       const to = toEmails.join(", ");
-      if (!to) return { ok: false, error: "Adres odbiorcy jest wymagany", code: "ERR_NO_TO" };
-      if (!canAccessOffer(db, resolvedOfferId, user.id)) return { ok: false, error: "Oferta nie znaleziona" };
+      if (!to) return { ok: false, code: "ERR_NO_TO", message: "Adres odbiorcy jest wymagany", error: "Adres odbiorcy jest wymagany" };
+      if (!canAccessOffer(db, resolvedOfferId, user.id)) return { ok: false, code: "ERR_NOT_FOUND", message: "Oferta nie znaleziona", error: "Oferta nie znaleziona" };
       const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
-      if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, error: "Forbidden" };
+      if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, code: "ERR_FORBIDDEN", message: "Forbidden", error: "Forbidden" };
       const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
-      if (!account) return { ok: false, error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)", code: "ERR_AUTH" };
-      const senderExists = db.prepare("SELECT id FROM users WHERE id = ? AND active = 1").get(senderUserId);
-      if (!senderExists) return { ok: false, error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
+      if (!account) return { ok: false, code: "ERR_AUTH", message: "Skonfiguruj konto SMTP w Panelu admina (E-mail)", error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)" };
+      const effectiveUserId: string = senderUserId ?? user.id ?? (account as { user_id?: string }).user_id ?? "";
+      const ehColsEarly = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+      const hasUserIdColEarly = ehColsEarly.some((c) => c.name === "user_id");
+      if (hasUserIdColEarly && !effectiveUserId) {
+        return { ok: false, code: "ERR_NO_USER", message: "Brak użytkownika (user_id) – nie można zapisać historii e-mail.", error: "Brak użytkownika (user_id)", details: "effectiveUserId empty" };
+      }
+      const senderExists = db.prepare("SELECT id FROM users WHERE id = ? AND active = 1").get(effectiveUserId);
+      if (!senderExists) return { ok: false, code: "ERR_FORBIDDEN", message: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)", error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
 
       const settings = getEmailSettings(db as import("./emailService").Db);
       const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(resolvedOfferId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
-      if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
+      if (!offerRow) return { ok: false, code: "ERR_NOT_FOUND", message: "Oferta nie znaleziona", error: "Oferta nie znaleziona" };
       const salespersonRow = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(senderUserId) as { display_name: string | null; email: string } | undefined;
       const clientName = [offerRow.client_first_name, offerRow.client_last_name].filter(Boolean).join(" ") || offerRow.company_name || "";
       const companyName = offerRow.company_name || "";
@@ -2686,12 +2693,40 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         insertPdf(getDb(), { id: pdfId, offerId: resolvedOfferId, userId: (row.user_id as string) || user.id, clientName, fileName: result.fileName, filePath: result.filePath, status: "PDF_CREATED", totalPln: payload.pricing.totalPln, widthM: payload.offer.widthM, lengthM: payload.offer.lengthM, heightM: payload.offer.heightM ?? undefined, areaM2: payload.offer.areaM2, variantHali: payload.offer.variantHali });
         return { ok: true, filePath: result.filePath, fileName: result.fileName };
       })();
-      if (!ensurePdfResult.ok) return { ok: false, error: ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail.", code: "ERR_NO_ATTACHMENT" };
+      if (!ensurePdfResult.ok) {
+        const attachmentMsg = ensurePdfResult.error ?? "Nie udało się przygotować PDF oferty. Wygeneruj PDF przed wysłaniem e-mail.";
+        return { ok: false, code: "ERR_NO_ATTACHMENT", message: attachmentMsg, error: attachmentMsg };
+      }
       const extraAttachments = p.extraAttachments ?? [];
       const attachments: Array<{ filename: string; path: string }> = ensurePdfResult.filePath && ensurePdfResult.fileName
         ? [{ filename: ensurePdfResult.fileName, path: ensurePdfResult.filePath }, ...extraAttachments]
         : extraAttachments;
-      if (attachments.length === 0) return { ok: false, error: "Brak załącznika PDF do oferty", code: "ERR_NO_ATTACHMENT" };
+      if (attachments.length === 0) return { ok: false, code: "ERR_NO_ATTACHMENT", message: "Brak załącznika PDF do oferty" };
+
+      const dateBucket5Min = Math.floor(Date.now() / 300_000).toString();
+      const idempotencyKey = crypto.createHash("sha256").update(`${resolvedOfferId}|${to}|${subject}|${attachments[0]?.path ?? ""}|${dateBucket5Min}`).digest("hex");
+      const ehColsForIdem = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+      const hasIdempotencyKey = ehColsForIdem.some((c) => c.name === "idempotency_key");
+      const hasToAddr = ehColsForIdem.some((c) => c.name === "to_addr");
+      const hasToEmail = ehColsForIdem.some((c) => c.name === "to_email");
+      if (hasIdempotencyKey) {
+        const existing = db.prepare("SELECT id FROM email_history WHERE idempotency_key = ? AND (status = 'sent' OR status = 'SENT') LIMIT 1").get(idempotencyKey) as { id: string } | undefined;
+        if (existing) {
+          logger.info("[email] sendOfferEmail idempotent skip", { offerId: resolvedOfferId, to });
+          return { ok: true, sent: true, alreadySent: true };
+        }
+      } else {
+        const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+        const existingByOffer = hasToAddr
+          ? db.prepare("SELECT id FROM email_history WHERE offer_id = ? AND to_addr = ? AND subject = ? AND (status = 'sent' OR status = 'SENT') AND created_at >= ? LIMIT 1").get(resolvedOfferId, to, subject, fiveMinAgo) as { id: string } | undefined
+          : hasToEmail
+            ? db.prepare("SELECT id FROM email_history WHERE offer_id = ? AND to_email = ? AND subject = ? AND (status = 'sent' OR status = 'SENT') AND created_at >= ? LIMIT 1").get(resolvedOfferId, to, subject, fiveMinAgo) as { id: string } | undefined
+            : undefined;
+        if (existingByOffer) {
+          logger.info("[email] sendOfferEmail idempotent skip (by offer/to/subject)", { offerId: resolvedOfferId, to });
+          return { ok: true, sent: true, alreadySent: true };
+        }
+      }
 
       const online = await checkInternetEmail();
       if (!online) {
@@ -2726,65 +2761,115 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
         const smtpResponse = result.response ?? null;
         const accountId = account?.id ?? null;
-        db.transaction(() => {
-          const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(resolvedOfferId);
-          if (!offerExists) throw new Error("[email] FK/consistency: oferta nie istnieje przed zapisem outbox");
-          db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, resolvedOfferId);
-          db.prepare(
-            `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
-          ).run(
-            outboxId,
-            accountId,
-            senderUserId,
-            to,
-            cc || null,
-            subject,
-            bodyText,
-            bodyHtml,
-            JSON.stringify(attachments || []),
-            resolvedOfferId,
-            now,
-            now,
-            now
-          );
-          const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(outboxId);
-          if (!outboxExists) {
-            throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
+        try {
+          db.transaction(() => {
+            const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(resolvedOfferId);
+            if (!offerExists) throw new Error("[email] FK/consistency: oferta nie istnieje przed zapisem outbox");
+            db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(now, now, resolvedOfferId);
+            db.prepare(
+              `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
+            ).run(
+              outboxId,
+              accountId,
+              senderUserId,
+              to,
+              cc || null,
+              subject,
+              bodyText,
+              bodyHtml,
+              JSON.stringify(attachments || []),
+              resolvedOfferId,
+              now,
+              now,
+              now
+            );
+            const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(outboxId);
+            if (!outboxExists) throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
+            const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+            if (auditTables.length > 0) {
+              db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
+                uuid(), resolvedOfferId, user.id, JSON.stringify({ to, outboxId })
+              );
+            }
+            const ehCols = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+            const hasOfferIdCol = ehCols.some((c) => c.name === "offer_id");
+            const hasIdemCol = ehCols.some((c) => c.name === "idempotency_key");
+            const hasUserIdCol = ehCols.some((c) => c.name === "user_id");
+            const hasToAddr = ehCols.some((c) => c.name === "to_addr");
+            const hasToEmail = ehCols.some((c) => c.name === "to_email");
+            if (hasUserIdCol && !effectiveUserId) throw new Error("[email] effectiveUserId required for email_history.user_id");
+            if (hasOfferIdCol && hasToAddr) {
+              if (hasUserIdCol && hasIdemCol) {
+                db.prepare(
+                  "INSERT INTO email_history (id, outbox_id, account_id, user_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?)"
+                ).run(historyId, outboxId, accountId, effectiveUserId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, resolvedOfferId, idempotencyKey);
+              } else if (hasUserIdCol) {
+                db.prepare(
+                  "INSERT INTO email_history (id, outbox_id, account_id, user_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)"
+                ).run(historyId, outboxId, accountId, effectiveUserId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, resolvedOfferId);
+              } else if (hasIdemCol) {
+                db.prepare(
+                  "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id, idempotency_key) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?)"
+                ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, resolvedOfferId, idempotencyKey);
+              } else {
+                db.prepare(
+                  "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)"
+                ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, resolvedOfferId);
+              }
+            } else if (hasOfferIdCol && hasToEmail && hasUserIdCol) {
+              const fromE = (account as { from_email?: string }).from_email ?? "";
+              db.prepare(
+                "INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SENT', ?, ?)"
+              ).run(historyId, resolvedOfferId, effectiveUserId, fromE, to, subject, "", "[]", now, now);
+            }
+          })();
+          try {
+            const logEmailPayload = {
+              id: historyId,
+              userId: user.id,
+              userEmail: user.email,
+              toEmail: to,
+              subject,
+              status: "SENT" as const,
+              sentAt: now,
+            };
+            db.prepare(
+              "INSERT INTO outbox (id, operation_type, payload_json, retry_count, max_retries) VALUES (?, 'LOG_EMAIL', ?, 0, 5)"
+            ).run(uuid(), JSON.stringify(logEmailPayload));
+            const { flushOutbox } = await import("@planlux/shared");
+            const { createOutboxStorage } = await import("../src/db/outboxStorage");
+            const { sendEmail: sendGenericEmailSmtp } = await import("./mail");
+            const r = await flushOutbox({
+              api: apiClient,
+              storage: createOutboxStorage(db as Parameters<typeof createOutboxStorage>[0]),
+              isOnline: () => true,
+              sendEmail: createSendEmailForFlush(getDb),
+              sendGenericEmail: async (payload) => {
+                await sendGenericEmailSmtp({ to: payload.to, subject: payload.subject, text: payload.text, html: payload.html });
+              },
+            }) as { processed: number; failed: number; firstError?: { code?: string; message: string; details?: unknown } };
+            if (r.firstError) {
+              return { ok: true, sent: true, sheetsError: r.firstError };
+            }
+          } catch (logErr) {
+            logger.warn("[email] LOG_EMAIL enqueue failed (outbox)", logErr);
           }
+        } catch (txErr) {
+          const msg = txErr instanceof Error ? txErr.message : String(txErr);
+          logger.error("[email] sendOfferEmail history/outbox transaction failed (mail already sent)", txErr);
           const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
           if (auditTables.length > 0) {
-            db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_SENT', ?)").run(
-              uuid(), resolvedOfferId, user.id, JSON.stringify({ to, outboxId })
-            );
+            try {
+              db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_HISTORY_WRITE_FAILED', ?)").run(
+                uuid(), resolvedOfferId, user.id, JSON.stringify({ to, error: msg, code: "ERR_HISTORY_WRITE" })
+              );
+            } catch (_) {}
           }
-        })();
-        let historySaved = true;
-        const offerIdForHistory = resolvedOfferId;
-        try {
-          if (!offerIdForHistory) {
-            throw new Error("sendOfferEmail: resolvedOfferId is null – cannot insert email_history");
-          }
-          console.info("[email_history insert]", {
-            resolvedOfferId: offerIdForHistory,
-            typeofOfferId: typeof offerIdForHistory,
-            payloadOfferId: p.offerId,
-            payloadOfferNumber: p.offerNumber,
-          });
-          db.prepare(
-            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at, offer_id) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)"
-          ).run(historyId, outboxId, accountId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now, offerIdForHistory);
-        } catch (historyErr) {
-          historySaved = false;
-          console.error("[email_history failed]", historyErr);
-          console.error("[email] email_history insert failed", {
-            resolvedOfferId: offerIdForHistory,
-            userId: senderUserId,
-            error: String(historyErr),
-          });
-          logger.error("[email] email_history insert failed", historyErr);
+          const historyMsg = "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę.";
+          return { ok: false, code: "ERR_HISTORY_WRITE", message: historyMsg, error: historyMsg, details: txErr instanceof Error ? txErr.stack : undefined };
         }
-        return { ok: true, sent: true, historySaved, warning: historySaved ? undefined : "E-mail wysłany, ale nie zapisano w historii (sprawdź bazę/logi)." };
+        return { ok: true, sent: true };
       }
 
       const errMsg = result.error ?? "Serwer SMTP nie przyjął wiadomości";
@@ -2799,11 +2884,19 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const hasErrorMessage = ehCols.some((c) => c.name === "error_message");
         const hasToAddr = ehCols.some((c) => c.name === "to_addr");
         const hasToEmail = ehCols.some((c) => c.name === "to_email");
+        const hasUserIdCol = ehCols.some((c) => c.name === "user_id");
         if (hasOfferId) {
           if (hasToAddr && hasError) {
-            db.prepare(
-              "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, created_at, offer_id) VALUES (?, NULL, ?, ?, ?, 'failed', ?, ?, ?)"
-            ).run(historyId, account?.id ?? null, to, subject, errMsg, now, resolvedOfferId);
+            if (hasUserIdCol) {
+              const failUserId = effectiveUserId || ((account as { user_id?: string }).user_id ?? user.id);
+              db.prepare(
+                "INSERT INTO email_history (id, outbox_id, account_id, user_id, to_addr, subject, status, error, created_at, offer_id) VALUES (?, NULL, ?, ?, ?, ?, 'failed', ?, ?, ?)"
+              ).run(historyId, account?.id ?? null, failUserId, to, subject, errMsg, now, resolvedOfferId);
+            } else {
+              db.prepare(
+                "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, error, created_at, offer_id) VALUES (?, NULL, ?, ?, ?, 'failed', ?, ?, ?)"
+              ).run(historyId, account?.id ?? null, to, subject, errMsg, now, resolvedOfferId);
+            }
           } else if (hasToEmail && hasErrorMessage) {
             db.prepare(
               "INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, '', 'FAILED', ?, ?)"
@@ -2815,6 +2908,23 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'EMAIL_FAILED', ?)").run(
             uuid(), resolvedOfferId, user.id, JSON.stringify({ to, error: errMsg, code })
           );
+        }
+        try {
+          const logEmailPayload = {
+            id: historyId,
+            userId: user.id,
+            userEmail: user.email,
+            toEmail: to,
+            subject,
+            status: "FAILED" as const,
+            errorMessage: errMsg,
+            sentAt: null,
+          };
+          db.prepare(
+            "INSERT INTO outbox (id, operation_type, payload_json, retry_count, max_retries) VALUES (?, 'LOG_EMAIL', ?, 0, 5)"
+          ).run(uuid(), JSON.stringify(logEmailPayload));
+        } catch (logErr) {
+          logger.warn("[email] LOG_EMAIL (FAILED) enqueue failed", logErr);
         }
       } catch (auditErr) {
         logger.error("[email] sendOfferEmail FAILED audit/history insert", auditErr);
@@ -2829,16 +2939,16 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         relatedOfferId: resolvedOfferId,
         accountUserId: senderUserId,
       }, logger);
-      return { ok: false, error: errMsg, code, queued: true };
+      return { ok: false, code, message: errMsg, error: errMsg, queued: true };
     } catch (e) {
-      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, code: "ERR_AUTH", message: e.message, error: e.message };
       logger.error("[email] sendOfferEmail failed", e);
       const msg = e instanceof Error ? e.message : String(e);
       let friendly = msg;
       if (msg.includes("Oferta nie istnieje w bazie CRM")) friendly = msg;
       else if (msg.includes("FOREIGN KEY") || msg.includes("constraint failed")) friendly = "Błąd zapisu powiązań (oferta lub użytkownik). Odśwież ofertę i spróbuj ponownie.";
       else if (msg.includes("insertPdf") || msg.includes("zapisać PDF")) friendly = "Nie udało się zapisać PDF w bazie. Sprawdź logi i spróbuj ponownie.";
-      return { ok: false, error: friendly, code: "ERR_SMTP", stack: e instanceof Error ? e.stack : undefined };
+      return { ok: false, code: "ERR_SMTP", message: friendly, error: friendly, details: e instanceof Error ? e.stack : undefined };
     }
   });
 
@@ -2894,7 +3004,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
   ipcMain.handle("planlux:email:send", async (_, payload: unknown) => {
     try {
-      requireAuth();
+      const user = requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { to?: string; cc?: string; bcc?: string; subject?: string; text?: string; html?: string; attachments?: Array<{ filename: string; path: string }>; relatedOfferId?: string; accountId?: string | null };
       const toInput = typeof p.to === "string" ? p.to.trim() : "";
@@ -2974,9 +3084,18 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           );
           const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(tempId);
           if (!outboxExists) throw new Error("[email] FK diagnostic: email_outbox row missing after INSERT");
-          db.prepare(
-            "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-          ).run(historyId, tempId, account.id, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+          const ehCols = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+          const hasUserIdCol = ehCols.some((c) => c.name === "user_id");
+          const userId = (account as { user_id?: string | null }).user_id ?? user.id;
+          if (hasUserIdCol) {
+            db.prepare(
+              "INSERT INTO email_history (id, outbox_id, account_id, user_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
+            ).run(historyId, tempId, account.id, userId, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+          } else {
+            db.prepare(
+              "INSERT INTO email_history (id, outbox_id, account_id, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
+            ).run(historyId, tempId, account.id, to, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+          }
         });
         runTx();
         return { ok: true, sent: true };

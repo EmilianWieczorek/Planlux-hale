@@ -41,15 +41,27 @@ export interface FlushOutboxDeps {
   isOnline: () => boolean;
 }
 
+/** Błąd zwracany do UI gdy np. logEmail dostanie nie-JSON z Apps Script. */
+export interface FlushOutboxFirstError {
+  code?: string;
+  message: string;
+  details?: unknown;
+}
+
 /**
  * Przetwarza outbox w kolejności created_at.
  * HEARTBEAT → LOG_PDF → SEND_EMAIL (wywołuje sendEmail) → LOG_EMAIL.
  * Dla SEND_EMAIL wymaga inject sendEmail; bez niego pomija i zostawia w kolejce.
  */
-export async function flushOutbox(deps: FlushOutboxDeps): Promise<{ processed: number; failed: number }> {
+export async function flushOutbox(deps: FlushOutboxDeps): Promise<{
+  processed: number;
+  failed: number;
+  firstError?: FlushOutboxFirstError;
+}> {
   const pending = await deps.storage.getPending();
   let processed = 0;
   let failed = 0;
+  let firstError: FlushOutboxFirstError | undefined;
 
   for (const record of pending) {
     if (record.retry_count >= record.max_retries) {
@@ -102,6 +114,14 @@ export async function flushOutbox(deps: FlushOutboxDeps): Promise<{ processed: n
       processed++;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const errWithCode = err as { code?: string; details?: unknown };
+      if (!firstError && errWithCode.code === "ERR_SHEETS_BAD_JSON") {
+        firstError = {
+          code: errWithCode.code,
+          message: msg,
+          details: errWithCode.details,
+        };
+      }
       const backoff = BACKOFF_MS[Math.min(record.retry_count, BACKOFF_MS.length - 1)];
       deps.storage.markFailed(record.id, msg, true);
       failed++;
@@ -109,7 +129,7 @@ export async function flushOutbox(deps: FlushOutboxDeps): Promise<{ processed: n
     }
   }
 
-  return { processed, failed };
+  return { processed, failed, firstError };
 }
 
 export function generateOutboxId(): string {

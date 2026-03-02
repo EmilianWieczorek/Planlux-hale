@@ -421,16 +421,34 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
             ccOfficeEnabled: p.ccOfficeEnabled,
             subjectOverride: p.subject || undefined,
             bodyOverride: p.body ? p.body.replace(/\n/g, "<br>") : undefined,
-          })) as { ok: boolean; sent?: boolean; queued?: boolean; error?: string; code?: string };
+          })) as {
+            ok: boolean;
+            sent?: boolean;
+            queued?: boolean;
+            error?: string;
+            code?: string;
+            message?: string;
+            sheetsError?: { code?: string; message: string; details?: { status?: number; contentType?: string; bodySnippet?: string } };
+          };
           if (res.queued) setQueueSnackbarOpen(true);
           if (res.ok) await refreshData();
           const messageByCode: Record<string, string> = {
             ERR_NO_TO: "Podaj adres e-mail odbiorcy.",
+            ERR_NO_USER: "Brak użytkownika (user_id) – nie można zapisać historii e-mail.",
             ERR_NO_ATTACHMENT: "Brak załącznika PDF. Wygeneruj PDF oferty przed wysłaniem.",
             ERR_AUTH: "Błąd autoryzacji SMTP. Sprawdź ustawienia konta e-mail w Panelu admina.",
             ERR_TIMEOUT: "Przekroczono limit czasu połączenia. Sprawdź internet i spróbuj ponownie.",
+            ERR_HISTORY_WRITE: "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę – nie wysyłaj ponownie.",
+            ERR_SHEETS_BAD_JSON: "Apps Script zwrócił nieprawidłową odpowiedź (nie JSON). Zapis do Google Sheets w kolejce – sprawdź logi (status, content-type, fragment odpowiedzi).",
           };
-          const friendlyError = res.error && res.code && messageByCode[res.code] ? messageByCode[res.code] : res.error;
+          let friendlyError: string | undefined;
+          if (res.ok && res.sent && res.sheetsError) {
+            friendlyError = `E-mail wysłany. Zapis do Google Sheets nie powiódł się: ${res.sheetsError.message} Wpis w kolejce – spróbuję ponownie.`;
+          } else if (!res.ok) {
+            const baseMsg = (res as { message?: string }).message ?? (res.code && messageByCode[res.code] ? messageByCode[res.code] : res.error);
+            const details = (res as { details?: unknown }).details;
+            friendlyError = typeof details === "string" ? `${baseMsg} (${details.slice(0, 120)})` : baseMsg;
+          }
           return { ...res, error: friendlyError };
         }}
       />

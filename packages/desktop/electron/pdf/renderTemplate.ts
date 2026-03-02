@@ -111,12 +111,13 @@ function buildEditorContentReplacements(editorContent: PdfEditorContent): Record
     p2.note?.trim() !== ""
       ? `<section class="spec-note" data-plx-block="SELLER_NOTE" style="margin-top:16px;padding:12px;background:#f8fafc;border-radius:8px;font-size:11px;color:#475569;"><div class="spec-note__text">${escapeHtml(p2.note)}</div></section>`
       : "";
+  const emptyPlaceholder = "Brak danych";
   return {
     "{{page2SectionTitle}}": escapeHtml("SPECYFIKACJA TECHNICZNA"),
-    "{{page2Box1}}": linesToHtml(p2.boxText1),
-    "{{page2Box2}}": linesToHtml(p2.boxText2),
-    "{{page2Box3}}": linesToHtml(p2.boxText3),
-    "{{page2Box4}}": linesToHtml(p2.boxText4),
+    "{{page2Box1}}": linesToHtml((p2.boxText1 ?? "").trim() || emptyPlaceholder),
+    "{{page2Box2}}": linesToHtml((p2.boxText2 ?? "").trim() || emptyPlaceholder),
+    "{{page2Box3}}": linesToHtml((p2.boxText3 ?? "").trim() || emptyPlaceholder),
+    "{{page2Box4}}": linesToHtml((p2.boxText4 ?? "").trim() || emptyPlaceholder),
     "{{page2NoteSection}}": noteHtml,
   };
 }
