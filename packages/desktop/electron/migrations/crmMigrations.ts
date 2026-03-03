@@ -66,24 +66,38 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] offers_crm skipped", e);
   }
 
-  // 2. email_history
+  // 2. email_history – unified schema (single source of truth); new DBs get this; old DBs get rebuilt in step 20
   try {
     database.exec(`
       CREATE TABLE IF NOT EXISTS email_history (
         id TEXT PRIMARY KEY,
-        offer_id TEXT NOT NULL REFERENCES offers_crm(id),
-        user_id TEXT NOT NULL REFERENCES users(id),
-        from_email TEXT NOT NULL,
-        to_email TEXT NOT NULL,
-        subject TEXT NOT NULL,
-        body TEXT NOT NULL,
+        related_offer_id TEXT DEFAULT NULL,
+        offer_id TEXT DEFAULT NULL,
+        outbox_id TEXT DEFAULT NULL,
+        account_id TEXT DEFAULT NULL,
+        user_id TEXT DEFAULT NULL,
+        from_email TEXT NOT NULL DEFAULT '',
+        to_email TEXT NOT NULL DEFAULT '',
+        to_addr TEXT NOT NULL DEFAULT '',
+        subject TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
         attachments_json TEXT NOT NULL DEFAULT '[]',
-        sent_at TEXT,
-        status TEXT NOT NULL CHECK (status IN ('QUEUED', 'SENT', 'FAILED')),
-        error_message TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        status TEXT NOT NULL CHECK (status IN ('queued','sent','failed')),
+        error_message TEXT DEFAULT NULL,
+        error TEXT DEFAULT NULL,
+        accepted_json TEXT DEFAULT NULL,
+        rejected_json TEXT DEFAULT NULL,
+        smtp_response TEXT DEFAULT NULL,
+        provider_message_id TEXT DEFAULT NULL,
+        sent_at TEXT DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        idempotency_key TEXT DEFAULT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_email_history_related_offer_id ON email_history(related_offer_id);
       CREATE INDEX IF NOT EXISTS idx_email_history_offer_id ON email_history(offer_id);
+      CREATE INDEX IF NOT EXISTS idx_email_history_outbox_id ON email_history(outbox_id);
+      CREATE INDEX IF NOT EXISTS idx_email_history_created_at ON email_history(created_at);
+      CREATE INDEX IF NOT EXISTS idx_email_history_idempotency_key ON email_history(idempotency_key);
       CREATE INDEX IF NOT EXISTS idx_email_history_user_id ON email_history(user_id);
     `);
     logger.info("[migration] email_history ready");
@@ -235,7 +249,7 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.info("[migration] smtp_accounts table already exists");
   }
 
-  // 7. email_outbox – kolejka offline-first z retry/backoff
+  // 7. email_outbox – kolejka offline-first z retry/backoff (runtime status: queued/sent/failed lowercase)
   try {
     database.exec(`
       CREATE TABLE IF NOT EXISTS email_outbox (
@@ -249,7 +263,7 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
         html_body TEXT DEFAULT NULL,
         attachments_json TEXT NOT NULL DEFAULT '[]',
         related_offer_id TEXT DEFAULT NULL,
-        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','sending','sent','failed')),
+        status TEXT NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED','SENT','FAILED')),
         retry_count INTEGER NOT NULL DEFAULT 0,
         next_retry_at TEXT DEFAULT NULL,
         last_error TEXT DEFAULT NULL,
@@ -569,5 +583,172 @@ COMMIT;
     }
   } catch (e) {
     logger.warn("[migration] email_history user_id backfill skipped", e);
+  }
+
+  // 20. email_history: unified schema (single source of truth) – rebuild if old/wrong CHECK
+  try {
+    runEmailHistoryUnifiedStep(database, logger);
+  } catch (e) {
+    logger.warn("[migration] email_history unified skipped", e);
+    try {
+      database.exec("PRAGMA foreign_keys = ON");
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Krok 20: ujednolicenie email_history (rebuild przy starym CHECK). Eksport do wywołania przy CHECK constraint failed w runtime. */
+export function runEmailHistoryUnifiedStep(
+  database: Db,
+  logger: { info: (m: string, d?: unknown) => void; warn: (m: string, e?: unknown) => void; error?: (m: string, e?: unknown) => void }
+): void {
+  try {
+    const createStmt = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='email_history'").get() as { sql: string } | undefined;
+    const sql = createStmt?.sql ?? "";
+    const hasOldCheck =
+      sql.includes("QUEUED") ||
+      sql.includes("'falled'") ||
+      sql.includes("'sending'");
+
+    if (!hasTable(database, "email_history")) {
+      database.exec(`
+        CREATE TABLE email_history (
+          id TEXT PRIMARY KEY,
+          related_offer_id TEXT DEFAULT NULL,
+          offer_id TEXT DEFAULT NULL,
+          outbox_id TEXT DEFAULT NULL,
+          account_id TEXT DEFAULT NULL,
+          user_id TEXT DEFAULT NULL,
+          from_email TEXT NOT NULL DEFAULT '',
+          to_email TEXT NOT NULL DEFAULT '',
+          to_addr TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
+          attachments_json TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL CHECK (status IN ('queued','sent','failed')),
+          error_message TEXT DEFAULT NULL,
+          error TEXT DEFAULT NULL,
+          accepted_json TEXT DEFAULT NULL,
+          rejected_json TEXT DEFAULT NULL,
+          smtp_response TEXT DEFAULT NULL,
+          provider_message_id TEXT DEFAULT NULL,
+          sent_at TEXT DEFAULT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          idempotency_key TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_history_related_offer_id ON email_history(related_offer_id);
+        CREATE INDEX IF NOT EXISTS idx_email_history_offer_id ON email_history(offer_id);
+        CREATE INDEX IF NOT EXISTS idx_email_history_outbox_id ON email_history(outbox_id);
+        CREATE INDEX IF NOT EXISTS idx_email_history_created_at ON email_history(created_at);
+        CREATE INDEX IF NOT EXISTS idx_email_history_idempotency_key ON email_history(idempotency_key);
+        CREATE INDEX IF NOT EXISTS idx_email_history_user_id ON email_history(user_id);
+      `);
+      logger.info("[migration] email_history unified (new table) ready");
+    } else if (hasOldCheck) {
+      database.exec("PRAGMA foreign_keys = OFF");
+      try {
+        const run = database.prepare("SELECT * FROM email_history").all() as Array<Record<string, unknown>>;
+
+        database.exec(`
+          CREATE TABLE email_history_new (
+            id TEXT PRIMARY KEY,
+            related_offer_id TEXT DEFAULT NULL,
+            offer_id TEXT DEFAULT NULL,
+            outbox_id TEXT DEFAULT NULL,
+            account_id TEXT DEFAULT NULL,
+            user_id TEXT DEFAULT NULL,
+            from_email TEXT NOT NULL DEFAULT '',
+            to_email TEXT NOT NULL DEFAULT '',
+            to_addr TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL CHECK (status IN ('queued','sent','failed')),
+            error_message TEXT DEFAULT NULL,
+            error TEXT DEFAULT NULL,
+            accepted_json TEXT DEFAULT NULL,
+            rejected_json TEXT DEFAULT NULL,
+            smtp_response TEXT DEFAULT NULL,
+            provider_message_id TEXT DEFAULT NULL,
+            sent_at TEXT DEFAULT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            idempotency_key TEXT DEFAULT NULL
+          );
+        `);
+        const mapStatus = (s: unknown): string => {
+          const raw = String(s ?? "").trim();
+          const v = raw.toUpperCase();
+          if (v === "QUEUED") return "queued";
+          if (v === "SENT") return "sent";
+          if (v === "FAILED") return "failed";
+          if (v === "SENDING" || raw.toLowerCase() === "sending") return "sent";
+          if (raw.toLowerCase() === "falled") return "failed";
+          return raw ? raw.toLowerCase() : "sent";
+        };
+        const ins = database.prepare(`
+          INSERT INTO email_history_new (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, body, attachments_json, status, error_message, error, sent_at, created_at, idempotency_key)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const r of run) {
+          const status = mapStatus(r.status);
+          const toEmail = (r.to_email ?? r.to_addr ?? "") as string;
+          ins.run(
+            r.id ?? "",
+            r.related_offer_id ?? r.offer_id ?? null,
+            r.offer_id ?? null,
+            r.outbox_id ?? null,
+            r.account_id ?? null,
+            r.user_id ?? null,
+            (r.from_email ?? "") as string,
+            toEmail,
+            (r.to_addr ?? toEmail) as string,
+            (r.subject ?? "") as string,
+            (r.body ?? "") as string,
+            (r.attachments_json ?? "[]") as string,
+            status,
+            r.error_message ?? null,
+            r.error ?? null,
+            r.sent_at ?? null,
+            (r.created_at ?? new Date().toISOString()) as string,
+            r.idempotency_key ?? null
+          );
+        }
+        database.exec("DROP TABLE email_history");
+        database.exec("ALTER TABLE email_history_new RENAME TO email_history");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_related_offer_id ON email_history(related_offer_id)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_offer_id ON email_history(offer_id)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_outbox_id ON email_history(outbox_id)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_created_at ON email_history(created_at)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_idempotency_key ON email_history(idempotency_key)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_user_id ON email_history(user_id)");
+        logger.info("[migration] email_history unified (rebuilt from old CHECK)", { rows: run.length });
+      } finally {
+        database.exec("PRAGMA foreign_keys = ON");
+      }
+    } else {
+      const info = database.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+      const addIfMissing = (col: string, def: string) => {
+        if (!info.some((c) => c.name === col)) {
+          database.exec(`ALTER TABLE email_history ADD COLUMN ${col} ${def}`);
+          logger.info("[migration] email_history column added", { column: col });
+        }
+      };
+      addIfMissing("related_offer_id", "TEXT DEFAULT NULL");
+      addIfMissing("to_addr", "TEXT NOT NULL DEFAULT ''");
+      addIfMissing("error", "TEXT DEFAULT NULL");
+      addIfMissing("idempotency_key", "TEXT DEFAULT NULL");
+      database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_related_offer_id ON email_history(related_offer_id)");
+      database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_outbox_id ON email_history(outbox_id)");
+      database.exec("CREATE INDEX IF NOT EXISTS idx_email_history_idempotency_key ON email_history(idempotency_key)");
+      logger.info("[migration] email_history unified (columns ensured)");
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history unified skipped", e);
+    try {
+      database.exec("PRAGMA foreign_keys = ON");
+    } catch {
+      // ignore
+    }
   }
 }

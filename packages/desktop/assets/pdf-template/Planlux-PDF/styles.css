@@ -303,6 +303,16 @@ html, body{
 .plx-spec .hero{ padding-bottom: 15px; }
 .plx-spec .spec{ padding: 22px 53px 18px; }
 .page--spec .spec{ padding-top: 15px; }
+
+.page--spec .hero{
+  height: auto;
+  min-height: 234px;
+  padding-bottom: 15px;
+}
+.page--spec .chips{
+  margin-bottom: 0;
+}
+
 .plx-spec .spec-grid{
   margin-top: 15px;
   display:grid;
@@ -541,6 +551,11 @@ html, body{
 @media print{
   html, body { margin: 0 !important; padding: 0 !important; background: #fff !important; }
   .wrap { margin: 0 !important; padding: 0 !important; background: #fff !important; min-height: auto !important; display: block !important; }
+  .page--spec .hero{
+    height: auto !important;
+    min-height: 234px !important;
+    padding-bottom: 15px !important;
+  }
   .page{
     width: 210mm !important;
     height: auto !important;
@@ -566,8 +581,12 @@ html, body{
   .plx-spec .spec-grid,
   .plx-offer .card,
   .xd-terrain .stepCard{ page-break-inside: avoid; break-inside: avoid; }
-  /* Page 2 (SPECYFIKACJA TECHNICZNA): nie zmniejszać headera; 15px od ostatniego elementu do dołu headera; bez dużego białego pasa. */
-  .page--spec .hero{ min-height: 234px !important; height: 234px !important; padding-top: 0; padding-bottom: 15px !important; }
+  /* Page 2 (SPECYFIKACJA TECHNICZNA): hero rośnie z treścią; 15px od chips do dołu headera. */
+  .page--spec .hero{
+    height: auto !important;
+    min-height: 234px !important;
+    padding-bottom: 15px !important;
+  }
   .page--spec .hero__inner{ padding-top: 20px; }
   .page--spec .spec{ padding-top: 15px !important; }
   .page--spec .spec-grid{ margin-top: 15px !important; }

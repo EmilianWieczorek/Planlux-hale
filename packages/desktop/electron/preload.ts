@@ -63,6 +63,7 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:email:outboxList",
   "planlux:email:retryNow",
   "planlux:email:historyList",
+  "planlux:debugEmailTables",
   "base:sync",
   "pdf:generate",
   "planlux:generatePdf",
@@ -117,6 +118,7 @@ const api = {
     retryNow: (outboxId: string) => safeInvoke("planlux:email:retryNow", outboxId),
     historyForOffer: (offerId: string) => safeInvoke("planlux:getEmailHistoryForOffer", offerId),
     getOfferEmailPreview: (offerId: string) => safeInvoke("planlux:email:getOfferEmailPreview", offerId),
+    debugEmailTables: () => safeInvoke("planlux:debugEmailTables"),
   },
   smtp: {
     listAccounts: () => safeInvoke("planlux:smtp:listAccounts"),

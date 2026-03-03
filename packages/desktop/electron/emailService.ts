@@ -19,6 +19,18 @@ export function parseRecipients(input: string): string[] {
     .filter(Boolean);
 }
 
+/** Allowed email_history.status values (CHECK constraint). 'sending' is UI/outbox-only, never stored in email_history. */
+export const ALLOWED_EMAIL_HISTORY_STATUSES = ["queued", "sent", "failed"] as const;
+export type AllowedEmailHistoryStatus = (typeof ALLOWED_EMAIL_HISTORY_STATUSES)[number];
+
+/** Normalize status for email_history INSERT/UPDATE. Rejects 'sending' and any invalid value → fallback 'queued'. */
+export function allowedEmailHistoryStatus(s: unknown): AllowedEmailHistoryStatus {
+  const v = String(s ?? "").trim().toLowerCase();
+  if (v === "sending") return "queued";
+  if (v === "sent" || v === "failed" || v === "queued") return v;
+  return "queued";
+}
+
 const CHECK_INTERNET_URL = "https://example.com/favicon.ico";
 const CHECK_INTERNET_TIMEOUT_MS = 3000;
 const OUTBOX_POLL_INTERVAL_MS = 15_000;
@@ -435,7 +447,7 @@ export function enqueueEmail(
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, bcc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`
   ).run(
     id,
     accountId,
@@ -465,121 +477,123 @@ export async function processOutbox(
   logger: { info: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void }
 ): Promise<{ processed: number; failed: number }> {
   const now = new Date().toISOString();
+  const ehInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+  const hasUserIdCol = ehInfo.some((c) => c.name === "user_id");
+  const hasToEmail = ehInfo.some((c) => c.name === "to_email");
+  const hasToAddr = ehInfo.some((c) => c.name === "to_addr");
+  const hasIdempotencyKey = ehInfo.some((c) => c.name === "idempotency_key");
+  const hasRelatedOfferId = ehInfo.some((c) => c.name === "related_offer_id");
+
   const rows = db.prepare(
-    `SELECT * FROM email_outbox WHERE status IN ('QUEUED','FAILED') AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY created_at ASC LIMIT 20`
+    `SELECT * FROM email_outbox WHERE status IN ('queued','failed') AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY created_at ASC LIMIT 20`
   ).all(now) as EmailOutboxRow[];
   let processed = 0;
   let failed = 0;
   for (const row of rows) {
-    db.prepare("UPDATE email_outbox SET status = 'QUEUED', updated_at = ? WHERE id = ?").run(now, row.id);
+    db.prepare("UPDATE email_outbox SET status = 'queued', updated_at = ? WHERE id = ?").run(now, row.id);
     const result = await sendNow(db, { ...row, status: "sending" }, logger);
     const acceptedJson = result.accepted != null ? JSON.stringify(result.accepted) : null;
     const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
     const smtpResponse = result.response ?? null;
     if (result.ok) {
-      const ehInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
-      const hasUserIdCol = ehInfo.some((c) => c.name === "user_id");
-      const hasToEmail = ehInfo.some((c) => c.name === "to_email");
-      const hasToAddr = ehInfo.some((c) => c.name === "to_addr");
       const account = getAccountForOutboxRow(db, row);
-      if (!account) throw new Error("Missing SMTP account for email history insert");
-      const firstActiveUserId = (db.prepare("SELECT id FROM users WHERE active = 1 ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined)?.id ?? null;
-      const userId =
-        row.account_user_id ??
-        account?.user_id ??
-        (hasUserIdCol ? firstActiveUserId : null);
-      logger.info("[email] resolved userId", { userId: userId ?? null, account_user_id: row.account_user_id ?? null, accountId: row.account_id ?? null });
-      const fromEmail = account.from_email ?? "";
-      const toRecipient = row.to_addr ?? "";
-      if (hasUserIdCol) {
-        if (!userId) {
-          logger.error("[emailService] missing userId for email_history (NOT NULL); row.account_user_id, account?.user_id, firstActiveUser", {
-            account_user_id: row.account_user_id ?? null,
-            account_user_id_from_account: account?.user_id ?? null,
-            firstActiveUserId,
-          });
-          throw new Error("[emailService] email_history.user_id is NOT NULL but userId is missing (account_user_id, account.user_id, first active user all null). Fix outbox to set account_user_id.");
-        }
-        if (userId !== row.account_user_id && userId === firstActiveUserId) {
-          logger.info("[emailService] email_history userId fallback used (first active user)", { outboxId: row.id, account_user_id: row.account_user_id ?? null });
-        }
+      if (!account) {
+        logger.error("[emailService] Missing SMTP account for outbox row", { outboxId: row.id });
+        failed++;
+        continue;
       }
-      if (hasToEmail && !toRecipient) throw new Error("Missing recipient for email_history.to_email (NOT NULL)");
+      const firstActiveUserId = (db.prepare("SELECT id FROM users WHERE active = 1 ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined)?.id ?? null;
+      const userId = row.account_user_id ?? account?.user_id ?? (hasUserIdCol ? firstActiveUserId : null);
+      const fromEmail = row.account_user_id
+        ? ((db.prepare("SELECT email FROM users WHERE id = ?").get(row.account_user_id) as { email?: string } | undefined)?.email ?? account.from_email ?? "")
+        : (account.from_email ?? "");
+      const toRecipient = parseRecipients(row.to_addr ?? "").join(", ");
+      const toEmailValue = toRecipient;
       const bodyValue = (row.html_body ?? row.text_body ?? "").trim() || "";
       const attachmentsJsonValue = row.attachments_json?.trim() ? row.attachments_json : "[]";
       const offerIdValue = row.related_offer_id ?? null;
+      const idempotencyKey = hasIdempotencyKey ? row.id : null;
+
       const runTx = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
-        db.prepare(
-          "UPDATE email_outbox SET status = 'SENT', updated_at = ? WHERE id = ?"
-        ).run(now, row.id);
-        const outboxExists = db.prepare("SELECT id FROM email_outbox WHERE id = ?").get(row.id);
-        if (!outboxExists) throw new Error("[emailService] FK diagnostic: email_outbox row missing before history INSERT");
-        logger.info("[email][debug] inserting history", {
-          offer_id: offerIdValue,
-          user_id: userId,
-          from_email: fromEmail,
-          to_email: toRecipient,
-          subject: row.subject,
-          body: bodyValue,
-          bodyType: typeof bodyValue,
-          bodyLength: bodyValue ? bodyValue.length : null,
-        });
-        if (hasUserIdCol) {
-          if (!userId) throw new Error("[emailService] hasUserIdCol but userId is null before INSERT");
-          if (hasToEmail && hasToAddr) {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message, to_addr)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, userId, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null, toRecipient);
-          } else if (hasToEmail) {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, userId, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null);
-          } else {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message, to_addr)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, userId, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null, toRecipient);
-          }
-        } else {
-          if (hasToEmail && hasToAddr) {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message, to_addr)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null, toRecipient);
-          } else if (hasToEmail) {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null);
-          } else {
-            db.prepare(
-              `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, account_id, outbox_id, accepted_json, rejected_json, smtp_response, provider_message_id, error_message, to_addr)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(uuid(), offerIdValue, fromEmail, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, now, row.account_id, row.id, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, null, toRecipient);
-          }
-        }
+        db.prepare("UPDATE email_outbox SET status = 'sent', sent_at = ?, updated_at = ? WHERE id = ?").run(now, now, row.id);
       });
       runTx();
+
+      if (hasIdempotencyKey && idempotencyKey) {
+        const existing = db.prepare("SELECT id FROM email_history WHERE idempotency_key = ? AND status = 'sent' LIMIT 1").get(idempotencyKey);
+        if (existing) {
+          logger.info("[emailService] skip duplicate email_history (idempotency_key)", { outboxId: row.id });
+          processed++;
+          continue;
+        }
+      }
+
+      const statusSent = allowedEmailHistoryStatus("sent");
+      try {
+        const runTxHistory = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
+          if (hasUserIdCol && userId !== null) {
+            if (hasToEmail && hasToAddr) {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, userId, fromEmail, toEmailValue, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            } else if (hasToEmail) {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, userId, fromEmail, toEmailValue, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            } else {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, userId, fromEmail, toEmailValue, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            }
+          } else {
+            if (hasToEmail && hasToAddr) {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, to_addr, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, fromEmail, toEmailValue, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            } else if (hasToEmail) {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, fromEmail, toEmailValue, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            } else {
+              db.prepare(
+                `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, to_addr, subject, body, attachments_json, sent_at, status, created_at, accepted_json, rejected_json, smtp_response, provider_message_id, idempotency_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(uuid(), hasRelatedOfferId ? offerIdValue : null, offerIdValue, row.id, row.account_id, fromEmail, toEmailValue, toRecipient, row.subject, bodyValue, attachmentsJsonValue, now, statusSent, now, acceptedJson, rejectedJson, smtpResponse, result.messageId || null, idempotencyKey);
+            }
+          }
+        });
+        runTxHistory();
+      } catch (historyErr) {
+        logger.error("[emailService] email_history insert failed (outbox already SENT)", { outboxId: row.id, error: historyErr });
+        // Nie blokujemy "wysłano" w UI – outbox już SENT
+      }
       processed++;
     } else {
       const nextRetry = row.retry_count + 1;
       if (nextRetry >= MAX_RETRIES) {
-        const ehInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
-        const hasUserIdCol = ehInfo.some((c) => c.name === "user_id");
-        const hasToEmailFail = ehInfo.some((c) => c.name === "to_email");
-        const hasToAddrFail = ehInfo.some((c) => c.name === "to_addr");
         const accountFail = getAccountForOutboxRow(db, row);
-        if (!accountFail) throw new Error("Missing SMTP account for email history insert");
+        if (!accountFail) {
+          logger.error("[emailService] FAILED path: missing SMTP account", { outboxId: row.id });
+          db.prepare("UPDATE email_outbox SET status = 'failed', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?").run(result.error || "Max retries", nextRetry, now, row.id);
+          failed++;
+          continue;
+        }
         const firstActiveUserIdFail = (db.prepare("SELECT id FROM users WHERE active = 1 ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined)?.id ?? null;
         const userIdFail = row.account_user_id ?? accountFail?.user_id ?? (hasUserIdCol ? firstActiveUserIdFail : null);
-        const fromEmailFail = accountFail.from_email ?? "";
-        const toRecipientFail = row.to_addr ?? "";
+        const fromEmailFail = row.account_user_id
+          ? ((db.prepare("SELECT email FROM users WHERE id = ?").get(row.account_user_id) as { email?: string } | undefined)?.email ?? accountFail.from_email ?? "")
+          : (accountFail.from_email ?? "");
+        const toRecipientFail = parseRecipients(row.to_addr ?? "").join(", ");
         const bodyValueFail = (row.html_body ?? row.text_body ?? "").trim() || "";
         const attachmentsJsonValueFail = row.attachments_json?.trim() ? row.attachments_json : "[]";
         const offerIdValueFail = row.related_offer_id ?? null;
         const errorMsgFail = result.error || null;
+        const idempotencyKeyFail = hasIdempotencyKey ? row.id : null;
         if (hasUserIdCol && !userIdFail) {
           logger.error("[emailService] FAILED path: missing userId for email_history", {
             account_user_id: row.account_user_id ?? null,
@@ -588,53 +602,67 @@ export async function processOutbox(
         }
         const runTxFail = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
           db.prepare(
-            "UPDATE email_outbox SET status = 'FAILED', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?"
+            "UPDATE email_outbox SET status = 'failed', last_error = ?, retry_count = ?, updated_at = ? WHERE id = ?"
           ).run(result.error || "Max retries", nextRetry, now, row.id);
-          if (hasUserIdCol) {
-            const uid = userIdFail ?? firstActiveUserIdFail;
-            if (uid) {
-              if (hasToEmailFail && hasToAddrFail) {
-                db.prepare(
-                  `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response, to_addr)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                ).run(uuid(), offerIdValueFail, uid, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, toRecipientFail);
-              } else if (hasToEmailFail) {
-                db.prepare(
-                  `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                ).run(uuid(), offerIdValueFail, uid, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse);
-              } else {
-                db.prepare(
-                  `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response, to_addr)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                ).run(uuid(), offerIdValueFail, uid, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, toRecipientFail);
-              }
-            }
-          } else {
-            if (hasToEmailFail && hasToAddrFail) {
-              db.prepare(
-                `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response, to_addr)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)`
-              ).run(uuid(), offerIdValueFail, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, toRecipientFail);
-            } else if (hasToEmailFail) {
-              db.prepare(
-                `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-              ).run(uuid(), offerIdValueFail, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse);
-            } else {
-              db.prepare(
-                `INSERT INTO email_history (id, offer_id, from_email, to_email, subject, body, attachments_json, status, created_at, account_id, outbox_id, error, error_message, accepted_json, rejected_json, smtp_response, to_addr)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)`
-              ).run(uuid(), offerIdValueFail, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, now, row.account_id, row.id, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, toRecipientFail);
-            }
-          }
         });
         runTxFail();
+        const statusFailed = allowedEmailHistoryStatus("failed");
+        const skipFailedHistory =
+          hasIdempotencyKey &&
+          idempotencyKeyFail &&
+          db.prepare("SELECT id FROM email_history WHERE idempotency_key = ? AND status = ? LIMIT 1").get(idempotencyKeyFail, statusFailed);
+        if (!skipFailedHistory) {
+          try {
+            const runTxHistoryFail = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
+              if (hasUserIdCol) {
+                const uid = userIdFail ?? firstActiveUserIdFail;
+                if (uid) {
+                  if (hasToEmail && hasToAddr) {
+                    db.prepare(
+                      `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                    ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, uid, fromEmailFail, toRecipientFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                  } else if (hasToEmail) {
+                    db.prepare(
+                      `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                    ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, uid, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                  } else {
+                    db.prepare(
+                      `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                    ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, uid, fromEmailFail, toRecipientFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                  }
+                }
+              } else {
+                if (hasToEmail && hasToAddr) {
+                  db.prepare(
+                    `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, to_addr, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                  ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, fromEmailFail, toRecipientFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                } else if (hasToEmail) {
+                  db.prepare(
+                    `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                  ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, fromEmailFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                } else {
+                  db.prepare(
+                    `INSERT INTO email_history (id, related_offer_id, offer_id, outbox_id, account_id, from_email, to_email, to_addr, subject, body, attachments_json, status, created_at, error, error_message, accepted_json, rejected_json, smtp_response, idempotency_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                  ).run(uuid(), offerIdValueFail, offerIdValueFail, row.id, row.account_id, fromEmailFail, toRecipientFail, toRecipientFail, row.subject, bodyValueFail, attachmentsJsonValueFail, statusFailed, now, errorMsgFail, errorMsgFail, acceptedJson, rejectedJson, smtpResponse, idempotencyKeyFail);
+                }
+              }
+            });
+            runTxHistoryFail();
+          } catch (historyErr) {
+            logger.error("[emailService] email_history insert failed (FAILED path, outbox already FAILED)", { outboxId: row.id, error: historyErr });
+          }
+        }
         failed++;
       } else {
         const nextAt = nextRetryAt(nextRetry);
         db.prepare(
-          "UPDATE email_outbox SET status = 'FAILED', retry_count = ?, next_retry_at = ?, last_error = ?, updated_at = ? WHERE id = ?"
+          "UPDATE email_outbox SET status = 'failed', retry_count = ?, next_retry_at = ?, last_error = ?, updated_at = ? WHERE id = ?"
         ).run(nextRetry, nextAt, result.error || null, now, row.id);
         failed++;
       }

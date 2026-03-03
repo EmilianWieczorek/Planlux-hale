@@ -90,6 +90,10 @@ export interface LogEmailPayload {
   pdfId?: string;
   sentAt: string | null;
   errorMessage?: string;
+  /** Nadawca (SMTP from). */
+  fromEmail?: string;
+  /** ID oferty powiązanej z e-mailem. */
+  offerId?: string;
 }
 
 export interface HeartbeatPayload {

@@ -14,7 +14,7 @@ import { getTestPdfFileName } from "./pdf/generatePdf";
 import { getPdfTemplateDir } from "./pdf/pdfPaths";
 import { createSendEmailForFlush } from "./smtpSend";
 import { sendEmail as sendSmtpEmail } from "./mail";
-import { parseRecipients } from "./emailService";
+import { parseRecipients, allowedEmailHistoryStatus } from "./emailService";
 import { createFilePdfTemplateConfigStore } from "./pdf/pdfTemplateConfigStore";
 import { getPreviewHtmlWithInlinedAssets } from "./pdf/renderTemplate";
 import { getNextOfferNumber as getNextOfferNumberLocal } from "./offerCounters";
@@ -116,6 +116,113 @@ function checkInternetNet(): Promise<boolean> {
       resolve(false);
     }
   });
+}
+
+/** Minimal DB for email history fetch (testable). */
+type EmailHistoryDb = {
+  prepare: (sql: string) => { all: (...args: unknown[]) => unknown[]; get: (...args: unknown[]) => unknown };
+};
+
+function mapEmailStatusForUi(s: string): string {
+  const u = String(s ?? "").toUpperCase();
+  if (u === "QUEUED") return "queued";
+  if (u === "SENT") return "sent";
+  if (u === "FAILED") return "failed";
+  return (s ?? "").toLowerCase() || s;
+}
+
+/** Zwraca listę e-maili dla oferty (historia + outbox QUEUED/FAILED bez duplikatów po outbox_id). Eksport do testów. */
+export function getEmailHistoryForOfferData(
+  db: EmailHistoryDb,
+  offerId: string,
+  logger: { warn: (m: string, e?: unknown) => void }
+): Array<{ id: string; fromEmail: string; toEmail: string; subject: string; body: string; status: string; sentAt: string | null; errorMessage: string | null; createdAt: string }> {
+  const emails: Array<{ id: string; fromEmail: string; toEmail: string; subject: string; body: string; status: string; sentAt: string | null; errorMessage: string | null; createdAt: string }> = [];
+  const seenIds = new Set<string>();
+  const outboxIdsInHistory = new Set<string>();
+
+  try {
+    const ehInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
+    const hasOfferId = ehInfo.some((c) => c.name === "offer_id");
+    const hasRelatedOfferId = ehInfo.some((c) => c.name === "related_offer_id");
+    const hasFromEmail = ehInfo.some((c) => c.name === "from_email");
+    const hasToEmail = ehInfo.some((c) => c.name === "to_email");
+    const hasToAddr = ehInfo.some((c) => c.name === "to_addr");
+    const hasOutboxId = ehInfo.some((c) => c.name === "outbox_id");
+    if (hasFromEmail || hasToEmail || hasToAddr) {
+      const whereClause = hasRelatedOfferId && hasOfferId
+        ? "(related_offer_id = ? OR offer_id = ?)"
+        : hasOfferId
+          ? "offer_id = ?"
+          : hasRelatedOfferId
+            ? "related_offer_id = ?"
+            : null;
+      if (whereClause) {
+        const args = whereClause.includes("OR") ? [offerId, offerId] : [offerId];
+        const historyCols = ["id", "from_email", "to_email", "to_addr", "subject", "body", "sent_at", "status", "error_message", "error", "created_at"];
+        if (hasOutboxId) historyCols.push("outbox_id");
+        const history = db.prepare(
+          `SELECT ${historyCols.join(", ")} FROM email_history WHERE ${whereClause} ORDER BY created_at DESC`
+        ).all(...args) as Array<Record<string, unknown>>;
+        for (const r of history) {
+          const id = String(r.id ?? "");
+          if (seenIds.has(id)) continue;
+          seenIds.add(id);
+          if (hasOutboxId && r.outbox_id) outboxIdsInHistory.add(String(r.outbox_id));
+          const toDisplay = String(r.to_email ?? r.to_addr ?? "");
+          emails.push({
+            id,
+            fromEmail: String(r.from_email ?? ""),
+            toEmail: toDisplay,
+            subject: String(r.subject ?? ""),
+            body: String(r.body ?? ""),
+            status: mapEmailStatusForUi(String(r.status ?? "")),
+            sentAt: r.sent_at ? String(r.sent_at) : null,
+            errorMessage: (r.error_message ?? r.error) ? String(r.error_message ?? r.error) : null,
+            createdAt: String(r.created_at ?? ""),
+          });
+        }
+      }
+    }
+  } catch (ehErr) {
+    logger.warn("[crm] getEmailHistoryForOffer email_history read failed", ehErr);
+  }
+
+  try {
+    const outboxInfo = db.prepare("PRAGMA table_info(email_outbox)").all() as Array<{ name: string }>;
+    const hasRelatedOfferIdOb = outboxInfo.some((c) => c.name === "related_offer_id");
+    if (hasRelatedOfferIdOb) {
+      const outboxRows = db.prepare(
+        "SELECT id, to_addr, subject, html_body, text_body, status, sent_at, last_error, created_at, account_user_id FROM email_outbox WHERE related_offer_id = ? AND status IN ('queued','failed') ORDER BY created_at DESC"
+      ).all(offerId) as Array<Record<string, unknown>>;
+      for (const r of outboxRows) {
+        const outboxId = String(r.id ?? "");
+        if (outboxIdsInHistory.has(outboxId)) continue;
+        if (seenIds.has(outboxId)) continue;
+        seenIds.add(outboxId);
+        const senderEmail = r.account_user_id
+          ? (db.prepare("SELECT email FROM users WHERE id = ?").get(r.account_user_id) as { email: string } | undefined)?.email ?? ""
+          : "";
+        const body = (r.html_body ?? r.text_body ?? "") as string;
+        emails.push({
+          id: outboxId,
+          fromEmail: senderEmail,
+          toEmail: String(r.to_addr ?? ""),
+          subject: String(r.subject ?? ""),
+          body: body.replace(/<[^>]+>/g, " ").trim(),
+          status: mapEmailStatusForUi(String(r.status ?? "")),
+          sentAt: r.sent_at ? String(r.sent_at) : null,
+          errorMessage: r.last_error ? String(r.last_error) : null,
+          createdAt: String(r.created_at ?? ""),
+        });
+      }
+    }
+  } catch (obErr) {
+    logger.warn("[crm] getEmailHistoryForOffer email_outbox read failed", obErr);
+  }
+
+  emails.sort((a, b) => (b.createdAt > a.createdAt ? 1 : b.createdAt < a.createdAt ? -1 : 0));
+  return emails;
 }
 
 export async function registerIpcHandlers(deps: {
@@ -1719,65 +1826,13 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: historia e-maili dla oferty. Źródła: email_history (legacy offer_id) + email_outbox (related_offer_id). */
+  /** CRM: historia e-maili dla oferty. Źródło: email_history (related_offer_id OR offer_id); outbox tylko QUEUED/FAILED, bez wpisów już w history (Set outbox_id). Statusy mapowane na lowercase w UI. */
   ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
       const db = getDb();
       if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
-      const emails: Array<{ id: string; fromEmail: string; toEmail: string; subject: string; body: string; status: string; sentAt: string | null; errorMessage: string | null; createdAt: string }> = [];
-      try {
-        const info = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string }>;
-        const hasOfferId = info.some((c) => c.name === "offer_id");
-        if (hasOfferId) {
-          const legacy = db.prepare(
-            "SELECT id, from_email, to_email, subject, body, sent_at, status, error_message, created_at FROM email_history WHERE offer_id = ? ORDER BY created_at DESC"
-          ).all(offerId) as Array<Record<string, unknown>>;
-          legacy.forEach((r) => {
-            emails.push({
-              id: String(r.id ?? ""),
-              fromEmail: String(r.from_email ?? ""),
-              toEmail: String(r.to_email ?? ""),
-              subject: String(r.subject ?? ""),
-              body: String(r.body ?? ""),
-              status: String(r.status ?? ""),
-              sentAt: r.sent_at ? String(r.sent_at) : null,
-              errorMessage: r.error_message ? String(r.error_message) : null,
-              createdAt: String(r.created_at ?? ""),
-            });
-          });
-        }
-      } catch {
-        /* legacy table may not exist or have different schema */
-      }
-      try {
-        const outboxInfo = db.prepare("PRAGMA table_info(email_outbox)").all() as Array<{ name: string }>;
-        const hasRelatedOfferId = outboxInfo.some((c) => c.name === "related_offer_id");
-        if (hasRelatedOfferId) {
-          const outbox = db.prepare(
-            "SELECT id, to_addr, subject, html_body, status, sent_at, last_error, created_at, account_user_id FROM email_outbox WHERE related_offer_id = ? ORDER BY created_at DESC"
-          ).all(offerId) as Array<Record<string, unknown>>;
-          for (const r of outbox) {
-            const senderEmail = r.account_user_id
-              ? (db.prepare("SELECT email FROM users WHERE id = ?").get(r.account_user_id) as { email: string } | undefined)?.email ?? ""
-              : "";
-            emails.push({
-              id: String(r.id ?? ""),
-              fromEmail: senderEmail,
-              toEmail: String(r.to_addr ?? ""),
-              subject: String(r.subject ?? ""),
-              body: String((r.html_body as string) ?? "").replace(/<[^>]+>/g, " ").trim(),
-              status: String(r.status ?? ""),
-              sentAt: r.sent_at ? String(r.sent_at) : null,
-              errorMessage: r.last_error ? String(r.last_error) : null,
-              createdAt: String(r.created_at ?? ""),
-            });
-          }
-        }
-      } catch {
-        /* outbox may use different column name */
-      }
-      emails.sort((a, b) => (b.createdAt > a.createdAt ? 1 : b.createdAt < a.createdAt ? -1 : 0));
+      const emails = getEmailHistoryForOfferData(db as EmailHistoryDb, offerId, logger);
       return { ok: true, emails };
     } catch (e) {
       logger.error("[crm] getEmailHistoryForOffer failed", e);
@@ -1944,22 +1999,6 @@ export async function registerIpcHandlers(deps: {
       const attachments = params.pdfPath ? [params.pdfPath] : [];
       const nowIso = new Date().toISOString();
 
-      db.prepare(
-        `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        emailId,
-        offerId,
-        user.id,
-        fromEmail,
-        toNormalized,
-        params.subject.trim() || "Oferta PLANLUX",
-        params.body.trim(),
-        JSON.stringify(attachments),
-        "queued",
-        nowIso
-      );
-
       const onlineRes = await (async () => {
         try {
           const res = await fetch("https://www.google.com", { method: "HEAD", mode: "no-cors" });
@@ -1973,9 +2012,21 @@ export async function registerIpcHandlers(deps: {
         const { getSmtpConfig, sendMail } = await import("./smtpSend");
         const creds = getSmtpConfig(fromEmail);
         if (!creds) {
-          db.prepare("UPDATE email_history SET status = 'failed', error_message = ? WHERE id = ?").run(
+          db.prepare(
+            `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, error_message, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            emailId,
+            offerId,
+            user.id,
+            fromEmail,
+            toNormalized,
+            params.subject.trim() || "Oferta PLANLUX",
+            params.body.trim(),
+            JSON.stringify(attachments),
+            allowedEmailHistoryStatus("failed"),
             "Skonfiguruj SMTP w ustawieniach (userData/smtp-config.json)",
-            emailId
+            nowIso
           );
           return { ok: false, error: "Skonfiguruj SMTP w ustawieniach" };
         }
@@ -1992,7 +2043,22 @@ export async function registerIpcHandlers(deps: {
           const rejected = (info.rejected ?? []).length > 0;
           const sent = accepted && !rejected;
           if (sent) {
-            db.prepare("UPDATE email_history SET status = 'sent', sent_at = ? WHERE id = ?").run(nowIso, emailId);
+            db.prepare(
+              `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, sent_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              emailId,
+              offerId,
+              user.id,
+              fromEmail,
+              toNormalized,
+              params.subject.trim() || "Oferta PLANLUX",
+              params.body.trim(),
+              JSON.stringify(attachments),
+              allowedEmailHistoryStatus("sent"),
+              nowIso,
+              nowIso
+            );
             db.prepare("UPDATE offers_crm SET status = 'SENT', emailed_at = ?, updated_at = ? WHERE id = ?").run(nowIso, nowIso, offerId);
             const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
             if (auditTables.length > 0) {
@@ -2008,17 +2074,62 @@ export async function registerIpcHandlers(deps: {
           const errMsg = rejected
             ? `SMTP odrzucił adresy: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
             : (info.response ?? "Serwer nie przyjął wiadomości");
-          db.prepare("UPDATE email_history SET status = 'failed', error_message = ? WHERE id = ?").run(errMsg, emailId);
+          db.prepare(
+            `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, error_message, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            emailId,
+            offerId,
+            user.id,
+            fromEmail,
+            toNormalized,
+            params.subject.trim() || "Oferta PLANLUX",
+            params.body.trim(),
+            JSON.stringify(attachments),
+            allowedEmailHistoryStatus("failed"),
+            errMsg,
+            nowIso
+          );
           logger.error("[email] send not accepted", { rejected: info.rejected, response: info.response });
           return { ok: false, error: errMsg };
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          db.prepare("UPDATE email_history SET status = 'failed', error_message = ? WHERE id = ?").run(msg, emailId);
+          db.prepare(
+            `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, error_message, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            emailId,
+            offerId,
+            user.id,
+            fromEmail,
+            toNormalized,
+            params.subject.trim() || "Oferta PLANLUX",
+            params.body.trim(),
+            JSON.stringify(attachments),
+            allowedEmailHistoryStatus("failed"),
+            msg,
+            nowIso
+          );
           logger.error("[email] send failed", e);
           return { ok: false, error: msg };
         }
       }
 
+      db.prepare(
+        `INSERT INTO email_history (id, offer_id, user_id, from_email, to_email, subject, body, attachments_json, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        emailId,
+        offerId,
+        user.id,
+        fromEmail,
+        toNormalized,
+        params.subject.trim() || "Oferta PLANLUX",
+        params.body.trim(),
+        JSON.stringify(attachments),
+        allowedEmailHistoryStatus("queued"),
+        nowIso
+      );
       const { generateOutboxId } = await import("@planlux/shared");
       const outboxId = generateOutboxId();
       db.prepare(
@@ -2777,10 +2888,10 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         logger.info("[email] resolved userId", { userId: effectiveUserId, account_user_id: senderUserId, accountId });
         try {
           db.transaction(() => {
-            const emailHistoryStatus = "sent";
-            const emailHistoryStatusFail = "failed";
-            const outboxStatusSuccess = "SENT";
-            const outboxStatusFail = "FAILED";
+            const emailHistoryStatus = allowedEmailHistoryStatus("sent");
+            const emailHistoryStatusFail = allowedEmailHistoryStatus("failed");
+            const outboxStatusSuccess = "sent";
+            const outboxStatusFail = "failed";
             const offerStatusSuccess = "SENT";
 
             const offerExists = db.prepare("SELECT id FROM offers_crm WHERE id = ?").get(resolvedOfferId);
@@ -2895,14 +3006,17 @@ console.log("[IPC] handler registered: planlux:checkInternet");
             }
           })();
           try {
+            const fromEmailForSheets = (account as { from_email?: string }).from_email ?? user.email ?? "";
             const logEmailPayload = {
               id: historyId,
               userId: user.id,
               userEmail: user.email,
               toEmail: to,
               subject,
-              status: "SENT" as const,
+              status: "sent" as const,
               sentAt: now,
+              fromEmail: fromEmailForSheets,
+              offerId: resolvedOfferId,
             };
             db.prepare(
               "INSERT INTO outbox (id, operation_type, payload_json, retry_count, max_retries) VALUES (?, 'LOG_EMAIL', ?, 0, 5)"
@@ -2920,9 +3034,10 @@ console.log("[IPC] handler registered: planlux:checkInternet");
               },
             }) as { processed: number; failed: number; firstError?: { code?: string; message: string; details?: unknown } };
             if (r.processed > 0 && !r.firstError) {
-              logger.info("[email] Logged to Sheets", logEmailPayload.id);
+              logger.info("[email] Logged to Sheets", { id: logEmailPayload.id, offerId: resolvedOfferId });
             }
             if (r.firstError) {
+              logger.warn("[email] Sheets logEmail failed (diagnostic)", { payloadId: logEmailPayload.id, offerId: resolvedOfferId, error: r.firstError });
               return { ok: true, sent: true, sheetsError: r.firstError };
             }
           } catch (logErr) {
@@ -2931,6 +3046,33 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         } catch (txErr) {
           const msg = txErr instanceof Error ? txErr.message : String(txErr);
           logger.error("[email] sendOfferEmail history/outbox transaction failed (mail already sent)", txErr);
+          const isCheckStatus = /CHECK constraint failed.*status|status IN \(.*sending|email_history.*status/i.test(msg);
+          if (isCheckStatus) {
+            try {
+              const tablesWithStatusCheck = db.prepare(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND (sql LIKE '%sending%' OR sql LIKE '%queued%')"
+              ).all() as Array<{ name: string; sql: string | null }>;
+              const allTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as Array<{ name: string }>;
+              if (process.env.NODE_ENV !== "production") {
+                logger.info("[schema][DEBUG] tables_with_status_check", JSON.stringify(tablesWithStatusCheck, null, 2));
+                logger.info("[schema][DEBUG] all_tables", JSON.stringify(allTables.map((r) => r.name)));
+              } else {
+                logger.warn("[schema][DEBUG] CHECK failed – tables_with_status_check (names only)", tablesWithStatusCheck.map((r) => r.name));
+                if (tablesWithStatusCheck.length > 0) {
+                  tablesWithStatusCheck.forEach((r) => logger.warn("[schema][DEBUG] CREATE " + r.name, r.sql ?? ""));
+                }
+              }
+            } catch (schemaErr) {
+              logger.warn("[schema][DEBUG] schema dump failed", schemaErr);
+            }
+            try {
+              const { runEmailHistoryUnifiedStep } = await import("./migrations/crmMigrations");
+              runEmailHistoryUnifiedStep(getDb() as Parameters<typeof runEmailHistoryUnifiedStep>[0], logger);
+              logger.info("[email] email_history schema repaired after CHECK constraint failure – spróbuj wysłać ponownie");
+            } catch (migErr) {
+              logger.warn("[email] runEmailHistoryUnifiedStep after CHECK failure", migErr);
+            }
+          }
           const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
           if (auditTables.length > 0) {
             try {
@@ -2939,7 +3081,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
               );
             } catch (_) {}
           }
-          const historyMsg = "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę.";
+          const historyMsg = "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę. Przy błędzie CHECK – tabela została naprawiona, wyślij e-mail ponownie.";
           return { ok: false, code: "ERR_HISTORY_WRITE", message: historyMsg, error: historyMsg, details: txErr instanceof Error ? txErr.stack : undefined };
         }
         return { ok: true, sent: true };
@@ -3006,15 +3148,18 @@ console.log("[IPC] handler registered: planlux:checkInternet");
           );
         }
         try {
+          const fromEmailFail = (account as { from_email?: string } | undefined)?.from_email ?? "";
           const logEmailPayload = {
             id: historyId,
             userId: user.id,
             userEmail: user.email,
             toEmail: to,
             subject,
-            status: "FAILED" as const,
+            status: "failed" as const,
             errorMessage: errMsg,
             sentAt: null,
+            fromEmail: fromEmailFail,
+            offerId: resolvedOfferId,
           };
           db.prepare(
             "INSERT INTO outbox (id, operation_type, payload_json, retry_count, max_retries) VALUES (?, 'LOG_EMAIL', ?, 0, 5)"
@@ -3155,6 +3300,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const result = await sendNow(db, outboxRow, logger);
       if (result.ok) {
         const now = new Date().toISOString();
+        const statusSent = allowedEmailHistoryStatus("sent");
         const acceptedJson = result.accepted != null ? JSON.stringify(result.accepted) : null;
         const rejectedJson = result.rejected != null ? JSON.stringify(result.rejected) : null;
         const smtpResponse = result.response ?? null;
@@ -3162,7 +3308,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const runTx = (db as unknown as { transaction: (fn: () => void) => () => void }).transaction(() => {
           db.prepare(
             `INSERT INTO email_outbox (id, account_id, account_user_id, to_addr, cc, bcc, subject, text_body, html_body, attachments_json, related_offer_id, status, retry_count, sent_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SENT', 0, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', 0, ?, ?, ?)`
           ).run(
             tempId,
             account.id,
@@ -3192,30 +3338,30 @@ console.log("[IPC] handler registered: planlux:checkInternet");
             if (!userId) throw new Error("[email] email_history.user_id required but userId is null (planlux:email:send)");
             if (hasToEmailSend && hasToAddrSend) {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             } else if (hasToEmailSend) {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_email, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_email, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             } else {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, user_id, from_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, userId, fromEmailSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             }
           } else {
             if (hasToEmailSend && hasToAddrSend) {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             } else if (hasToEmailSend) {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_email, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_email, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             } else {
               db.prepare(
-                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?)"
-              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, subject, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
+                "INSERT INTO email_history (id, outbox_id, account_id, from_email, to_addr, subject, status, provider_message_id, accepted_json, rejected_json, smtp_response, sent_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).run(historyId, tempId, account.id, fromEmailSend, toRecipientSend, subject, statusSent, result.messageId || null, acceptedJson, rejectedJson, smtpResponse, now, now);
             }
           }
         });
@@ -3262,7 +3408,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (!row) return { ok: false, error: "Pozycja nie znaleziona" };
       const canRetry = user.role === "ADMIN" || user.role === "BOSS" || row.account_user_id === user.id;
       if (!canRetry) return { ok: false, error: "Forbidden" };
-      db.prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'QUEUED', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
+      db.prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'queued', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
       return { ok: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
@@ -3279,6 +3425,47 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       return { ok: false, error: e instanceof Error ? e.message : String(e), items: [] };
+    }
+  });
+
+  /** Debug: PRAGMA table_info + last 20 rows dla email_history i email_outbox + schema version flags (diagnostyka użytkowników). */
+  ipcMain.handle("planlux:debugEmailTables", async () => {
+    try {
+      requireAuth();
+      const db = getDb();
+      let emailHistoryInfo: Array<{ name: string; type: string }> = [];
+      let emailOutboxInfo: Array<{ name: string; type: string }> = [];
+      let lastHistory: Record<string, unknown>[] = [];
+      let lastOutbox: Record<string, unknown>[] = [];
+      let createHistory: { sql: string } | undefined;
+      let createOutbox: { sql: string } | undefined;
+      try {
+        emailHistoryInfo = db.prepare("PRAGMA table_info(email_history)").all() as Array<{ name: string; type: string }>;
+        createHistory = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='email_history'").get() as { sql: string } | undefined;
+        lastHistory = db.prepare("SELECT * FROM email_history ORDER BY created_at DESC LIMIT 20").all() as Record<string, unknown>[];
+      } catch {
+        // table may not exist
+      }
+      try {
+        emailOutboxInfo = db.prepare("PRAGMA table_info(email_outbox)").all() as Array<{ name: string; type: string }>;
+        createOutbox = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='email_outbox'").get() as { sql: string } | undefined;
+        lastOutbox = db.prepare("SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT 20").all() as Record<string, unknown>[];
+      } catch {
+        // table may not exist
+      }
+      const statusHistoryLower = (createHistory?.sql ?? "").includes("'queued'");
+      const statusOutboxUpper = (createOutbox?.sql ?? "").includes("'QUEUED'");
+      return {
+        ok: true,
+        email_history: { table_info: emailHistoryInfo, last20: lastHistory, createSql: createHistory?.sql ?? null },
+        email_outbox: { table_info: emailOutboxInfo, last20: lastOutbox, createSql: createOutbox?.sql ?? null },
+        schemaFlags: {
+          email_history_status_lowercase: statusHistoryLower,
+          email_outbox_status_uppercase: statusOutboxUpper,
+        },
+      };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 }

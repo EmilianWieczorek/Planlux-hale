@@ -3,7 +3,27 @@
  * @vitest-environment node
  */
 import { describe, it, expect, vi } from "vitest";
-import { enqueueEmail, parseRecipients } from "./emailService";
+import { enqueueEmail, parseRecipients, allowedEmailHistoryStatus, ALLOWED_EMAIL_HISTORY_STATUSES } from "./emailService";
+
+describe("allowedEmailHistoryStatus", () => {
+  it("returns only queued, sent, or failed", () => {
+    expect(ALLOWED_EMAIL_HISTORY_STATUSES).toEqual(["queued", "sent", "failed"]);
+  });
+  it("accepts queued, sent, failed as-is", () => {
+    expect(allowedEmailHistoryStatus("queued")).toBe("queued");
+    expect(allowedEmailHistoryStatus("sent")).toBe("sent");
+    expect(allowedEmailHistoryStatus("failed")).toBe("failed");
+  });
+  it("never returns sending; maps sending to queued", () => {
+    expect(allowedEmailHistoryStatus("sending")).toBe("queued");
+    expect(allowedEmailHistoryStatus("SENDING")).toBe("queued");
+  });
+  it("maps unknown or empty to queued", () => {
+    expect(allowedEmailHistoryStatus("")).toBe("queued");
+    expect(allowedEmailHistoryStatus("x")).toBe("queued");
+    expect(allowedEmailHistoryStatus(null)).toBe("queued");
+  });
+});
 
 describe("parseRecipients", () => {
   it("splits by space into separate addresses", () => {
@@ -43,7 +63,7 @@ describe("emailService", () => {
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
     expect(db.prepare).toHaveBeenCalledWith(
-      expect.stringMatching(/INSERT INTO email_outbox.*QUEUED/)
+      expect.stringMatching(/INSERT INTO email_outbox.*queued/)
     );
     expect(run).toHaveBeenCalled();
   });
