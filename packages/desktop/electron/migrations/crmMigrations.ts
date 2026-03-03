@@ -222,6 +222,7 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
   }
 
   // 6. smtp_accounts – konfiguracja SMTP (pełna tabela z user_id). Idempotentna.
+  // SMTP password is not stored here; it is encrypted using OS-level encryption (Electron safeStorage) in secureStore.
   if (!hasTable(database, "smtp_accounts")) {
     database.exec(`
       CREATE TABLE smtp_accounts (

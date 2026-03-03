@@ -3,6 +3,12 @@ productName: Planlux Hale
 electronVersion: "28.0.0"
 directories:
   output: release
+files:
+  - "dist/**/*"
+  - "dist-electron/**/*"
+  - "build/icon.ico"
+  - "node_modules/**/*"
+  - "package.json"
 
 # Produkcyjna konfiguracja
 asar: true
@@ -23,11 +29,14 @@ win:
     - target: nsis
       arch:
         - x64
+  icon: build/icon.ico
   signingHashAlgorithms:
     - sha256
   # Opcjonalne: certyfikat .pfx (CSC_LINK, CSC_KEY_PASSWORD)
 
 nsis:
   oneClick: false
+  perMachine: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
+  createStartMenuShortcut: true

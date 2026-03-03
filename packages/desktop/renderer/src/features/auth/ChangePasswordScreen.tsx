@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { tokens } from "../../theme/tokens";
 
+const MIN_PASSWORD_LENGTH = 8;
+
 const styles = {
   root: {
     minHeight: "100vh",
@@ -35,6 +37,7 @@ const styles = {
     borderRadius: tokens.radius.md,
     fontSize: tokens.font.size.base,
     marginBottom: tokens.space[4],
+    boxSizing: "border-box" as const,
   } as React.CSSProperties,
   button: {
     width: "100%",
@@ -55,23 +58,32 @@ const styles = {
 };
 
 interface Props {
-  onLogin: (email: string, password: string) => Promise<boolean>;
+  user: { id: string; email: string; role: string; displayName?: string };
+  onChangePassword: (newPassword: string) => Promise<void>;
 }
 
-export function LoginScreen({ onLogin }: Props) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+export function ChangePasswordScreen({ user, onChangePassword }: Props) {
+  const [newPassword, setNewPassword] = useState("");
+  const [repeatPassword, setRepeatPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setError(`Hasło musi mieć co najmniej ${MIN_PASSWORD_LENGTH} znaków`);
+      return;
+    }
+    if (newPassword !== repeatPassword) {
+      setError("Hasła nie są identyczne");
+      return;
+    }
     setLoading(true);
     try {
-      await onLogin(email, password);
+      await onChangePassword(newPassword);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Nie udało się zalogować");
+      setError(e instanceof Error ? e.message : "Nie udało się zmienić hasła");
     } finally {
       setLoading(false);
     }
@@ -80,27 +92,33 @@ export function LoginScreen({ onLogin }: Props) {
   return (
     <div style={styles.root}>
       <form style={styles.card} onSubmit={handleSubmit}>
-        <h1 style={styles.title}>Planlux Hale</h1>
-        <p style={styles.subtitle}>Zaloguj się, aby kontynuować</p>
+        <h1 style={styles.title}>Zmień hasło</h1>
+        <p style={styles.subtitle}>
+          Twoje konto wymaga ustawienia nowego hasła przed wejściem do aplikacji.
+        </p>
         {error && <p style={styles.error}>{error}</p>}
         <input
-          type="email"
-          placeholder="E-mail"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          type="password"
+          placeholder="Nowe hasło (min. 8 znaków)"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
           style={styles.input}
           required
+          minLength={MIN_PASSWORD_LENGTH}
+          autoComplete="new-password"
         />
         <input
           type="password"
-          placeholder="Hasło"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Powtórz hasło"
+          value={repeatPassword}
+          onChange={(e) => setRepeatPassword(e.target.value)}
           style={styles.input}
           required
+          minLength={MIN_PASSWORD_LENGTH}
+          autoComplete="new-password"
         />
         <button type="submit" style={styles.button} disabled={loading}>
-          {loading ? "Logowanie..." : "Zaloguj się"}
+          {loading ? "Zapisywanie..." : "Zapisz hasło i kontynuuj"}
         </button>
       </form>
     </div>

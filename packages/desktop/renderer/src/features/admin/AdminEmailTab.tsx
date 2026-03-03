@@ -136,10 +136,19 @@ export function AdminEmailTab({ api }: Props) {
     }
   }, [api]);
 
+  /** Handlowiec = role stored in DB as HANDLOWIEC (or legacy SALESPERSON). */
+  const isHandlowiecRole = (role: string) =>
+    (role ?? "").toUpperCase() === "HANDLOWIEC" || (role ?? "").toUpperCase() === "SALESPERSON";
+
   const loadUsers = useCallback(async () => {
     const r = (await api("planlux:getUsers")) as { ok: boolean; users?: UserRow[] };
-    if (r.ok && r.users) setUsers(r.users.filter((u) => u.role === "SALESPERSON" && u.active));
-    else setUsers([]);
+    if (r.ok && r.users) {
+      const handlowcy = r.users.filter((u) => isHandlowiecRole(u.role) && u.active);
+      setUsers(handlowcy);
+      console.log("SMTP HANDLOWCY:", handlowcy);
+    } else {
+      setUsers([]);
+    }
   }, [api]);
 
   const loadAccounts = useCallback(async () => {
@@ -338,7 +347,7 @@ export function AdminEmailTab({ api }: Props) {
         <div style={styles.card}>
           <h2 style={styles.h2}>SMTP per handlowiec</h2>
           {users.length === 0 ? (
-            <Typography color="text.secondary">Brak handlowców (rola SALESPERSON).</Typography>
+            <Typography color="text.secondary">Brak handlowców (rola Handlowiec).</Typography>
           ) : (
             <Table size="small">
               <TableHead>
@@ -370,25 +379,63 @@ export function AdminEmailTab({ api }: Props) {
                       </TableCell>
                       <TableCell align="right">
                         {acc && (
-                          <IconButton
-                            size="small"
-                            onClick={async () => {
-                              setTesting(true);
-                              try {
-                                const r = (await api("planlux:smtp:testForUser", u.id)) as { ok: boolean; error?: string };
-                                if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
-                                else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
-                              } catch (e) {
-                                setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
-                              } finally {
-                                setTesting(false);
-                              }
-                            }}
-                            disabled={testing}
-                            title="Test połączenia"
-                          >
-                            <Refresh fontSize="small" />
-                          </IconButton>
+                          <>
+                            <IconButton
+                              size="small"
+                              onClick={async () => {
+                                setTesting(true);
+                                try {
+                                  const r = (await api("planlux:smtp:testForUser", u.id)) as { ok: boolean; error?: string };
+                                  if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
+                                  else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
+                                } catch (e) {
+                                  setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
+                                } finally {
+                                  setTesting(false);
+                                }
+                              }}
+                              disabled={testing}
+                              title="Test połączenia"
+                            >
+                              <Refresh fontSize="small" />
+                            </IconButton>
+                            {import.meta.env.DEV && acc.hasPassword && (
+                              <IconButton
+                                size="small"
+                                onClick={async () => {
+                                  try {
+                                    const r = (await api("planlux:smtp:clearPasswordForUser", { userId: u.id })) as {
+                                      ok: boolean;
+                                      error?: string;
+                                    };
+                                    if (r.ok) {
+                                      setSnackbar({
+                                        open: true,
+                                        message: "Hasło SMTP zresetowane. Wprowadź nowe przed testem/wysyłką.",
+                                        severity: "success",
+                                      });
+                                      loadAccounts();
+                                    } else {
+                                      setSnackbar({
+                                        open: true,
+                                        message: r.error ?? "Błąd resetu hasła SMTP",
+                                        severity: "error",
+                                      });
+                                    }
+                                  } catch (e) {
+                                    setSnackbar({
+                                      open: true,
+                                      message: e instanceof Error ? e.message : "Błąd resetu hasła SMTP",
+                                      severity: "error",
+                                    });
+                                  }
+                                }}
+                                title="Reset SMTP Password (DEV)"
+                              >
+                                <Refresh fontSize="small" />
+                              </IconButton>
+                            )}
+                          </>
                         )}
                         <IconButton size="small" onClick={() => openSmtpForm(u, acc)} title="Konfiguruj SMTP">
                           <Edit fontSize="small" />

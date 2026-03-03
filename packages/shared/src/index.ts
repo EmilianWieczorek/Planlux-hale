@@ -76,6 +76,16 @@ export {
   EMAIL_HISTORY_STATUSES,
   OUTBOX_OPERATION_TYPES,
 } from "./constants";
+export {
+  canAccessAdminPanel,
+  canManageUsers,
+  canManageSystemSettings,
+  canViewReports,
+  canUseSalesFeatures,
+  normalizeRole as normalizeRoleRbac,
+  ROLES,
+} from "./rbac";
+export type { Role } from "./rbac";
 export type { OfferStatusValue, UserRoleValue, EmailHistoryStatusValue } from "./constants";
 
 export {

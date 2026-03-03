@@ -31,6 +31,7 @@ import {
 import { ContentCopy, Lock } from "@mui/icons-material";
 import { DuplicateOffersModal, type DuplicateOffer } from "./DuplicateOffersModal";
 import { AddonsPanel } from "./AddonsPanel";
+import { EmailComposer } from "../oferty/EmailComposer";
 
 const defaultVariants = [
   { id: "T18_T35_DACH", name: "Hala T-18 + T-35 dach" },
@@ -161,6 +162,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const [generating, setGenerating] = useState(false);
   const [syncStatus, setSyncStatus] = useState<"offline" | "synced" | "unchanged" | "error" | null>(null);
   const [lastPdfPath, setLastPdfPath] = useState<string | null>(null);
+  const [lastPdfFileName, setLastPdfFileName] = useState<string | null>(null);
+  const [emailComposerOpen, setEmailComposerOpen] = useState(false);
+  const [emailPreview, setEmailPreview] = useState<{ subject: string; body: string; officeCcDefault: boolean; officeCcEmail: string } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [previewPdfBase64, setPreviewPdfBase64] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -531,6 +535,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     const pdfRes = (await api("pdf:generate", payload, undefined, undefined, draft.pdfOverrides && Object.keys(draft.pdfOverrides).length > 0 ? draft.pdfOverrides : undefined)) as { ok: boolean; pdfId?: string; filePath?: string; fileName?: string; error?: string };
     if (pdfRes.ok) {
       if (pdfRes.filePath) setLastPdfPath(pdfRes.filePath);
+      if (pdfRes.fileName) setLastPdfFileName(pdfRes.fileName);
       showToast(`PDF zapisany: ${pdfRes.fileName ?? ""}`);
       actions.addPdfHistory(pdfRes.fileName ?? "oferta.pdf");
       actions.lockOfferNumber();
@@ -583,6 +588,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
 
   const dimensionsPreview = [widthM, lengthM].filter(Boolean).join(" × ");
   const addonsCount = addons.reduce((s, a) => s + a.ilosc, 0);
+  /** Shown only after PDF generation succeeds (doGeneratePdf sets lastPdfPath). */
+  const hasGeneratedPdf = Boolean(lastPdfPath?.trim());
 
   return (
     <div style={styles.grid}>
@@ -957,25 +964,55 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <button onClick={generatePdf} disabled={generating || !result?.success} style={styles.button}>
               {generating ? "Generowanie..." : "Generuj PDF"}
             </button>
-            {lastPdfPath && (
+            {hasGeneratedPdf && (
               <>
                 <button
-                  onClick={() => api("shell:openPath", lastPdfPath)}
+                  onClick={() => api("shell:openPath", lastPdfPath!)}
                   style={styles.buttonSecondary}
                 >
                   Otwórz PDF
                 </button>
                 <button
-                  onClick={() => api("shell:showItemInFolder", lastPdfPath)}
+                  onClick={() => api("shell:showItemInFolder", lastPdfPath!)}
                   style={styles.buttonSecondary}
                 >
                   Otwórz folder
                 </button>
+                {draft.draftId && (
+                  <button
+                    onClick={async () => {
+                      setEmailComposerOpen(true);
+                      const prev = (await api("planlux:email:getOfferEmailPreview", draft.draftId)) as {
+                        ok: boolean;
+                        subject?: string;
+                        bodyHtml?: string;
+                        bodyText?: string;
+                        officeCcDefault?: boolean;
+                        officeCcEmail?: string;
+                      };
+                      if (prev.ok) {
+                        setEmailPreview({
+                          subject: prev.subject ?? `Oferta Planlux – ${draft.offerNumber ?? ""}`,
+                          body: (prev.bodyText ?? prev.bodyHtml ?? "").replace(/<[^>]+>/g, "\n"),
+                          officeCcDefault: prev.officeCcDefault ?? true,
+                          officeCcEmail: prev.officeCcEmail ?? "biuro@planlux.pl",
+                        });
+                      } else {
+                        setEmailPreview({
+                          subject: `Oferta Planlux – ${draft.offerNumber ?? ""}`,
+                          body: `Szanowni Państwo,\n\nW załączeniu przesyłam ofertę ${draft.offerNumber ?? ""}.\n\nPozdrawiam`,
+                          officeCcDefault: true,
+                          officeCcEmail: "biuro@planlux.pl",
+                        });
+                      }
+                    }}
+                    style={styles.buttonSecondary}
+                  >
+                    Wyślij e-mail
+                  </button>
+                )}
               </>
             )}
-            <button style={styles.buttonSecondary} disabled>
-              Wyślij e-mail (wkrótce)
-            </button>
           </div>
         </div>
         <div style={{ flex: 1, minHeight: 480 }}>
@@ -1008,6 +1045,47 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         onCancel={() => {
           setDuplicateModal({ open: false, duplicates: [] });
           pendingPdfGenerateRef.current = null;
+        }}
+      />
+      <EmailComposer
+        open={emailComposerOpen}
+        onClose={() => setEmailComposerOpen(false)}
+        defaultTo={clientEmail ?? ""}
+        defaultSubject={emailPreview?.subject ?? `Oferta Planlux – ${draft.offerNumber ?? ""}`}
+        defaultBody={emailPreview?.body ?? `Szanowni Państwo,\n\nW załączeniu przesyłam ofertę ${draft.offerNumber ?? ""}.\n\nPozdrawiam`}
+        officeCcDefault={emailPreview?.officeCcDefault ?? true}
+        officeCcEmail={emailPreview?.officeCcEmail ?? "biuro@planlux.pl"}
+        pdfPath={lastPdfPath}
+        pdfFileName={lastPdfFileName ?? undefined}
+        onSend={async (p) => {
+          const res = (await api("planlux:email:sendOfferEmail", {
+            offerId: draft.draftId,
+            to: p.to,
+            ccOfficeEnabled: p.ccOfficeEnabled,
+            subjectOverride: p.subject || undefined,
+            bodyOverride: p.body ? p.body.replace(/\n/g, "<br>") : undefined,
+          })) as {
+            ok: boolean;
+            sent?: boolean;
+            queued?: boolean;
+            error?: string;
+            code?: string;
+            message?: string;
+            sheetsError?: { code?: string; message: string; details?: unknown };
+          };
+          if (res.ok) showToast(res.queued ? "E-mail dodany do kolejki." : "E-mail wysłany.");
+          const messageByCode: Record<string, string> = {
+            ERR_NO_TO: "Podaj adres e-mail odbiorcy.",
+            ERR_NO_USER: "Brak użytkownika (user_id) – nie można zapisać historii e-mail.",
+            ERR_NO_ATTACHMENT: "Brak załącznika PDF. Wygeneruj PDF oferty przed wysłaniem.",
+            ERR_AUTH: "Błąd autoryzacji SMTP. Sprawdź ustawienia konta e-mail w Panelu admina.",
+            ERR_TIMEOUT: "Przekroczono limit czasu połączenia. Sprawdź internet i spróbuj ponownie.",
+            ERR_HISTORY_WRITE: "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę.",
+          };
+          const friendlyError = !res.ok
+            ? ((res as { message?: string }).message ?? (res.code && messageByCode[res.code] ? messageByCode[res.code] : res.error))
+            : undefined;
+          return { ...res, error: friendlyError };
         }}
       />
       {toast && (

@@ -6,7 +6,7 @@
 import { net } from "electron";
 import nodemailer from "nodemailer";
 import type Mail from "nodemailer/lib/mailer";
-import { getPassword, getSmtpPassword } from "./secureStore";
+import { getPassword, getSmtpPassword, getSmtpKeytarAccountKey } from "./secureStore";
 
 /**
  * Parse "To" field: comma, semicolon, space, newline.
@@ -140,6 +140,22 @@ function getAccountById(db: Db, accountId: string): SmtpAccountRow | null {
 }
 
 /**
+ * Normalize port + secure for Cyberfolks/typical SMTP:
+ * - 465 → secure true (implicit SSL)
+ * - 587 → secure false (STARTTLS)
+ * - If secure=true and port=587 → fix to secure=false
+ */
+export function normalizeSmtpPortSecure(port: number, secure: boolean): { port: number; secure: boolean } {
+  const p = Number(port) || 587;
+  let s = secure;
+  if (p === 465) s = true;
+  if (p === 587) s = false;
+  if (p === 25) s = false;
+  if (s === true && p === 587) s = false;
+  return { port: p, secure: s };
+}
+
+/**
  * Validate port + secure for SMTP (avoids WRONG_VERSION_NUMBER / TLS mismatch).
  * - 587 → STARTTLS, secure must be false
  * - 465 → implicit SSL, secure must be true
@@ -172,31 +188,112 @@ function getAccountForOutboxRow(db: Db, row: EmailOutboxRow): SmtpAccountRow | n
   return getDefaultAccount(db);
 }
 
-export async function buildTransport(
+export type BuildTransportOverrides = { port?: number; secure?: boolean } | undefined;
+
+/** Single source: fetch password from keytar for the account. Used by BOTH send and test. No cache. */
+export async function getCredentialsForAccount(
   db: Db,
   account: SmtpAccountRow
-): Promise<nodemailer.Transporter> {
-  const port = Number(account.port) || 587;
-  const secure = account.secure === 1;
-  validateSmtpPortSecure(port, secure);
+): Promise<{ account: SmtpAccountRow; password: string }> {
+  const keytarLookupId = account.user_id ?? account.id;
   const pass = account.user_id
     ? await getSmtpPassword(account.user_id)
     : await getPassword(account.id);
   if (!pass) throw new Error(`Brak hasła SMTP dla konta: ${account.name || account.from_email}`);
-  return nodemailer.createTransport({
+  const selectedUserEmail = (account.from_email || "").trim() || "(brak from_email)";
+  const keytarAccountKeyUsed = getSmtpKeytarAccountKey(keytarLookupId);
+  let port = Number(account.port) || 587;
+  let secure = account.secure === 1;
+  const normalized = normalizeSmtpPortSecure(port, secure);
+  port = normalized.port;
+  secure = normalized.secure;
+  console.log("KEYTAR ENTRY:", selectedUserEmail, "passLength:", pass.length);
+  console.log("[smtp] credentials (single source)", {
+    selectedUserEmail,
+    keytarAccountKeyUsed,
+    passLength: pass.length,
     host: account.host,
     port,
     secure,
-    auth: { user: account.auth_user || account.from_email, pass },
+  });
+  return { account, password: pass };
+}
+
+/**
+ * Build transporter from account + password. Same function used by send AND test.
+ * auth.user = full email (from_email). from in mail must equal auth.user.
+ */
+export function buildTransportFromConfig(
+  account: SmtpAccountRow,
+  password: string,
+  overrides?: BuildTransportOverrides
+): nodemailer.Transporter {
+  let port = Number(account.port) || 587;
+  let secure = account.secure === 1;
+  if (overrides?.port != null) port = overrides.port;
+  if (overrides?.secure !== undefined) secure = overrides.secure;
+  const normalized = normalizeSmtpPortSecure(port, secure);
+  port = normalized.port;
+  secure = normalized.secure;
+  validateSmtpPortSecure(port, secure);
+
+  const user = getSmtpAuthUser(account);
+  if (!user) throw new Error("SMTP: brak adresu e-mail (auth.user / from_email).");
+
+  return nodemailer.createTransport({
+    host: account.host.trim(),
+    port,
+    secure,
+    auth: { user, pass: password },
     ...(isDev() ? { tls: { rejectUnauthorized: false } } : {}),
   });
 }
 
+/**
+ * Fetch credentials from keytar (no cache) and build transporter. Used by both send and test.
+ */
+export async function buildTransport(
+  db: Db,
+  account: SmtpAccountRow,
+  overrides?: BuildTransportOverrides
+): Promise<nodemailer.Transporter> {
+  const { account: acc, password } = await getCredentialsForAccount(db, account);
+  return buildTransportFromConfig(acc, password, overrides);
+}
+
+/** Pełny e-mail do logowania SMTP (auth.user). Musi być równy from w wiadomości. */
+export function getSmtpAuthUser(account: SmtpAccountRow): string {
+  const fromEmail = (account.from_email || "").trim().toLowerCase();
+  const authUserRaw = (account.auth_user || "").trim() || fromEmail;
+  return authUserRaw.includes("@") ? authUserRaw : fromEmail;
+}
+
 /** Build transporter for a user (per-user SMTP). */
-export async function buildTransportForUser(db: Db, userId: string): Promise<nodemailer.Transporter> {
+export async function buildTransportForUser(db: Db, userId: string, overrides?: BuildTransportOverrides): Promise<nodemailer.Transporter> {
   const account = getAccountByUserId(db, userId);
   if (!account) throw new Error(`Brak konfiguracji SMTP dla użytkownika`);
-  return buildTransport(db, account);
+  return buildTransport(db, account, overrides);
+}
+
+/**
+ * Wywołuje transporter.verify(). Przy błędzie loguje pełny stack i response serwera.
+ */
+export async function verifyTransport(
+  transporter: nodemailer.Transporter,
+  logger: { error: (m: string, e?: unknown) => void }
+): Promise<{ ok: true } | { ok: false; needFallback: boolean; error: string; stack?: string; response?: string }> {
+  try {
+    await transporter.verify();
+    return { ok: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const stack = e instanceof Error ? e.stack : undefined;
+    const response = e && typeof e === "object" && "response" in e ? String((e as { response?: string }).response) : undefined;
+    const code = e && typeof e === "object" && "code" in e ? (e as { code?: string }).code : undefined;
+    logger.error("[smtp] verify failed – full error stack", { message: msg, stack, response, code });
+    const needFallback = /535|authentication|ECONNREFUSED|ETIMEDOUT|WRONG_VERSION|ENOTFOUND/i.test(msg);
+    return { ok: false, needFallback, error: msg, stack, response };
+  }
 }
 
 const TEMPLATE_PLACEHOLDERS = [
@@ -298,9 +395,10 @@ export async function sendOfferEmailNow(
     subject: params.subject,
   });
   const transporter = await buildTransport(db, account);
+  const authUser = getSmtpAuthUser(account);
   const from = account.from_name
-    ? `"${account.from_name.replace(/"/g, '\\"')}" <${account.from_email}>`
-    : account.from_email;
+    ? `"${account.from_name.replace(/"/g, '\\"')}" <${authUser}>`
+    : authUser;
   const text = params.bodyText ?? (params.bodyHtml ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   const html = params.bodyHtml ?? (params.bodyText ?? "").replace(/\n/g, "<br>");
   const mailOptions: Mail.Options = {
@@ -347,6 +445,27 @@ export async function sendOfferEmailNow(
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    const port = Number(account.port) || 587;
+    if ((port === 465 && /535|authentication|ECONNREFUSED|WRONG_VERSION/i.test(msg)) || false) {
+      logger.info("[emailService] sendOfferEmailNow fallback: port 587 (STARTTLS)");
+      const transporterFallback = await buildTransport(db, account, { port: 587, secure: false });
+      try {
+        const info = await transporterFallback.sendMail(mailOptions);
+        const accepted = (info.accepted ?? []).length > 0;
+        const rejected = (info.rejected ?? []).length > 0;
+        if (accepted && !rejected) {
+          return {
+            ok: true,
+            messageId: info.messageId as string,
+            accepted: info.accepted as string[],
+            rejected: info.rejected as string[],
+            response: typeof info.response === "string" ? info.response : undefined,
+          };
+        }
+      } catch (_) {
+        /* fall through to original error */
+      }
+    }
     logger.error("[emailService] sendOfferEmailNow failed", e);
     return { ok: false, error: msg };
   }
@@ -372,9 +491,10 @@ export async function sendNow(
     subject: outboxItem.subject,
   });
   const transporter = await buildTransport(db, account);
+  const authUser = getSmtpAuthUser(account);
   const from = account.from_name
-    ? `"${account.from_name.replace(/"/g, '\\"')}" <${account.from_email}>`
-    : account.from_email;
+    ? `"${account.from_name.replace(/"/g, '\\"')}" <${authUser}>`
+    : authUser;
   const mailOptions: Mail.Options = {
     from,
     to: outboxItem.to_addr,
@@ -430,6 +550,33 @@ export async function sendNow(
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (port === 465 && /535|authentication|ECONNREFUSED|WRONG_VERSION/i.test(msg)) {
+      logger.info("[emailService] sendNow fallback: port 587 (STARTTLS)");
+      try {
+        const transporterFallback = await buildTransport(db, account, { port: 587, secure: false });
+        const info = await transporterFallback.sendMail(mailOptions);
+        const accepted = (info.accepted ?? []).length > 0;
+        const rejected = (info.rejected ?? []).length > 0;
+        const sent = accepted && !rejected;
+        if (sent) {
+          const now = new Date().toISOString();
+          db.prepare("UPDATE email_outbox SET sent_at = ? WHERE id = ?").run(now, outboxItem.id);
+          return {
+            ok: true,
+            messageId: info.messageId as string,
+            accepted: info.accepted as string[],
+            rejected: info.rejected as string[],
+            response: typeof info.response === "string" ? info.response : undefined,
+          };
+        }
+        const errMsg = rejected
+          ? `SMTP odrzucił: ${(info.rejected ?? []).join(", ")}${info.response ? `; ${info.response}` : ""}`
+          : (info.response ?? "Serwer nie przyjął wiadomości");
+        return { ok: false, error: errMsg, messageId: info.messageId as string | undefined, accepted: info.accepted as string[] | undefined, rejected: info.rejected as string[] | undefined, response: typeof info.response === "string" ? info.response : undefined };
+      } catch (_) {
+        /* fall through */
+      }
+    }
     logger.error("[emailService] sendNow failed", e);
     return { ok: false, error: msg };
   }

@@ -58,15 +58,14 @@ function serializeError(err: unknown): { message: string; code: string | null; r
   };
 }
 
-const ALLOWED_ROLES = ["ADMIN", "BOSS", "SALESPERSON"] as const;
+const ALLOWED_ROLES = ["ADMIN", "SZEF", "HANDLOWIEC"] as const;
 type AllowedRole = (typeof ALLOWED_ROLES)[number];
 
 function normalizeRole(input: string): AllowedRole {
   const r = (input ?? "").trim().toUpperCase();
   if (r === "ADMIN") return "ADMIN";
-  if (r === "BOSS" || r === "MANAGER" || r === "SZEF") return "BOSS";
-  if (r === "SALESPERSON" || r === "USER" || r === "HANDLOWIEC") return "SALESPERSON";
-  return "SALESPERSON";
+  if (r === "SZEF" || r === "BOSS" || r === "MANAGER") return "SZEF";
+  return "HANDLOWIEC";
 }
 
 function hashPassword(password: string): string {
@@ -241,7 +240,7 @@ export async function registerIpcHandlers(deps: {
       }
       const db = getDb();
       const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(email.trim().toLowerCase()) as
-        | { id: string; email: string; role: string; password_hash: string; display_name: string }
+        | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
         | undefined;
       if (!row || !verifyPassword(password, row.password_hash)) {
         return { ok: false, error: "Nieprawidłowy email lub hasło" };
@@ -257,14 +256,38 @@ export async function registerIpcHandlers(deps: {
       db.prepare(
         "INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)"
       ).run(sessionId, row.id, config.appVersion);
+      const mustChangePassword = row.must_change_password === 1;
       return {
         ok: true,
         user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
         sessionId,
+        mustChangePassword: mustChangePassword ?? false,
       };
     } catch (e) {
       logger.error("login failed", e);
       return { ok: false, error: String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:changePassword", async (_, newPassword: string) => {
+    try {
+      const user = requireAuth();
+      if (typeof newPassword !== "string" || newPassword.length < 8) {
+        return { ok: false, error: "Hasło musi mieć co najmniej 8 znaków" };
+      }
+      const db = getDb();
+      const hash = hashPassword(newPassword);
+      db.prepare(
+        "UPDATE users SET password_hash = ?, must_change_password = 0, password_set_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+      ).run(hash, user.id);
+      logger.info("[auth] changePassword", { userId: user.id });
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        return { ok: false, error: e.message };
+      }
+      logger.error("[auth] changePassword failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 
@@ -472,7 +495,7 @@ export async function registerIpcHandlers(deps: {
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='activity'").all() as Array<{ name: string }>;
       if (tables.length === 0) return { ok: true, data: [] };
-      const showAll = options?.all === true && (user.role === "ADMIN" || user.role === "BOSS");
+      const showAll = options?.all === true && (user.role === "ADMIN" || user.role === "SZEF");
       const rows = showAll
         ? db.prepare(
             `SELECT a.id, a.user_id, a.device_type, a.app_version, a.occurred_at, u.display_name as user_display_name, u.email as user_email
@@ -535,13 +558,14 @@ export async function registerIpcHandlers(deps: {
       if (existing) return { ok: false, error: "Użytkownik z tym adresem email już istnieje" };
       const id = uuid();
       const hash = hashPassword(password);
-      const role = normalizeRole(payload.role ?? "SALESPERSON");
+      const role = normalizeRole(payload.role ?? "HANDLOWIEC");
       const displayName = (payload.displayName ?? "").trim() || null;
+      const creatorId = currentUser?.id ?? null;
       db.prepare(
-        "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))"
-      ).run(id, email, hash, role, displayName);
+        "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, password_set_at, created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1, NULL, ?, datetime('now'), datetime('now'))"
+      ).run(id, email, hash, role, displayName, creatorId);
       logger.info("[admin] createUser", { email, role });
-      return { ok: true, id };
+      return { ok: true, id, temporaryPassword: password };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
@@ -620,7 +644,7 @@ export async function registerIpcHandlers(deps: {
     try {
       const user = requireAuth();
       const db = getDb();
-      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
       const rows = seeAll
         ? db.prepare("SELECT * FROM offers ORDER BY created_at DESC LIMIT 200").all()
         : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
@@ -1469,7 +1493,7 @@ export async function registerIpcHandlers(deps: {
           perUser: [],
         };
       }
-      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
       const filterUser = seeAll ? null : user.id;
       const where = filterUser ? "WHERE user_id = ?" : "";
       const args = filterUser ? [filterUser] : [];
@@ -1539,7 +1563,7 @@ export async function registerIpcHandlers(deps: {
       const searchQuery = params?.searchQuery ?? "";
       let sql = "SELECT id, offer_number, status, user_id, client_first_name, client_last_name, company_name, nip, phone, variant_hali, width_m, length_m, area_m2, total_pln, created_at, pdf_generated_at, emailed_at, realized_at FROM offers_crm";
       const args: unknown[] = [];
-      const seeAll = user.role === "ADMIN" || user.role === "BOSS";
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
       if (!seeAll) {
         sql += " WHERE user_id = ?";
         args.push(user.id);
@@ -1669,7 +1693,7 @@ export async function registerIpcHandlers(deps: {
       const db = getDb();
       const offerRow = db.prepare("SELECT user_id FROM offers_crm WHERE id = ?").get(offerId) as { user_id: string } | undefined;
       if (!offerRow) return { ok: false, error: "Oferta nie znaleziona" };
-      if (offerRow.user_id !== user.id && user.role !== "ADMIN" && user.role !== "BOSS") return { ok: false, error: "Forbidden" };
+      if (offerRow.user_id !== user.id && user.role !== "ADMIN" && user.role !== "SZEF") return { ok: false, error: "Forbidden" };
       const now = new Date().toISOString();
       db.prepare("UPDATE offers_crm SET status = 'REALIZED', realized_at = ?, updated_at = ? WHERE id = ?").run(now, now, offerId);
       const uid = user.id;
@@ -1708,7 +1732,7 @@ export async function registerIpcHandlers(deps: {
       if (offer.status !== "IN_PROGRESS") {
         return { ok: false, error: "Nie można usunąć oferty po zatwierdzeniu", code: "ERR_STATUS" };
       }
-      const canAccess = offer.user_id === user.id || (user.role === "ADMIN" || user.role === "BOSS");
+      const canAccess = offer.user_id === user.id || (user.role === "ADMIN" || user.role === "SZEF");
       if (!canAccess) return { ok: false, error: "Forbidden", code: "ERR_AUTH" };
       db.transaction(() => {
         db.prepare("DELETE FROM pdfs WHERE offer_id = ?").run(offerId);
@@ -1735,7 +1759,7 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  const ROLES_SEE_ALL = ["ADMIN", "BOSS"];
+  const ROLES_SEE_ALL = ["ADMIN", "SZEF"];
 
   /**
    * Resolve offer identifier to offers_crm.id (PK for FK).
@@ -2305,7 +2329,7 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getPdfs", async () => {
     try {
-      const user = requireRole(["ADMIN", "BOSS"]);
+      const user = requireRole(["ADMIN", "SZEF"]);
       const db = getDb();
       const rows = db.prepare(
         `SELECT p.id, p.user_id, p.offer_id, p.client_name, p.variant_hali, p.file_name, p.file_path, p.status, p.created_at,
@@ -2324,7 +2348,7 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getEmails", async () => {
     try {
-      const user = requireRole(["ADMIN", "BOSS"]);
+      const user = requireRole(["ADMIN", "SZEF"]);
       const db = getDb();
       const hasEmailHistory = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>).length > 0;
       if (hasEmailHistory) {
@@ -2427,7 +2451,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     processOutbox,
     startOutboxWorker,
   } = await import("./emailService");
-  const { setPassword: secureSetPassword, setSmtpPassword, getPassword: secureGetPassword, getSmtpPassword: secureGetSmtpPassword, deletePassword: secureDeletePassword, deleteSmtpPassword, isKeytarAvailable } = await import("./secureStore");
+  const { setPassword: secureSetPassword, setSmtpPassword, getPassword: secureGetPassword, getSmtpPassword: secureGetSmtpPassword, getSmtpKeytarAccountKey, deletePassword: secureDeletePassword, deleteSmtpPassword, isKeytarAvailable } = await import("./secureStore");
   const { getAccountByUserId, buildTransportForUser, getEmailSettings, setEmailSetting, sendOfferEmailNow, renderTemplate } = await import("./emailService");
 
   startOutboxWorker(getDb as () => import("./emailService").Db, logger);
@@ -2436,7 +2460,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     try {
       const user = requireAuth();
       const db = getDb();
-      const isAdminOrBoss = user.role === "ADMIN" || user.role === "BOSS";
+      const isAdminOrBoss = user.role === "ADMIN" || user.role === "SZEF";
       let rows: Array<Record<string, unknown>>;
       if (isAdminOrBoss) {
         rows = db.prepare("SELECT id, user_id, name, from_name, from_email, host, port, secure, auth_user, reply_to, is_default, active, created_at, updated_at FROM smtp_accounts ORDER BY is_default DESC, created_at ASC").all() as Array<Record<string, unknown>>;
@@ -2461,7 +2485,6 @@ console.log("[IPC] handler registered: planlux:checkInternet");
 
   ipcMain.handle("planlux:smtp:upsertAccount", async (_, payload: unknown) => {
     try {
-      console.log("[IPC] planlux:smtp:upsertAccount called");
       requireRole(["ADMIN"]);
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { id?: string; name?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; password?: string; reply_to?: string; is_default?: boolean };
@@ -2504,7 +2527,6 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       return { ok: false, error: ser.message };
     }
   });
-  console.log("[IPC] handler registered: planlux:smtp:upsertAccount");
 
   ipcMain.handle("planlux:smtp:setDefaultAccount", async (_, accountId: string) => {
     try {
@@ -2518,19 +2540,65 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     }
   });
 
+  function smtpTestDebugId(): string {
+    return crypto.randomBytes(4).toString("hex").toUpperCase();
+  }
+
+  function smtpTestUserFriendlyMessage(rawError: string, debugId: string): string {
+    const has535 = /535|authentication failed/i.test(rawError);
+    const base = has535
+      ? "Połączenie SMTP nie powiodło się (błąd logowania). Sprawdź adres e-mail i hasło."
+      : "Połączenie SMTP nie powiodło się.";
+    return `${base} Identyfikator debug: ${debugId}`;
+  }
+
   ipcMain.handle("planlux:smtp:testAccount", async (_, accountId: string) => {
     try {
       requireRole(["ADMIN"]);
-      const db = getDb();
+      const db = getDb() as import("./emailService").Db;
       const row = db.prepare("SELECT * FROM smtp_accounts WHERE id = ?").get(accountId) as import("./emailService").SmtpAccountRow | undefined;
-      if (!row) return { ok: false, error: "Konto nie znalezione" };
-      const transporter = await (await import("./emailService")).buildTransport(db as import("./emailService").Db, row);
-      await transporter.verify();
-      return { ok: true };
+      if (!row) return { ok: false, error: "Konto nie znalezione", debugId: undefined };
+      const { buildTransport, verifyTransport, normalizeSmtpPortSecure } = await import("./emailService");
+      const { port: normPort } = normalizeSmtpPortSecure(Number(row.port) || 587, row.secure === 1);
+      const loggerWithStack = {
+        error: (msg: string, e?: unknown) => {
+          const stack = e && typeof e === "object" && "stack" in e ? String((e as { stack?: string }).stack) : undefined;
+          const response = e && typeof e === "object" && "response" in e ? String((e as { response?: string }).response) : undefined;
+          logger.warn(msg, e);
+          if (stack) logger.warn("[smtp] verify error stack", { stack });
+          if (response) logger.warn("[smtp] verify server response", { response });
+        },
+      };
+      let transporter = await buildTransport(db, row);
+      let result = await verifyTransport(transporter, loggerWithStack);
+      if (result.ok) return { ok: true };
+      if (result.needFallback && normPort === 465) {
+        logger.info("[smtp] testAccount fallback: próba port 587 (STARTTLS)");
+        transporter = await buildTransport(db, row, { port: 587, secure: false });
+        result = await verifyTransport(transporter, loggerWithStack);
+      }
+      if (result.ok) return { ok: true };
+      const debugId = smtpTestDebugId();
+      logger.warn("[smtp] testAccount failed. If sending works for this account, test path had mismatched credentials.", { debugId, error: result.error, response: result.response, stack: result.stack });
+      return {
+        ok: false,
+        error: smtpTestUserFriendlyMessage(result.error, debugId),
+        rawError: result.error,
+        stack: result.stack,
+        response: result.response,
+        debugId,
+      };
     } catch (e) {
       const ser = serializeError(e);
-      logger.warn("[smtp] testAccount failed", { message: ser.message, code: ser.code, reason: ser.reason });
-      return { ok: false, error: ser.message };
+      const debugId = smtpTestDebugId();
+      logger.warn("[smtp] testAccount failed. If sending works for this account, test path had mismatched credentials.", { debugId, message: ser.message, stack: ser.stack });
+      return {
+        ok: false,
+        error: smtpTestUserFriendlyMessage(ser.message, debugId),
+        rawError: ser.message,
+        stack: ser.stack,
+        debugId,
+      };
     }
   });
 
@@ -2547,6 +2615,50 @@ console.log("[IPC] handler registered: planlux:checkInternet");
   });
 
   ipcMain.handle("planlux:smtp:isKeytarAvailable", async () => ({ ok: true, available: isKeytarAvailable() }));
+
+  /** DEV/diagnostic: clear SMTP password for a user so that next send/test forces re-entry. Resolves by userId/email/current user. */
+  ipcMain.handle(
+    "planlux:smtp:clearPasswordForUser",
+    async (_, payload?: { userId?: string; email?: string }) => {
+      try {
+        const user = requireAuth();
+        const db = getDb();
+        let targetUserId: string | null = null;
+        let targetEmail: string | null = null;
+
+        if (payload && typeof payload === "object" && typeof payload.userId === "string") {
+          targetUserId = payload.userId;
+          const row = db
+            .prepare("SELECT email FROM users WHERE id = ? AND active = 1")
+            .get(targetUserId) as { email?: string } | undefined;
+          targetEmail = row?.email ?? null;
+        } else if (payload && typeof payload === "object" && typeof payload.email === "string") {
+          const row = db
+            .prepare("SELECT id, email FROM users WHERE email = ? AND active = 1")
+            .get(payload.email.trim().toLowerCase()) as { id?: string; email?: string } | undefined;
+          targetUserId = row?.id ?? null;
+          targetEmail = row?.email ?? payload.email;
+        } else {
+          targetUserId = user.id;
+          targetEmail = user.email;
+        }
+
+        if (!targetUserId) return { ok: false, error: "Użytkownik nie znaleziony" };
+        if (user.role === "HANDLOWIEC" && targetUserId !== user.id) {
+          return { ok: false, error: "Forbidden" };
+        }
+
+        const accountKey = getSmtpKeytarAccountKey(targetUserId);
+        const deleted = await deleteSmtpPassword(targetUserId);
+        console.log("KEYTAR ENTRY CLEARED:", targetEmail ?? "(unknown)", "accountKey:", accountKey, "deleted:", deleted);
+        return { ok: true, deleted, accountKey };
+      } catch (e) {
+        const ser = serializeError(e);
+        logger.warn("[smtp] clearPasswordForUser failed", { message: ser.message, stack: ser.stack });
+        return { ok: false, error: ser.message };
+      }
+    }
+  );
 
   /** Per-user: SMTP config for current user (no password). */
   ipcMain.handle("planlux:smtp:getForCurrentUser", async () => {
@@ -2570,7 +2682,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
       const p = payload as { targetUserId?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; smtpPass?: string; reply_to?: string };
       const targetUserId = (typeof p.targetUserId === "string" ? p.targetUserId : null) ?? user.id;
-      if (user.role === "SALESPERSON" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
+      if (user.role === "HANDLOWIEC" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
       const db = getDb();
       const userRow = db.prepare("SELECT email FROM users WHERE id = ? AND active = 1").get(targetUserId) as { email: string } | undefined;
       if (!userRow) return { ok: false, error: "Użytkownik nie znaleziony" };
@@ -2605,31 +2717,71 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     }
   });
 
-  /** Test SMTP connection for a user. */
-  ipcMain.handle("planlux:smtp:testForUser", async (_, userId?: string) => {
+  /** Test SMTP connection for a user. Uses same credential source as send (getCredentialsForAccount + buildTransportFromConfig). Optional smtpPass overwrites keytar before test. */
+  ipcMain.handle("planlux:smtp:testForUser", async (_, userIdOrPayload?: string | { userId?: string; smtpPass?: string }) => {
     try {
       const user = requireAuth();
-      const targetUserId = (typeof userId === "string" ? userId : null) ?? user.id;
-      if (user.role === "SALESPERSON" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
+      const payload = typeof userIdOrPayload === "object" && userIdOrPayload != null
+        ? userIdOrPayload
+        : { userId: typeof userIdOrPayload === "string" ? userIdOrPayload : undefined };
+      const targetUserId = (typeof payload.userId === "string" ? payload.userId : null) ?? user.id;
+      const smtpPass = typeof payload.smtpPass === "string" ? payload.smtpPass : undefined;
+      if (user.role === "HANDLOWIEC" && targetUserId !== user.id) return { ok: false, error: "Forbidden", debugId: undefined };
       const db = getDb() as import("./emailService").Db;
-      const { getAccountByUserId, buildTransportForUser, validateSmtpPortSecure } = await import("./emailService");
+      const { getAccountByUserId, buildTransportForUser, verifyTransport, normalizeSmtpPortSecure } = await import("./emailService");
       const account = getAccountByUserId(db, targetUserId);
-      if (!account) return { ok: false, error: "Brak konfiguracji SMTP dla użytkownika" };
+      if (!account) return { ok: false, error: "Brak konfiguracji SMTP dla użytkownika", debugId: undefined };
+      if (smtpPass != null && smtpPass.length > 0) {
+        await setSmtpPassword(targetUserId, smtpPass);
+      }
       const port = Number(account.port) || 587;
       const secure = account.secure === 1;
-      const connectionType = secure ? "SSL (implicit)" : "STARTTLS";
-      logger.info("[smtp] testForUser", { host: account.host, port, secure, connectionType });
+      const { port: normPort, secure: normSecure } = normalizeSmtpPortSecure(port, secure);
+      logger.info("[smtp] testForUser", { host: account.host, port: normPort, secure: normSecure, from_email: account.from_email });
       if (/gmail\.com|googlemail\.com/i.test(account.host)) {
         logger.warn("[smtp] Gmail: upewnij się, że używasz Hasła aplikacji (App Password), nie zwykłego hasła do konta Google.");
       }
-      validateSmtpPortSecure(port, secure);
-      const transporter = await buildTransportForUser(db, targetUserId);
-      await transporter.verify();
-      return { ok: true };
+      const loggerWithStack = {
+        error: (msg: string, e?: unknown) => {
+          const stack = e && typeof e === "object" && "stack" in e ? String((e as { stack?: string }).stack) : undefined;
+          const response = e && typeof e === "object" && "response" in e ? String((e as { response?: string }).response) : undefined;
+          logger.warn(msg, e);
+          if (stack) logger.warn("[smtp] verify error stack", { stack });
+          if (response) logger.warn("[smtp] verify server response", { response });
+        },
+      };
+      let transporter = await buildTransportForUser(db, targetUserId);
+      let result = await verifyTransport(transporter, loggerWithStack);
+      if (result.ok) return { ok: true };
+      if (result.needFallback && normPort === 465) {
+        logger.info("[smtp] testForUser fallback: próba port 587 (STARTTLS)");
+        transporter = await buildTransportForUser(db, targetUserId, { port: 587, secure: false });
+        result = await verifyTransport(transporter, loggerWithStack);
+      }
+      if (result.ok) return { ok: true };
+      const debugId = smtpTestDebugId();
+      logger.warn("[smtp] testForUser failed. If sending works for this user, test path had mismatched credentials.", { debugId, userId: targetUserId, from_email: account.from_email, error: result.error, response: result.response, stack: result.stack });
+      return {
+        ok: false,
+        error: smtpTestUserFriendlyMessage(result.error, debugId),
+        rawError: result.error,
+        stack: result.stack,
+        response: result.response,
+        debugId,
+      };
     } catch (e) {
       const ser = serializeError(e);
-      logger.warn("[smtp] testForUser failed", { message: ser.message, code: ser.code, reason: ser.reason });
-      return { ok: false, error: ser.message, code: ser.code, reason: ser.reason, stack: ser.stack };
+      const debugId = smtpTestDebugId();
+      logger.warn("[smtp] testForUser failed. If sending works for this user, test path had mismatched credentials.", { debugId, message: ser.message, stack: ser.stack });
+      return {
+        ok: false,
+        error: smtpTestUserFriendlyMessage(ser.message, debugId),
+        rawError: ser.message,
+        code: ser.code,
+        reason: ser.reason,
+        stack: ser.stack,
+        debugId,
+      };
     }
   });
 
@@ -2729,8 +2881,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const to = toEmails.join(", ");
       if (!to) return { ok: false, code: "ERR_NO_TO", message: "Adres odbiorcy jest wymagany", error: "Adres odbiorcy jest wymagany" };
       if (!canAccessOffer(db, resolvedOfferId, user.id)) return { ok: false, code: "ERR_NOT_FOUND", message: "Oferta nie znaleziona", error: "Oferta nie znaleziona" };
-      const senderUserId = (user.role === "ADMIN" || user.role === "BOSS") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
-      if (user.role === "SALESPERSON" && senderUserId !== user.id) return { ok: false, code: "ERR_FORBIDDEN", message: "Forbidden", error: "Forbidden" };
+      const senderUserId = (user.role === "ADMIN" || user.role === "SZEF") && typeof p.sendAsUserId === "string" ? p.sendAsUserId : user.id;
+      if (user.role === "HANDLOWIEC" && senderUserId !== user.id) return { ok: false, code: "ERR_FORBIDDEN", message: "Forbidden", error: "Forbidden" };
       const account = getAccountByUserId(db as import("./emailService").Db, senderUserId);
       if (!account) return { ok: false, code: "ERR_AUTH", message: "Skonfiguruj konto SMTP w Panelu admina (E-mail)", error: "Skonfiguruj konto SMTP w Panelu admina (E-mail)" };
       const effectiveUserId: string = senderUserId ?? user.id ?? (account as { user_id?: string }).user_id ?? "";
@@ -3382,7 +3534,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const user = requireAuth();
       const status = filter?.status;
       const db = getDb();
-      const isAdminOrBoss = user.role === "ADMIN" || user.role === "BOSS";
+      const isAdminOrBoss = user.role === "ADMIN" || user.role === "SZEF";
       let rows: unknown[];
       if (isAdminOrBoss) {
         rows = status
@@ -3406,7 +3558,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const db = getDb();
       const row = db.prepare("SELECT account_user_id FROM email_outbox WHERE id = ?").get(outboxId) as { account_user_id: string | null } | undefined;
       if (!row) return { ok: false, error: "Pozycja nie znaleziona" };
-      const canRetry = user.role === "ADMIN" || user.role === "BOSS" || row.account_user_id === user.id;
+      const canRetry = user.role === "ADMIN" || user.role === "SZEF" || row.account_user_id === user.id;
       if (!canRetry) return { ok: false, error: "Forbidden" };
       db.prepare("UPDATE email_outbox SET next_retry_at = NULL, status = 'queued', updated_at = ? WHERE id = ?").run(new Date().toISOString(), outboxId);
       return { ok: true };

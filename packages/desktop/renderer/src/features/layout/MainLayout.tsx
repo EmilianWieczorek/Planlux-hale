@@ -17,6 +17,7 @@ import { AdminPanel } from "../admin/AdminPanel";
 import { ClearDataDialog } from "./ClearDataDialog";
 import { offerDraftStore } from "../../state/offerDraftStore";
 import { tokens } from "../../theme/tokens";
+import { canAccessAdminPanel } from "@planlux/shared";
 
 type Tab = "dashboard" | "kalkulator" | "oferty" | "admin";
 
@@ -104,8 +105,8 @@ export function MainLayout({ user, onLogout, api }: Props) {
   const [emailSending, setEmailSending] = useState(false);
   const [emailSnackbar, setEmailSnackbar] = useState<{ message: string; severity: "success" | "info" | "error" } | null>(null);
 
-  const isAdmin = user.role === "ADMIN"; // tylko ADMIN widzi Panel admina
-  const isBossOrAdmin = user.role === "ADMIN" || user.role === "BOSS"; // widok wszystkich ofert
+  const canAccessAdmin = canAccessAdminPanel(user.role);
+  const isBossOrAdmin = user.role === "ADMIN" || user.role === "SZEF"; // widok wszystkich ofert
 
   const handleClearGlobal = () => {
     offerDraftStore.resetGlobal();
@@ -196,7 +197,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
               {t === "dashboard" ? "Dashboard" : t === "kalkulator" ? "Kalkulator" : "Oferty"}
             </button>
           ))}
-          {isAdmin && (
+          {canAccessAdmin && (
             <button onClick={() => handleTabChange("admin")} style={styles.navBtn(tab === "admin")}>
               Panel admina
             </button>
@@ -323,7 +324,10 @@ export function MainLayout({ user, onLogout, api }: Props) {
             }}
           />
         )}
-        {tab === "admin" && isAdmin && <AdminPanel api={api} currentUser={user} />}
+        {tab === "admin" && !canAccessAdmin && (
+          <Box sx={{ p: 3, textAlign: "center", color: "text.secondary" }}>Brak uprawnień do panelu admina.</Box>
+        )}
+        {tab === "admin" && canAccessAdmin && <AdminPanel api={api} currentUser={user} />}
       </main>
     </div>
   );

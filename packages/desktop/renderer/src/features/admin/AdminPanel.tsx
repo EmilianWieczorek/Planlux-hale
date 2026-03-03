@@ -24,9 +24,10 @@ import {
   Tabs,
   Tab,
 } from "@mui/material";
-import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email, Mail } from "@mui/icons-material";
+import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email, Mail, ContentCopy } from "@mui/icons-material";
 import { AdminEmailTab } from "./AdminEmailTab";
 import { tokens } from "../../theme/tokens";
+import { canManageUsers } from "@planlux/shared";
 
 const styles = {
   card: {
@@ -53,12 +54,19 @@ interface Props {
 
 const roleToLabel = (role: string) => {
   if (role === "ADMIN") return "Admin";
-  if (role === "BOSS" || role === "MANAGER") return "Szef";
-  return "Handlowiec"; // SALESPERSON, USER
+  if (role === "SZEF") return "Szef";
+  return "Handlowiec";
 };
 
+/** Tab index for Activity (SZEF: 0, ADMIN: 1). */
+const tabActivity = (canManage: boolean) => (canManage ? 1 : 0);
+const tabPdf = (canManage: boolean) => (canManage ? 2 : 1);
+const tabEmailHist = (canManage: boolean) => (canManage ? 3 : 2);
+const tabEmail = (canManage: boolean) => (canManage ? 4 : 3);
+
 export function AdminPanel({ api, currentUser }: Props) {
-  const [tab, setTab] = useState(0);
+  const canManage = canManageUsers(currentUser.role);
+  const [tab, setTab] = useState(canManage ? 0 : 0);
   const [users, setUsers] = useState<UserRow[]>([]);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [pdfs, setPdfs] = useState<PdfRow[]>([]);
@@ -69,9 +77,10 @@ export function AdminPanel({ api, currentUser }: Props) {
   const [formEmail, setFormEmail] = useState("");
   const [formPassword, setFormPassword] = useState("");
   const [formDisplayName, setFormDisplayName] = useState("");
-  const [formRole, setFormRole] = useState<string>("SALESPERSON");
+  const [formRole, setFormRole] = useState<string>("HANDLOWIEC");
   const [submitting, setSubmitting] = useState(false);
   const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: "success" | "error" | "info" }>({ open: false, message: "", severity: "info" });
+  const [tempPasswordModal, setTempPasswordModal] = useState<{ open: boolean; email: string; temporaryPassword: string }>({ open: false, email: "", temporaryPassword: "" });
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
@@ -132,7 +141,7 @@ export function AdminPanel({ api, currentUser }: Props) {
     setFormEmail("");
     setFormPassword("");
     setFormDisplayName("");
-    setFormRole("SALESPERSON");
+    setFormRole("HANDLOWIEC");
     setModalOpen(true);
   };
 
@@ -141,7 +150,7 @@ export function AdminPanel({ api, currentUser }: Props) {
     setFormEmail(u.email);
     setFormPassword("");
     setFormDisplayName(u.displayName || "");
-    setFormRole(u.role === "USER" ? "SALESPERSON" : u.role === "MANAGER" ? "BOSS" : u.role);
+    setFormRole(u.role === "USER" || u.role === "SALESPERSON" ? "HANDLOWIEC" : u.role === "MANAGER" || u.role === "BOSS" ? "SZEF" : u.role);
     setModalOpen(true);
   };
 
@@ -182,11 +191,15 @@ export function AdminPanel({ api, currentUser }: Props) {
           password: formPassword,
           displayName: formDisplayName.trim() || undefined,
           role: formRole,
-        })) as { ok: boolean; error?: string };
+        })) as { ok: boolean; id?: string; temporaryPassword?: string; error?: string };
         if (r.ok) {
-          setSnackbar({ open: true, message: "Użytkownik utworzony", severity: "success" });
           setModalOpen(false);
           loadUsers();
+          if (typeof r.temporaryPassword === "string" && r.temporaryPassword.length > 0) {
+            setTempPasswordModal({ open: true, email, temporaryPassword: r.temporaryPassword });
+          } else {
+            setSnackbar({ open: true, message: "Użytkownik utworzony. Wymaga zmiany hasła przy pierwszym logowaniu.", severity: "success" });
+          }
         } else {
           setSnackbar({ open: true, message: r.error ?? "Błąd tworzenia", severity: "error" });
         }
@@ -228,14 +241,14 @@ export function AdminPanel({ api, currentUser }: Props) {
         Panel admina
       </Typography>
       <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2, borderBottom: 1, borderColor: "divider" }}>
-        <Tab icon={<People />} iconPosition="start" label="Użytkownicy" />
+        {canManage && <Tab icon={<People />} iconPosition="start" label="Użytkownicy" />}
         <Tab icon={<Timeline />} iconPosition="start" label="Aktywność" />
         <Tab icon={<PictureAsPdf />} iconPosition="start" label="Historia PDF" />
         <Tab icon={<Email />} iconPosition="start" label="Historia e-mail" />
         <Tab icon={<Mail />} iconPosition="start" label="E-mail" />
       </Tabs>
 
-      {tab === 0 && (
+      {canManage && tab === 0 && (
         <div style={styles.card}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
             <h2 style={styles.h2}>Użytkownicy</h2>
@@ -294,7 +307,7 @@ export function AdminPanel({ api, currentUser }: Props) {
         </div>
       )}
 
-      {tab === 1 && (
+      {tab === tabActivity(canManage) && (
         <div style={styles.card}>
           <h2 style={styles.h2}>Aktywność</h2>
           <p style={{ color: tokens.color.textMuted, marginBottom: 16 }}>
@@ -337,7 +350,7 @@ export function AdminPanel({ api, currentUser }: Props) {
         </div>
       )}
 
-      {tab === 2 && (
+      {tab === tabPdf(canManage) && (
         <div style={styles.card}>
           <h2 style={styles.h2}>Historia PDF</h2>
           <p style={{ color: tokens.color.textMuted, marginBottom: 16 }}>
@@ -374,9 +387,9 @@ export function AdminPanel({ api, currentUser }: Props) {
         </div>
       )}
 
-      {tab === 4 && <AdminEmailTab api={api} />}
+      {tab === tabEmail(canManage) && <AdminEmailTab api={api} />}
 
-      {tab === 3 && (
+      {tab === tabEmailHist(canManage) && (
         <div style={styles.card}>
           <h2 style={styles.h2}>Historia e-mail</h2>
           <p style={{ color: tokens.color.textMuted, marginBottom: 16 }}>
@@ -449,10 +462,10 @@ export function AdminPanel({ api, currentUser }: Props) {
           />
           <FormControl fullWidth margin="dense">
             <InputLabel>Rola</InputLabel>
-            <Select value={["ADMIN","BOSS","SALESPERSON"].includes(formRole) ? formRole : "SALESPERSON"} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
+            <Select value={["ADMIN","SZEF","HANDLOWIEC"].includes(formRole) ? formRole : "HANDLOWIEC"} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
               <MenuItem value="ADMIN">Admin</MenuItem>
-              <MenuItem value="BOSS">Szef</MenuItem>
-              <MenuItem value="SALESPERSON">Handlowiec</MenuItem>
+              <MenuItem value="SZEF">Szef</MenuItem>
+              <MenuItem value="HANDLOWIEC">Handlowiec</MenuItem>
             </Select>
           </FormControl>
         </DialogContent>
@@ -462,6 +475,38 @@ export function AdminPanel({ api, currentUser }: Props) {
           </Button>
           <Button onClick={handleSubmit} variant="contained" disabled={submitting}>
             {submitting ? "Zapisywanie…" : editingUser ? "Zapisz" : "Utwórz"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={tempPasswordModal.open} onClose={() => setTempPasswordModal((p) => ({ ...p, open: false }))} maxWidth="sm" fullWidth>
+        <DialogTitle>Hasło tymczasowe – zapisz i przekaż użytkownikowi</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            Użytkownik <strong>{tempPasswordModal.email}</strong> został utworzony. Przy pierwszym logowaniu zostanie poproszony o zmianę hasła.
+          </Typography>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 2 }}>
+            <TextField
+              fullWidth
+              size="small"
+              label="Hasło tymczasowe"
+              value={tempPasswordModal.temporaryPassword}
+              InputProps={{ readOnly: true }}
+            />
+            <IconButton
+              onClick={() => {
+                navigator.clipboard.writeText(tempPasswordModal.temporaryPassword);
+                setSnackbar({ open: true, message: "Skopiowano do schowka", severity: "success" });
+              }}
+              title="Kopiuj"
+            >
+              <ContentCopy />
+            </IconButton>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTempPasswordModal((p) => ({ ...p, open: false }))} variant="contained">
+            Zamknij
           </Button>
         </DialogActions>
       </Dialog>

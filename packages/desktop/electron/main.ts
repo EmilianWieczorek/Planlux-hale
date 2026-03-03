@@ -131,9 +131,81 @@ COMMIT;
     }
   }
 
+  // Migracja users_roles_4: CHECK (HANDLOWIEC, SZEF, ADMIN). USER/SALESPERSON→HANDLOWIEC, BOSS/MANAGER→SZEF, ADMIN→ADMIN.
+  const done4 = database.prepare("SELECT 1 FROM _migrations WHERE id = ?").get("users_roles_4");
+  if (done4) {
+    logger.info("[migration] users_roles_4 ALREADY_APPLIED");
+  } else {
+    const usersExists4 = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get() as { name?: string } | undefined)?.name === "users";
+    if (!usersExists4) {
+      database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_4");
+      logger.info("[migration] users_roles_4 skipped (no users table)");
+    } else {
+      const sqlRow4 = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as { sql: string } | undefined;
+      const sqlDef4 = (sqlRow4?.sql ?? "").toUpperCase();
+      const alreadyNewRoles = sqlDef4.includes("'HANDLOWIEC'") && sqlDef4.includes("'SZEF'") && sqlDef4.includes("'ADMIN'");
+      if (alreadyNewRoles) {
+        database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("users_roles_4");
+        logger.info("[migration] users_roles_4 already has target schema (HANDLOWIEC/SZEF/ADMIN)");
+      } else {
+        logger.info("[migration] users_roles_4 START");
+        database.exec("PRAGMA foreign_keys = OFF");
+        database.exec("DROP TABLE IF EXISTS users_new");
+        const cols4 = database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+        const hasActive4 = cols4.some((c) => c.name === "active");
+        const hasDisplayName4 = cols4.some((c) => c.name === "display_name");
+        const hasFullName4 = cols4.some((c) => c.name === "full_name");
+        const hasCreatedAt4 = cols4.some((c) => c.name === "created_at");
+        const hasUpdatedAt4 = cols4.some((c) => c.name === "updated_at");
+        const nameColumn4 = hasDisplayName4 ? "display_name" : hasFullName4 ? "full_name" : "email";
+        const activeExpr4 = hasActive4 ? "COALESCE(active,1)" : "1";
+        const createdExpr4 = hasCreatedAt4 ? "COALESCE(created_at, datetime('now'))" : "datetime('now')";
+        const updatedExpr4 = hasUpdatedAt4 ? "COALESCE(updated_at, datetime('now'))" : "datetime('now')";
+        database.exec(`
+BEGIN TRANSACTION;
+CREATE TABLE users_new (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('HANDLOWIEC','SZEF','ADMIN')),
+  display_name TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO users_new (id, email, password_hash, role, display_name, active, created_at, updated_at)
+SELECT id, email, password_hash,
+  CASE UPPER(TRIM(role))
+    WHEN 'USER' THEN 'HANDLOWIEC'
+    WHEN 'SALESPERSON' THEN 'HANDLOWIEC'
+    WHEN 'HANDLOWIEC' THEN 'HANDLOWIEC'
+    WHEN 'BOSS' THEN 'SZEF'
+    WHEN 'MANAGER' THEN 'SZEF'
+    WHEN 'SZEF' THEN 'SZEF'
+    WHEN 'ADMIN' THEN 'ADMIN'
+    ELSE 'HANDLOWIEC'
+  END,
+  ${nameColumn4} AS display_name, ${activeExpr4} AS active, ${createdExpr4} AS created_at, ${updatedExpr4} AS updated_at
+FROM users;
+DROP TABLE users;
+ALTER TABLE users_new RENAME TO users;
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+COMMIT;
+`);
+        database.prepare("INSERT INTO _migrations (id) VALUES (?)").run("users_roles_4");
+        logger.info("[migration] users_roles_4 APPLIED");
+        database.exec("PRAGMA foreign_keys = ON");
+      }
+    }
+  }
+
   // Proste, idempotentne migracje kolumnowe.
   const migrations = [
     "ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN password_set_at TEXT DEFAULT NULL",
+    "ALTER TABLE users ADD COLUMN created_by_user_id TEXT DEFAULT NULL",
   ];
   for (const sql of migrations) {
     try {
@@ -322,10 +394,25 @@ function loadWindow(mainWindow: BrowserWindow) {
   }
 }
 
+function resolveWindowIconPath(): string | undefined {
+  const candidates = [
+    path.join(__dirname, "../build/icon.ico"),
+    path.join(__dirname, "../../build/icon.ico"),
+    path.join(app.getAppPath(), "build/icon.ico"),
+    path.join(process.resourcesPath, "build", "icon.ico"),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined;
+}
+
 function createWindow() {
+  const iconPath = resolveWindowIconPath();
   mainWindow = new BrowserWindow({
     width: 1000,
     height: 700,
+    icon: iconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -437,13 +524,16 @@ async function runStartup(): Promise<void> {
     logger,
   });
   console.log("[IPC] Planlux IPC handlers initialized");
-  const existing = database.prepare("SELECT id FROM users WHERE email = ?").get("admin@planlux.pl");
-  if (!existing) {
-    const crypto = require("crypto");
-    const hash = crypto.scryptSync("admin123", "planlux-hale-v1", 64).toString("hex");
-    database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin')")
-      .run(crypto.randomUUID(), "admin@planlux.pl", hash);
-    logger.info("Seeded admin user (admin@planlux.pl / admin123)");
+  // Seed admin only in development (production: create admin via other means; no credentials in logs)
+  if (process.env.NODE_ENV !== "production") {
+    const existing = database.prepare("SELECT id FROM users WHERE email = ?").get("admin@planlux.pl");
+    if (!existing) {
+      const crypto = require("crypto");
+      const hash = crypto.scryptSync("admin123", "planlux-hale-v1", 64).toString("hex");
+      database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin')")
+        .run(crypto.randomUUID(), "admin@planlux.pl", hash);
+      logger.info("[seed] Admin user created (dev only)");
+    }
   }
   createWindow();
 

@@ -13,21 +13,33 @@ import fs from "fs";
 
 const TEMPLATE_SUBDIR = path.join("assets", "pdf-template", "Planlux-PDF");
 
+/** W packaged app nie używamy ścieżek repo (packages/desktop). */
+function isRepoRelativePath(dir: string): boolean {
+  const normalized = path.normalize(dir);
+  return (
+    normalized.includes(`${path.sep}packages${path.sep}desktop`) ||
+    normalized.includes("/packages/desktop")
+  );
+}
+
 /**
  * Zwraca katalog szablonu Planlux-PDF (tam gdzie leży index.html).
  * Działa w DEV (run from repo) i PROD (packaged app / app.asar).
+ * W production (app.isPackaged) pomija ścieżki zawierające packages/desktop.
  */
 export function getPdfTemplateDir(): string | null {
   const appPath = app.getAppPath();
+  const resourcesPath = process.resourcesPath || "";
   const candidates = [
     path.join(appPath, TEMPLATE_SUBDIR),
+    path.join(resourcesPath, "app.asar", TEMPLATE_SUBDIR),
+    path.join(resourcesPath, TEMPLATE_SUBDIR),
     path.join(process.cwd(), TEMPLATE_SUBDIR),
     path.join(__dirname, "..", "..", TEMPLATE_SUBDIR),
-    path.join(process.resourcesPath || "", "app.asar", TEMPLATE_SUBDIR),
-    path.join(process.resourcesPath || "", TEMPLATE_SUBDIR),
   ];
   for (const dir of candidates) {
     const normalized = path.normalize(dir);
+    if (app.isPackaged && isRepoRelativePath(normalized)) continue;
     const indexPath = path.join(normalized, "index.html");
     if (fs.existsSync(indexPath)) return normalized;
   }

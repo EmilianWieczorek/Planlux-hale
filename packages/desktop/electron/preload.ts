@@ -7,6 +7,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 const ALLOWED_CHANNELS = new Set([
   "planlux:login",
   "planlux:logout",
+  "planlux:changePassword",
   "planlux:endSession",
   "planlux:getPricingCache",
   "planlux:syncPricing",

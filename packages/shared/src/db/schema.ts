@@ -9,9 +9,12 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('ADMIN', 'BOSS', 'SALESPERSON')),
+  role TEXT NOT NULL CHECK (role IN ('HANDLOWIEC', 'SZEF', 'ADMIN')),
   display_name TEXT,
   active INTEGER NOT NULL DEFAULT 1,
+  must_change_password INTEGER NOT NULL DEFAULT 0,
+  password_set_at TEXT DEFAULT NULL,
+  created_by_user_id TEXT DEFAULT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

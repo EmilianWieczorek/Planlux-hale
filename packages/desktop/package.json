@@ -22,9 +22,41 @@
     "dev": "vite",
     "clean": "rimraf dist",
     "pdf:rebuild:test": "npm run clean && npm run build",
+    "dist": "electron-builder --win nsis",
     "build:win": "npm run build && electron-builder --win",
     "dist:win": "npm run build && electron-builder --win --publish never --projectDir .",
     "rebuild": "electron-rebuild -f -w keytar"
+  },
+  "build": {
+    "appId": "pl.planlux.hale",
+    "productName": "Planlux Hale",
+    "electronVersion": "28.3.3",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   },
   "dependencies": {
     "@emotion/react": "^11.13.5",
@@ -52,7 +84,7 @@
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.1",
     "@vitest/ui": "^4.0.18",
-    "electron": "^28.0.0",
+    "electron": "28.3.3",
     "electron-builder": "^26.8.1",
     "jsdom": "^28.1.0",
     "rimraf": "^5.0.0",

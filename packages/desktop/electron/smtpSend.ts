@@ -8,7 +8,7 @@ import path from "path";
 import fs from "fs";
 import { app } from "electron";
 import type { SmtpCredentials } from "@planlux/shared";
-import { validateSmtpPortSecure, allowedEmailHistoryStatus } from "./emailService";
+import { validateSmtpPortSecure, allowedEmailHistoryStatus, normalizeSmtpPortSecure } from "./emailService";
 
 const CONFIG_PATH = path.join(app.getPath("userData"), "smtp-config.json");
 
@@ -19,11 +19,14 @@ export function getSmtpConfig(accountEmail: string): SmtpCredentials | null {
     const data = JSON.parse(raw) as Record<string, { host: string; port: number; secure: boolean; user: string; password: string }>;
     const cfg = data[accountEmail];
     if (!cfg?.user || !cfg?.password) return null;
+    const port = cfg.port ?? 465;
+    const secure = cfg.secure ?? true;
+    const { port: p, secure: s } = normalizeSmtpPortSecure(port, secure);
     return {
       host: cfg.host ?? "poczta.cyberfolks.pl",
-      port: cfg.port ?? 465,
-      secure: cfg.secure ?? true,
-      user: cfg.user,
+      port: p,
+      secure: s,
+      user: (cfg.user || accountEmail).trim().includes("@") ? (cfg.user || accountEmail).trim() : accountEmail,
       password: cfg.password,
     };
   } catch {
@@ -64,19 +67,35 @@ export async function sendMail(
   credentials: SmtpCredentials,
   params: { from: string; to: string; subject: string; body: string; attachmentPath?: string }
 ): Promise<SentMailResult> {
-  const port = credentials.port ?? 587;
-  const secure = credentials.secure ?? false;
+  let port = credentials.port ?? 587;
+  let secure = credentials.secure ?? false;
+  const normalized = normalizeSmtpPortSecure(port, secure);
+  port = normalized.port;
+  secure = normalized.secure;
   validateSmtpPortSecure(port, secure);
-  const isDev = process.env.NODE_ENV === "development" || !!process.env.VITE_DEV_SERVER_URL;
-  const transporter = nodemailer.createTransport({
+  const user = (credentials.user || params.from || "").trim().includes("@")
+    ? (credentials.user || params.from).trim()
+    : (params.from || "").trim();
+  const from = user;
+  console.log("SMTP CONFIG DEBUG", {
     host: credentials.host,
     port,
     secure,
-    auth: { user: credentials.user, pass: credentials.password },
-    ...(isDev ? { tls: { rejectUnauthorized: false } } : {}),
+    user,
+    passLength: credentials.password?.length ?? 0,
   });
+  const isDev = process.env.NODE_ENV === "development" || !!process.env.VITE_DEV_SERVER_URL;
+  const createTransporter = () =>
+    nodemailer.createTransport({
+      host: credentials.host.trim(),
+      port,
+      secure,
+      auth: { user, pass: credentials.password },
+      ...(isDev ? { tls: { rejectUnauthorized: false } } : {}),
+    });
+  let transporter = createTransporter();
   const mailOptions: nodemailer.SendMailOptions = {
-    from: params.from,
+    from,
     to: params.to,
     subject: params.subject,
     text: params.body,
@@ -85,15 +104,38 @@ export async function sendMail(
   if (params.attachmentPath && fs.existsSync(params.attachmentPath)) {
     mailOptions.attachments = [{ filename: path.basename(params.attachmentPath), path: params.attachmentPath }];
   }
-  const info = await transporter.sendMail(mailOptions);
-  const envelope = info.envelope as { from?: string; to?: string[] } | undefined;
-  return {
-    messageId: info.messageId as string | undefined,
-    accepted: info.accepted as string[] | undefined,
-    rejected: info.rejected as string[] | undefined,
-    response: typeof info.response === "string" ? info.response : undefined,
-    envelope: envelope ? { from: envelope.from ?? "", to: envelope.to ?? [] } : undefined,
-  };
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    const envelope = info.envelope as { from?: string; to?: string[] } | undefined;
+    return {
+      messageId: info.messageId as string | undefined,
+      accepted: info.accepted as string[] | undefined,
+      rejected: info.rejected as string[] | undefined,
+      response: typeof info.response === "string" ? info.response : undefined,
+      envelope: envelope ? { from: envelope.from ?? "", to: envelope.to ?? [] } : undefined,
+    };
+  } catch (firstErr) {
+    const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+    if ((port === 465 && /535|authentication|ECONNREFUSED|WRONG_VERSION/i.test(msg)) || false) {
+      transporter = nodemailer.createTransport({
+        host: credentials.host.trim(),
+        port: 587,
+        secure: false,
+        auth: { user, pass: credentials.password },
+        ...(isDev ? { tls: { rejectUnauthorized: false } } : {}),
+      });
+      const info = await transporter.sendMail(mailOptions);
+      const envelope = info.envelope as { from?: string; to?: string[] } | undefined;
+      return {
+        messageId: info.messageId as string | undefined,
+        accepted: info.accepted as string[] | undefined,
+        rejected: info.rejected as string[] | undefined,
+        response: typeof info.response === "string" ? info.response : undefined,
+        envelope: envelope ? { from: envelope.from ?? "", to: envelope.to ?? [] } : undefined,
+      };
+    }
+    throw firstErr;
+  }
 }
 
 /** Callback dla flushOutbox – wysyła e-mail z payload SEND_EMAIL i aktualizuje email_history + offers_crm. */

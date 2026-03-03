@@ -6,6 +6,7 @@ import { planluxTheme } from "../theme/planluxTheme";
 const INACTIVITY_MS = 30 * 60 * 1000; // 30 min
 const REMINDER_BEFORE_MS = 2 * 60 * 1000; // przypomnienie 2 min przed wylogowaniem
 import { LoginScreen } from "../features/auth/LoginScreen";
+import { ChangePasswordScreen } from "../features/auth/ChangePasswordScreen";
 import { MainLayout } from "../features/layout/MainLayout";
 import { offerDraftStore, setSyncErrorHandler } from "../state/offerDraftStore";
 import "../theme/global.css";
@@ -43,6 +44,7 @@ const api = (channel: string, ...args: unknown[]) => {
 
 export default function App() {
   const [user, setUser] = useState<{ id: string; email: string; role: string; displayName?: string } | null>(null);
+  const [mustChangePassword, setMustChangePassword] = useState(false);
   const [loading, setLoading] = useState(true);
   const [inProgressCount, setInProgressCount] = useState(0);
   const [reminderOpen, setReminderOpen] = useState(false);
@@ -52,12 +54,24 @@ export default function App() {
   const reminderTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
   const handleLogin = async (email: string, password: string) => {
-    const r = (await api("planlux:login", email, password)) as { ok: boolean; user?: { id: string; email: string; role: string; displayName?: string }; error?: string };
+    const r = (await api("planlux:login", email, password)) as {
+      ok: boolean;
+      user?: { id: string; email: string; role: string; displayName?: string };
+      mustChangePassword?: boolean;
+      error?: string;
+    };
     if (r.ok && r.user) {
       setUser(r.user);
+      setMustChangePassword(Boolean(r.mustChangePassword));
       return true;
     }
     throw new Error(r.error ?? "Login failed");
+  };
+
+  const handleChangePassword = async (newPassword: string) => {
+    const r = (await api("planlux:changePassword", newPassword)) as { ok: boolean; error?: string };
+    if (!r.ok) throw new Error(r.error ?? "Nie udało się zmienić hasła");
+    setMustChangePassword(false);
   };
 
   const handleLogout = useCallback(async () => {
@@ -173,6 +187,15 @@ export default function App() {
 
   if (!user) {
     return <LoginScreen onLogin={handleLogin} />;
+  }
+
+  if (mustChangePassword) {
+    return (
+      <ChangePasswordScreen
+        user={user}
+        onChangePassword={handleChangePassword}
+      />
+    );
   }
 
   return (

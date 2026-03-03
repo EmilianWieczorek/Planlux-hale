@@ -271,14 +271,15 @@ export async function generatePdfFromTemplate(
     return { ok: false, error: msg, details: e instanceof Error ? e.stack : undefined };
   }
 
-  const tmpDir = path.join(app.getPath("userData"), "tmp");
-  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  const baseDir = app.getPath("userData");
+  const tmpDir = path.join(baseDir, "tmp");
+  await fs.promises.mkdir(tmpDir, { recursive: true });
   const offerId = `offer_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   const offerDir = path.join(tmpDir, offerId);
   const tempHtmlPath = path.join(offerDir, "index.html");
 
   try {
-    fs.mkdirSync(offerDir, { recursive: true });
+    await fs.promises.mkdir(offerDir, { recursive: true });
     const assetsSrc = path.join(templateDir, "assets");
     if (fs.existsSync(assetsSrc)) {
       const assetsDest = path.join(offerDir, "assets");
@@ -310,6 +311,7 @@ export async function generatePdfFromTemplate(
   }
 
   const outputDir = options?.previewMode ? getPdfPreviewDir() : getPdfOutputDir();
+  await fs.promises.mkdir(outputDir, { recursive: true });
   const fileName = options?.previewMode
     ? getPreviewPdfFileName()
     : options?.testMode

@@ -1,12 +1,15 @@
 /**
- * Secure password storage: keytar (OS keychain) with AES fallback.
- * - Windows: Credential Vault
+ * Secure password storage for SMTP.
+ * SMTP password is encrypted using OS-level encryption (Electron safeStorage) when available:
+ * - Windows: DPAPI
  * - macOS: Keychain
- * - Linux: secret service
- * If keytar is unavailable, use AES-256-GCM with a per-device key stored in app userData.
+ * - Linux: libsecret / kwallet
+ * Encrypted buffer is stored as base64; plain password is never persisted.
+ * When safeStorage is unavailable, keytar (OS keychain) or AES-256-GCM fallback is used.
  */
 
 const SERVICE_NAME = "PlanluxHaleSMTP";
+const SAFE_STORAGE_PREFIX = "v2:";
 
 function accountKey(accountId: string): string {
   return `smtp:${accountId}`;
@@ -20,11 +23,35 @@ try {
   keytarModule = null;
 }
 
-// Fallback: AES-256-GCM with key derived from machine id / userData path
-import { app } from "electron";
+import { app, safeStorage } from "electron";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
+
+function isSafeStorageAvailable(): boolean {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
+/** Encrypt with Electron safeStorage; returns "v2:" + base64(encrypted buffer). */
+function encryptWithSafeStorage(plain: string): string {
+  const buffer = safeStorage.encryptString(plain);
+  return SAFE_STORAGE_PREFIX + buffer.toString("base64");
+}
+
+/** Decrypt value if it has safeStorage prefix. Returns plain or null. */
+function decryptSafeStoragePayload(stored: string): string | null {
+  if (!stored.startsWith(SAFE_STORAGE_PREFIX)) return null;
+  try {
+    const buf = Buffer.from(stored.slice(SAFE_STORAGE_PREFIX.length), "base64");
+    return safeStorage.decryptString(buf);
+  } catch {
+    return null;
+  }
+}
 
 const ALG = "aes-256-gcm";
 const IV_LEN = 16;
@@ -111,28 +138,46 @@ function saveFallbackStore(): void {
 
 export async function setPassword(accountId: string, password: string): Promise<void> {
   const key = accountKey(accountId);
+  let toStore: string;
+  if (isSafeStorageAvailable()) {
+    toStore = encryptWithSafeStorage(password);
+  } else if (keytarModule) {
+    toStore = password;
+  } else {
+    toStore = encryptFallback(password);
+  }
   if (keytarModule) {
-    await keytarModule.setPassword(SERVICE_NAME, key, password);
+    await keytarModule.setPassword(SERVICE_NAME, key, toStore);
     return;
   }
   loadFallbackStore();
-  FALLBACK_STORE.set(key, encryptFallback(password));
+  FALLBACK_STORE.set(key, toStore);
   saveFallbackStore();
 }
 
 export async function getPassword(accountId: string): Promise<string | null> {
   const key = accountKey(accountId);
+  let stored: string | null;
   if (keytarModule) {
-    return await keytarModule.getPassword(SERVICE_NAME, key);
+    stored = await keytarModule.getPassword(SERVICE_NAME, key);
+  } else {
+    loadFallbackStore();
+    stored = FALLBACK_STORE.get(key) ?? null;
   }
-  loadFallbackStore();
-  const enc = FALLBACK_STORE.get(key);
-  if (!enc) return null;
-  try {
-    return decryptFallback(enc);
-  } catch {
+  if (!stored) return null;
+  if (stored.startsWith(SAFE_STORAGE_PREFIX) && isSafeStorageAvailable()) {
+    const dec = decryptSafeStoragePayload(stored);
+    if (dec !== null) return dec;
     return null;
   }
+  if (!keytarModule) {
+    try {
+      return decryptFallback(stored);
+    } catch {
+      return null;
+    }
+  }
+  return stored;
 }
 
 export async function deletePassword(accountId: string): Promise<boolean> {
@@ -149,6 +194,11 @@ export async function deletePassword(accountId: string): Promise<boolean> {
 
 export function isKeytarAvailable(): boolean {
   return keytarModule != null;
+}
+
+/** Key used in keytar for SMTP (service: PlanluxHaleSMTP, account: smtp:${accountId}). Log for debug only – never log password. */
+export function getSmtpKeytarAccountKey(accountId: string): string {
+  return accountKey(accountId);
 }
 
 /** Per-user SMTP password (key = smtp:${userId}). Use for salesperson @planlux.pl accounts. */

@@ -63,26 +63,21 @@ export function getTestPdfFileName(): string {
 }
 
 /**
- * Resolve output directory: documents/Planlux Hale/output or userData/output.
+ * Katalog zapisu PDF: userData/pdf (stabilny w DEV i PROD, zawsze istnieje).
  */
 export function getPdfOutputDir(): string {
-  try {
-    const docs = app.getPath("documents");
-    const dir = path.join(docs, "Planlux Hale", "output");
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return dir;
-  } catch {
-    const dir = path.join(app.getPath("userData"), "output");
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return dir;
-  }
+  const baseDir = app.getPath("userData");
+  const pdfDir = path.join(baseDir, "pdf");
+  if (!fs.existsSync(pdfDir)) fs.mkdirSync(pdfDir, { recursive: true });
+  return pdfDir;
 }
 
 /**
  * Katalog na tymczasowe PDF preview (userData/preview).
  */
 export function getPdfPreviewDir(): string {
-  const dir = path.join(app.getPath("userData"), "preview");
+  const baseDir = app.getPath("userData");
+  const dir = path.join(baseDir, "preview");
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
