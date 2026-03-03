@@ -190,7 +190,15 @@ function getAccountForOutboxRow(db: Db, row: EmailOutboxRow): SmtpAccountRow | n
 
 export type BuildTransportOverrides = { port?: number; secure?: boolean } | undefined;
 
-/** Single source: fetch password from keytar for the account. Used by BOTH send and test. No cache. */
+/** Normalize secure from DB (INTEGER 0/1, or legacy boolean/string). Never log password. */
+export function secureToBool(raw: unknown): boolean {
+  if (raw === 1 || raw === true) return true;
+  if (raw === 0 || raw === false) return false;
+  const s = String(raw ?? "").toLowerCase();
+  return s === "true" || s === "1";
+}
+
+/** Single source: fetch password from keytar for the account. Used by BOTH send and test. No cache. Logs only safe fields (no password). */
 export async function getCredentialsForAccount(
   db: Db,
   account: SmtpAccountRow
@@ -200,21 +208,20 @@ export async function getCredentialsForAccount(
     ? await getSmtpPassword(account.user_id)
     : await getPassword(account.id);
   if (!pass) throw new Error(`Brak hasła SMTP dla konta: ${account.name || account.from_email}`);
-  const selectedUserEmail = (account.from_email || "").trim() || "(brak from_email)";
+  const fromEmail = (account.from_email || "").trim() || "(brak from_email)";
   const keytarAccountKeyUsed = getSmtpKeytarAccountKey(keytarLookupId);
   let port = Number(account.port) || 587;
-  let secure = account.secure === 1;
+  let secure = secureToBool(account.secure);
   const normalized = normalizeSmtpPortSecure(port, secure);
   port = normalized.port;
   secure = normalized.secure;
-  console.log("KEYTAR ENTRY:", selectedUserEmail, "passLength:", pass.length);
-  console.log("[smtp] credentials (single source)", {
-    selectedUserEmail,
-    keytarAccountKeyUsed,
-    passLength: pass.length,
+  console.log("[smtp] credentials (no password in logs)", {
     host: account.host,
     port,
     secure,
+    auth_user: account.auth_user || fromEmail,
+    from_email: fromEmail,
+    keytarAccountKeyUsed,
   });
   return { account, password: pass };
 }
@@ -223,13 +230,17 @@ export async function getCredentialsForAccount(
  * Build transporter from account + password. Same function used by send AND test.
  * auth.user = full email (from_email). from in mail must equal auth.user.
  */
+const SMTP_CONNECTION_TIMEOUT_MS = 10000;
+const SMTP_GREETING_TIMEOUT_MS = 10000;
+const SMTP_SOCKET_TIMEOUT_MS = 15000;
+
 export function buildTransportFromConfig(
   account: SmtpAccountRow,
   password: string,
   overrides?: BuildTransportOverrides
 ): nodemailer.Transporter {
   let port = Number(account.port) || 587;
-  let secure = account.secure === 1;
+  let secure = secureToBool(account.secure);
   if (overrides?.port != null) port = overrides.port;
   if (overrides?.secure !== undefined) secure = overrides.secure;
   const normalized = normalizeSmtpPortSecure(port, secure);
@@ -245,6 +256,9 @@ export function buildTransportFromConfig(
     port,
     secure,
     auth: { user, pass: password },
+    connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+    greetingTimeout: SMTP_GREETING_TIMEOUT_MS,
+    socketTimeout: SMTP_SOCKET_TIMEOUT_MS,
     ...(isDev() ? { tls: { rejectUnauthorized: false } } : {}),
   });
 }

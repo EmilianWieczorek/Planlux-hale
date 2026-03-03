@@ -2472,7 +2472,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         const hasPassword = uid
           ? !!(await secureGetSmtpPassword(uid))
           : !!(await secureGetPassword(r.id as string));
-        return { ...r, hasPassword };
+        const secure = r.secure === 1 || r.secure === true || String(r.secure).toLowerCase() === "true" ? 1 : 0;
+        return { ...r, hasPassword, secure };
       }));
       return { ok: true, accounts: withPasswordStatus };
     } catch (e) {
@@ -2545,10 +2546,17 @@ console.log("[IPC] handler registered: planlux:checkInternet");
   }
 
   function smtpTestUserFriendlyMessage(rawError: string, debugId: string): string {
-    const has535 = /535|authentication failed/i.test(rawError);
-    const base = has535
-      ? "Połączenie SMTP nie powiodło się (błąd logowania). Sprawdź adres e-mail i hasło."
-      : "Połączenie SMTP nie powiodło się.";
+    const msg = (rawError || "").toLowerCase();
+    let base: string;
+    if (/eauth|invalid login|535|authentication failed|auth failed/i.test(msg)) {
+      base = "Błąd logowania SMTP: sprawdź login/hasło oraz czy konto pocztowe istnieje na serwerze.";
+    } else if (/esocket|etimedout|econnrefused|enotfound|econnreset|network|timeout/i.test(msg)) {
+      base = "Brak połączenia / firewall / port.";
+    } else if (/self signed|tls|wrong_version|certificate|unable to verify/i.test(msg)) {
+      base = "Problem TLS – sprawdź secure/port.";
+    } else {
+      base = "Połączenie SMTP nie powiodło się.";
+    }
     return `${base} Identyfikator debug: ${debugId}`;
   }
 
@@ -2668,7 +2676,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const row = getAccountByUserId(db as import("./emailService").Db, user.id);
       if (!row) return { ok: true, account: null };
       const r = row as Record<string, unknown>;
-      return { ok: true, account: { id: row.id, user_id: row.user_id, name: row.name, from_name: row.from_name, from_email: row.from_email, host: row.host, port: row.port, secure: row.secure, auth_user: row.auth_user, reply_to: row.reply_to, active: row.active, created_at: r.created_at, updated_at: r.updated_at } };
+      const secure = row.secure === 1 || row.secure === true || String(row.secure).toLowerCase() === "true" ? 1 : 0;
+      return { ok: true, account: { id: row.id, user_id: row.user_id, name: row.name, from_name: row.from_name, from_email: row.from_email, host: row.host, port: row.port, secure, auth_user: row.auth_user, reply_to: row.reply_to, active: row.active, created_at: r.created_at, updated_at: r.updated_at } };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -2680,7 +2689,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     try {
       const user = requireAuth();
       if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid payload" };
-      const p = payload as { targetUserId?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean; auth_user?: string; smtpPass?: string; reply_to?: string };
+      const p = payload as { targetUserId?: string; from_name?: string; from_email?: string; host?: string; port?: number; secure?: boolean | number; auth_user?: string; smtpPass?: string; reply_to?: string };
       const targetUserId = (typeof p.targetUserId === "string" ? p.targetUserId : null) ?? user.id;
       if (user.role === "HANDLOWIEC" && targetUserId !== user.id) return { ok: false, error: "Forbidden" };
       const db = getDb();
@@ -2689,8 +2698,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const from_email = (typeof p.from_email === "string" ? p.from_email.trim() : null) ?? userRow.email;
       const from_name = (typeof p.from_name === "string" ? p.from_name.trim() : "") || from_email;
       const host = (typeof p.host === "string" ? p.host.trim() : "") || "";
-      const port = typeof p.port === "number" ? p.port : 587;
-      const secure = p.secure === true ? 1 : 0;
+      const port = typeof p.port === "number" ? p.port : (typeof p.port === "string" ? parseInt(p.port, 10) : NaN) || 465;
+      const secure = (p.secure === true || p.secure === 1) ? 1 : 0;
       const auth_user = (typeof p.auth_user === "string" ? p.auth_user.trim() : null) ?? from_email;
       const reply_to = (typeof p.reply_to === "string" ? p.reply_to.trim() : null) || null;
       const now = new Date().toISOString();
@@ -2735,9 +2744,12 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         await setSmtpPassword(targetUserId, smtpPass);
       }
       const port = Number(account.port) || 587;
-      const secure = account.secure === 1;
+      const secure = account.secure === 1 || account.secure === true || String(account.secure).toLowerCase() === "true";
       const { port: normPort, secure: normSecure } = normalizeSmtpPortSecure(port, secure);
-      logger.info("[smtp] testForUser", { host: account.host, port: normPort, secure: normSecure, from_email: account.from_email });
+      logger.info("[smtp] testForUser (no password in logs)", { host: account.host, port: normPort, secure: normSecure, user_id: targetUserId, auth_user: account.auth_user || account.from_email, from_email: account.from_email });
+      if (/smtp\.cyberfolks\.pl/i.test(account.host)) {
+        logger.warn("[smtp] Dla CyberFolks użyj hosta poczta.cyberfolks.pl zamiast smtp.cyberfolks.pl", { host: account.host });
+      }
       if (/gmail\.com|googlemail\.com/i.test(account.host)) {
         logger.warn("[smtp] Gmail: upewnij się, że używasz Hasła aplikacji (App Password), nie zwykłego hasła do konta Google.");
       }
@@ -2760,7 +2772,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       }
       if (result.ok) return { ok: true };
       const debugId = smtpTestDebugId();
-      logger.warn("[smtp] testForUser failed. If sending works for this user, test path had mismatched credentials.", { debugId, userId: targetUserId, from_email: account.from_email, error: result.error, response: result.response, stack: result.stack });
+      logger.warn("[smtp] testForUser failed (no password in logs)", { debugId, userId: targetUserId, host: account.host, port: normPort, secure: normSecure, from_email: account.from_email, error: result.error, response: result.response });
       return {
         ok: false,
         error: smtpTestUserFriendlyMessage(result.error, debugId),
@@ -2772,7 +2784,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
     } catch (e) {
       const ser = serializeError(e);
       const debugId = smtpTestDebugId();
-      logger.warn("[smtp] testForUser failed. If sending works for this user, test path had mismatched credentials.", { debugId, message: ser.message, stack: ser.stack });
+      logger.warn("[smtp] testForUser failed (no password in logs)", { debugId, message: ser.message, code: ser.code, stack: ser.stack });
       return {
         ok: false,
         error: smtpTestUserFriendlyMessage(ser.message, debugId),

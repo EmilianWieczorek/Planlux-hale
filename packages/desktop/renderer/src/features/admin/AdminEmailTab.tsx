@@ -104,9 +104,9 @@ export function AdminEmailTab({ api }: Props) {
   const [editingUser, setEditingUser] = useState<UserRow | null>(null);
   const [editingAccount, setEditingAccount] = useState<SmtpAccount | null>(null);
   const [formFromName, setFormFromName] = useState("");
-  const [formHost, setFormHost] = useState("mail.planlux.pl");
-  const [formPort, setFormPort] = useState("587");
-  const [formSecure, setFormSecure] = useState(false);
+  const [formHost, setFormHost] = useState("poczta.cyberfolks.pl");
+  const [formPort, setFormPort] = useState("465");
+  const [formSecure, setFormSecure] = useState(true);
   const [formAuthUser, setFormAuthUser] = useState("");
   const [formPassword, setFormPassword] = useState("");
   const [formReplyTo, setFormReplyTo] = useState("");
@@ -187,18 +187,22 @@ export function AdminEmailTab({ api }: Props) {
     if (subTab === 3) loadHistory();
   }, [subTab, loadHistory]);
 
+  /** CyberFolks: host poczta.cyberfolks.pl, port 465, SSL/TLS. */
+  const CYBERFOLKS_HOST = "poczta.cyberfolks.pl";
+  const CYBERFOLKS_PORT = 465;
   const openSmtpForm = (user: UserRow, acc?: SmtpAccount | null) => {
     setEditingUser(user);
     setEditingAccount(acc ?? null);
     setFormFromName(acc?.from_name || user.displayName || "");
-    setFormHost(acc?.host || "mail.planlux.pl");
-    setFormPort(String(acc?.port || 587));
+    setFormHost(acc?.host || CYBERFOLKS_HOST);
+    setFormPort(acc?.port != null && acc.port !== undefined ? String(acc.port) : String(CYBERFOLKS_PORT));
     setFormSecure(acc?.secure === 1);
     setFormAuthUser(acc?.auth_user || user.email || "");
     setFormPassword("");
     setFormReplyTo(acc?.reply_to || "");
     setAccountModalOpen(true);
   };
+  const hostIsWrongCyberFolks = formHost.trim().toLowerCase().replace(/^www\./, "") === "smtp.cyberfolks.pl";
 
   const handleSaveGlobalSettings = async () => {
     setSubmitting(true);
@@ -233,13 +237,14 @@ export function AdminEmailTab({ api }: Props) {
     }
     setSubmitting(true);
     try {
+      const portNum = parseInt(formPort, 10) || CYBERFOLKS_PORT;
       const r = (await api("planlux:smtp:upsertForUser", {
         targetUserId: editingUser.id,
         from_name: formFromName.trim(),
         from_email: editingUser.email,
         host: formHost.trim(),
-        port: parseInt(formPort, 10) || 587,
-        secure: formSecure,
+        port: portNum,
+        secure: formSecure ? 1 : 0,
         auth_user: formAuthUser.trim() || editingUser.email,
         smtpPass: formPassword || undefined,
         reply_to: formReplyTo.trim() || undefined,
@@ -262,9 +267,20 @@ export function AdminEmailTab({ api }: Props) {
     if (!editingUser) return;
     setTesting(true);
     try {
-      const r = (await api("planlux:smtp:testForUser", editingUser.id)) as { ok: boolean; error?: string };
+      const payload = formPassword
+        ? { userId: editingUser.id, smtpPass: formPassword }
+        : editingUser.id;
+      const r = (await api("planlux:smtp:testForUser", payload)) as { ok: boolean; error?: string; debugId?: string };
       if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
-      else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
+      else {
+        const msg = r.error ?? "Błąd połączenia";
+        const isAuthError = /auth failed|Invalid login|błąd logowania|535/i.test(msg);
+        const displayMsg = isAuthError
+          ? "Błąd logowania SMTP: sprawdź login/hasło oraz czy konto pocztowe istnieje na serwerze."
+          : msg;
+        const withId = r.debugId ? `${displayMsg} Identyfikator debug: ${r.debugId}` : displayMsg;
+        setSnackbar({ open: true, message: withId, severity: "error" });
+      }
     } catch (e) {
       setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
     } finally {
@@ -385,9 +401,17 @@ export function AdminEmailTab({ api }: Props) {
                               onClick={async () => {
                                 setTesting(true);
                                 try {
-                                  const r = (await api("planlux:smtp:testForUser", u.id)) as { ok: boolean; error?: string };
+                                  const r = (await api("planlux:smtp:testForUser", u.id)) as { ok: boolean; error?: string; debugId?: string };
                                   if (r.ok) setSnackbar({ open: true, message: "Połączenie OK", severity: "success" });
-                                  else setSnackbar({ open: true, message: r.error ?? "Błąd połączenia", severity: "error" });
+                                  else {
+                                    const msg = r.error ?? "Błąd połączenia";
+                                    const isAuthError = /auth failed|Invalid login|błąd logowania|535/i.test(msg);
+                                    const displayMsg = isAuthError
+                                      ? "Błąd logowania SMTP: sprawdź login/hasło oraz czy konto pocztowe istnieje na serwerze."
+                                      : msg;
+                                    const withId = r.debugId ? `${displayMsg} Identyfikator debug: ${r.debugId}` : displayMsg;
+                                    setSnackbar({ open: true, message: withId, severity: "error" });
+                                  }
                                 } catch (e) {
                                   setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
                                 } finally {
@@ -539,10 +563,22 @@ export function AdminEmailTab({ api }: Props) {
       <Dialog open={accountModalOpen} onClose={() => !submitting && setAccountModalOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Konfiguracja SMTP – {editingUser?.displayName || editingUser?.email}</DialogTitle>
         <DialogContent>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            Dla CyberFolks: host poczta.cyberfolks.pl, port 465, SSL/TLS.
+          </Typography>
           <TextField margin="dense" label="E-mail nadawcy" fullWidth value={editingUser?.email ?? ""} disabled />
           <TextField margin="dense" label="Nazwa nadawcy (from)" fullWidth value={formFromName} onChange={(e) => setFormFromName(e.target.value)} placeholder="np. Paweł Kowalski" />
-          <TextField margin="dense" label="Host SMTP" fullWidth required value={formHost} onChange={(e) => setFormHost(e.target.value)} placeholder="mail.planlux.pl" />
-          <TextField margin="dense" label="Port" type="number" fullWidth value={formPort} onChange={(e) => setFormPort(e.target.value)} />
+          <TextField
+            margin="dense"
+            label="Host SMTP"
+            fullWidth
+            required
+            value={formHost}
+            onChange={(e) => setFormHost(e.target.value)}
+            placeholder={CYBERFOLKS_HOST}
+            helperText={hostIsWrongCyberFolks ? "Dla CyberFolks użyj poczta.cyberfolks.pl" : undefined}
+          />
+          <TextField margin="dense" label="Port" type="number" fullWidth value={formPort} onChange={(e) => setFormPort(e.target.value)} placeholder="465" />
           <FormControlLabel
             control={<Checkbox checked={formSecure} onChange={(e) => setFormSecure(e.target.checked)} color="primary" />}
             label="Secure (SSL/TLS)"
