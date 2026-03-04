@@ -132,7 +132,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const widthM = draft.widthM;
   const lengthM = draft.lengthM;
   const heightM = draft.heightM;
-  const addons = draft.addons;
+  const addons = draft.addons ?? [];
   const standardSnapshot = draft.standardSnapshot ?? [];
   const rainGuttersAuto = draft.rainGuttersAuto ?? false;
   const gates = draft.gates ?? [];
@@ -174,6 +174,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const [overwriteOfferNumberDialog, setOverwriteOfferNumberDialog] = useState(false);
   const [autoGenerating, setAutoGenerating] = useState(false);
   const [duplicateModal, setDuplicateModal] = useState<{ open: boolean; duplicates: DuplicateOffer[] }>({ open: false, duplicates: [] });
+  /** E2E/UX: visible status during and after PDF generate (Generowanie… / Wygenerowano / Błąd PDF: …). */
+  const [pdfStatusMessage, setPdfStatusMessage] = useState<string | null>(null);
   const pendingPdfGenerateRef = useRef<(() => Promise<void>) | null>(null);
   const refreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewTokenRef = useRef(0);
@@ -195,8 +197,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   }, [showToast]);
 
   const loadPricing = useCallback(async () => {
-    const r = (await api("planlux:getPricingCache")) as {
-      ok: boolean;
+    const r = ((await api("planlux:getPricingCache")) ?? {}) as {
+      ok?: boolean;
       data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
     };
     if (r.ok && r.data) setPricingData(r.data);
@@ -211,12 +213,12 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   useEffect(() => {
     const w = parseFloat(widthM) || 0;
     const l = parseFloat(lengthM) || 0;
-    const hasData = (companyName.trim() || personName.trim() || draft.clientName.trim()).length > 0 && w > 0 && l > 0;
+    const hasData = ((companyName ?? "").trim() || (personName ?? "").trim() || (draft.clientName ?? "").trim()).length > 0 && w > 0 && l > 0;
     if (!hasData || draft.offerNumber || draft.offerNumberLocked || createOfferRequestedRef.current) return;
     const invoke = (window as unknown as { planlux?: { invoke?: (c: string, ...a: unknown[]) => Promise<unknown> } }).planlux?.invoke;
     if (!invoke) return;
     createOfferRequestedRef.current = true;
-    const createClientName = (personName.trim() || companyName.trim() || draft.clientName.trim()) || "Klient";
+    const createClientName = ((personName ?? "").trim() || (companyName ?? "").trim() || (draft.clientName ?? "").trim()) || "Klient";
     invoke("planlux:createOffer", { clientName: createClientName, widthM: w, lengthM: l })
       .then((res: unknown) => {
         const r = res as { ok?: boolean; offerId?: string; offerNumber?: string };
@@ -534,6 +536,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     };
     const pdfRes = (await api("pdf:generate", payload, undefined, undefined, draft.pdfOverrides && Object.keys(draft.pdfOverrides).length > 0 ? draft.pdfOverrides : undefined)) as { ok: boolean; pdfId?: string; filePath?: string; fileName?: string; error?: string };
     if (pdfRes.ok) {
+      setPdfStatusMessage(null);
       if (pdfRes.filePath) setLastPdfPath(pdfRes.filePath);
       if (pdfRes.fileName) setLastPdfFileName(pdfRes.fileName);
       showToast(`PDF zapisany: ${pdfRes.fileName ?? ""}`);
@@ -549,6 +552,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     } else {
       const err = (pdfRes as { error?: string }).error;
       const msg = err && err.length > 0 ? (err.length > 120 ? err.slice(0, 117) + "…" : err) : "Nie udało się wygenerować PDF. Spróbuj ponownie.";
+      setPdfStatusMessage(`Błąd PDF: ${msg}`);
       showToast(msg);
     }
   };
@@ -559,6 +563,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       return;
     }
     setGenerating(true);
+    setPdfStatusMessage("Generowanie...");
     try {
       const dupRes = (await api("planlux:findDuplicateOffers", {
         clientName: clientName || undefined,
@@ -580,7 +585,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       await doGeneratePdf();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Błąd generowania PDF";
-      showToast(msg.length > 120 ? msg.slice(0, 117) + "…" : msg);
+      const short = msg.length > 120 ? msg.slice(0, 117) + "…" : msg;
+      setPdfStatusMessage(`Błąd PDF: ${short}`);
+      showToast(short);
     } finally {
       setGenerating(false);
     }
@@ -603,15 +610,15 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           </AccordionSummary>
           <AccordionDetails>
             <label style={styles.label}>Nazwa firmy</label>
-            <input style={styles.input} value={companyName} onChange={(e) => actions.setCompanyName(e.target.value)} placeholder="np. Firma ABC Sp. z o.o." />
+            <input style={styles.input} value={companyName} onChange={(e) => actions.setCompanyName(e.target.value)} placeholder="np. Firma ABC Sp. z o.o." data-testid="client-company" />
             <label style={styles.label}>Imię i nazwisko</label>
-            <input style={styles.input} value={personName} onChange={(e) => actions.setPersonName(e.target.value)} placeholder="np. Jan Kowalski" />
+            <input style={styles.input} value={personName} onChange={(e) => actions.setPersonName(e.target.value)} placeholder="np. Jan Kowalski" data-testid="client-firstName" />
             <label style={styles.label}>Adres</label>
             <input style={styles.input} value={clientAddress} onChange={(e) => actions.setClientAddress(e.target.value)} placeholder="ul. Przykładowa 1, 00-001 Warszawa" />
             <label style={styles.label}>NIP</label>
             <input style={styles.input} value={clientNip} onChange={(e) => actions.setClientNip(e.target.value)} placeholder="np. 123-456-78-90" />
             <label style={styles.label}>E-mail</label>
-            <input style={styles.input} type="email" value={clientEmail} onChange={(e) => actions.setClientEmail(e.target.value)} placeholder="klient@firma.pl" />
+            <input style={styles.input} type="email" value={clientEmail} onChange={(e) => actions.setClientEmail(e.target.value)} placeholder="klient@firma.pl" data-testid="client-email" />
             <label style={styles.label}>Telefon</label>
             <input style={styles.input} value={clientPhone} onChange={(e) => actions.setClientPhone(e.target.value)} placeholder="+48 123 456 789" />
           </AccordionDetails>
@@ -625,7 +632,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           </AccordionSummary>
           <AccordionDetails>
             <label style={styles.label}>Wariant hali</label>
-            <select style={styles.input} value={variantHali} onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); actions.setAddons([]); actions.setStandardSnapshot([]); }}>
+            <select style={styles.input} value={variantHali} onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); actions.setAddons([]); actions.setStandardSnapshot([]); }} data-testid="hall-variant">
               {variants.map((v) => (
                 <option key={v.id} value={v.id}>{v.name}</option>
               ))}
@@ -633,15 +640,15 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <div style={styles.row}>
               <div style={{ flex: 1 }}>
                 <label style={styles.label}>Szerokość (m)</label>
-                <input style={styles.input} type="number" min={1} step={0.1} value={widthM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setWidthM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} />
+                <input style={styles.input} type="number" min={1} step={0.1} value={widthM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setWidthM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} data-testid="hall-width" />
               </div>
               <div style={{ flex: 1 }}>
                 <label style={styles.label}>Długość (m)</label>
-                <input style={styles.input} type="number" min={1} step={0.1} value={lengthM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setLengthM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} />
+                <input style={styles.input} type="number" min={1} step={0.1} value={lengthM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setLengthM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} data-testid="hall-length" />
               </div>
             </div>
             <label style={styles.label}>Wysokość (m) – opcjonalnie</label>
-            <input style={styles.input} type="number" min={0} step={0.01} value={heightM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setHeightM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} placeholder="np. 5.5" />
+            <input style={styles.input} type="number" min={0} step={0.01} value={heightM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setHeightM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} placeholder="np. 5.5" data-testid="hall-height" />
           </AccordionDetails>
         </Accordion>
         <Accordion defaultExpanded sx={{ "&:before": { display: "none" } }}>
@@ -961,26 +968,31 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <p style={{ color: tokens.color.textMuted }}>Brak bazy cennika. Kliknij „Synchronizuj bazę” (wymaga internetu).</p>
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
-            <button onClick={generatePdf} disabled={generating || !result?.success} style={styles.button}>
+            <button onClick={generatePdf} disabled={generating || !result?.success} style={styles.button} data-testid="offer-generate-pdf">
               {generating ? "Generowanie..." : "Generuj PDF"}
             </button>
-            {hasGeneratedPdf && (
-              <>
-                <button
-                  onClick={() => api("shell:openPath", lastPdfPath!)}
-                  style={styles.buttonSecondary}
-                >
-                  Otwórz PDF
-                </button>
-                <button
-                  onClick={() => api("shell:showItemInFolder", lastPdfPath!)}
-                  style={styles.buttonSecondary}
-                >
-                  Otwórz folder
-                </button>
-                {draft.draftId && (
+            {(generating || hasGeneratedPdf || pdfStatusMessage) && (
+              <span data-testid="pdf-status">
+                {generating && "Generowanie..."}
+                {hasGeneratedPdf && !generating && (
+                  <>
+                    Wygenerowano{" "}
+                    <button
+                    onClick={() => api("shell:openPath", lastPdfPath!)}
+                    style={styles.buttonSecondary}
+                  >
+                    Otwórz PDF
+                  </button>
                   <button
-                    onClick={async () => {
+                    onClick={() => api("shell:showItemInFolder", lastPdfPath!)}
+                    style={styles.buttonSecondary}
+                  >
+                    Otwórz folder
+                  </button>
+                  {draft.draftId && (
+                    <button
+                      data-testid="offer-send-email"
+                      onClick={async () => {
                       setEmailComposerOpen(true);
                       const prev = (await api("planlux:email:getOfferEmailPreview", draft.draftId)) as {
                         ok: boolean;
@@ -1010,8 +1022,11 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                   >
                     Wyślij e-mail
                   </button>
+                  )}
+                  </>
                 )}
-              </>
+                {pdfStatusMessage && !generating && !hasGeneratedPdf && pdfStatusMessage}
+              </span>
             )}
           </div>
         </div>

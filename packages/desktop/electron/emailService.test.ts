@@ -63,7 +63,7 @@ describe("emailService", () => {
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
     expect(db.prepare).toHaveBeenCalledWith(
-      expect.stringMatching(/INSERT INTO email_outbox.*queued/)
+      expect.stringMatching(/INSERT INTO email_outbox[\s\S]*queued/)
     );
     expect(run).toHaveBeenCalled();
   });

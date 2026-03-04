@@ -14,10 +14,14 @@ vi.mock("../../state/useOfferDraft", () => ({
       offerNumberLocked: false,
       variantId: "T18_T35_DACH",
       clientCompany: "",
+      companyName: "",
+      personName: "",
+      clientName: "",
       sellerName: "",
-      pdfOverrides: {},
+      pdfOverrides: { page1: {}, page2: {} },
       pdfTemplateConfig: null,
       status: "DRAFT",
+      addons: [],
     },
     actions: {},
   }),
@@ -37,9 +41,11 @@ describe("Kalkulator – no infinite update loop", () => {
   });
 
   it("mounts without causing infinite re-renders", async () => {
-    const { findByText } = render(
-      <Kalkulator api={vi.fn()} userId="user-1" online={true} />
+    const api = vi.fn().mockResolvedValue({ ok: false });
+    const { findAllByText } = render(
+      <Kalkulator api={api} userId="user-1" online={true} />
     );
-    await findByText(/Hala|Wariant|Kalkulator/u, {}, { timeout: 2000 });
+    const els = await findAllByText(/Hala|Wariant|Kalkulator/u, {}, { timeout: 2000 });
+    expect(els.length).toBeGreaterThan(0);
   });
 });

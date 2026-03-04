@@ -41,11 +41,19 @@ npm run desktop
 ## Build produkcyjny
 
 ```bash
-# Budowa instalatora Windows (.exe)
+# Budowa instalatora Windows (.exe) – bez wine/signing
 npm run dist:win
 
-# Wynik: packages/desktop/release/Planlux-Hale-{version}.exe
+# Wynik: packages/desktop/release/Planlux Hale Setup {version}.exe
+# Rozpakowana aplikacja: packages/desktop/release/win-unpacked/
 ```
+
+**Podpisywanie (opcjonalne):** Domyślnie build nie wymaga certyfikatu ani Wine. Aby podpisać instalator w CI, ustaw zmienne środowiskowe przed wywołaniem `electron-builder`:
+
+- `WIN_CSC_LINK` – ścieżka lub base64 do certyfikatu (.pfx/.p12)
+- `WIN_CSC_KEY_PASSWORD` – hasło do certyfikatu
+
+Skrypt `dist:win` ustawia `CSC_IDENTITY_AUTO_DISCOVERY=false`, dzięki czemu przy braku certyfikatu podpisywanie jest pomijane.
 
 ## Strategia gałęzi
 

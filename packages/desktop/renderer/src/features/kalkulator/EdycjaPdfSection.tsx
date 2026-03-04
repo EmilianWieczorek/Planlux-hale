@@ -45,6 +45,7 @@ export function EdycjaPdfSection({
   activeTab = 0,
   onActiveTabChange,
 }: EdycjaPdfSectionProps) {
+  const pdfOverridesSafe = pdfOverrides ?? { page1: {}, page2: {} };
   const [tab, setTab] = useState<0 | 1 | 2>(activeTab);
   const currentTab = onActiveTabChange ? activeTab : tab;
   const setCurrentTab = useCallback(
@@ -60,29 +61,29 @@ export function EdycjaPdfSection({
   const updatePage1 = useCallback(
     (partial: Partial<NonNullable<PdfOverrides["page1"]>>, mode: "typing" | "commit" = "typing") => {
       const next = mergePdfOverrides({
-        ...pdfOverrides,
-        page1: { ...pdfOverrides.page1, ...partial },
+        ...pdfOverridesSafe,
+        page1: { ...pdfOverridesSafe.page1, ...partial },
       });
       onPdfOverridesChange(next);
       markDirty(mode);
     },
-    [pdfOverrides, onPdfOverridesChange, markDirty]
+    [pdfOverridesSafe, onPdfOverridesChange, markDirty]
   );
 
   const updatePage2 = useCallback(
     (partial: Partial<NonNullable<PdfOverrides["page2"]>>, mode: "typing" | "commit" = "typing") => {
       const next = mergePdfOverrides({
-        ...pdfOverrides,
-        page2: { ...DEFAULT_PDF_OVERRIDES_PAGE2, ...pdfOverrides.page2, ...partial },
+        ...pdfOverridesSafe,
+        page2: { ...DEFAULT_PDF_OVERRIDES_PAGE2, ...pdfOverridesSafe.page2, ...partial },
       });
       onPdfOverridesChange(next);
       markDirty(mode);
     },
-    [pdfOverrides, onPdfOverridesChange, markDirty]
+    [pdfOverridesSafe, onPdfOverridesChange, markDirty]
   );
 
   const useManualPrice = Boolean(
-    pdfOverrides.page1?.priceNet != null || pdfOverrides.page1?.priceGross != null
+    pdfOverridesSafe.page1?.priceNet != null || pdfOverridesSafe.page1?.priceGross != null
   );
 
   const handleUseManualPriceChange = (checked: boolean) => {
@@ -107,7 +108,7 @@ export function EdycjaPdfSection({
 
   const summaryPreview = (() => {
     if (useManualPrice) return "Cena ręczna";
-    if (pdfOverrides.page2?.boxText1 || pdfOverrides.page2?.boxText2) return "Treści edytowane";
+    if (pdfOverridesSafe.page2?.boxText1 || pdfOverridesSafe.page2?.boxText2) return "Treści edytowane";
     return "Brak zmian";
   })();
 
@@ -151,7 +152,7 @@ export function EdycjaPdfSection({
                   label="Cena netto (opcjonalnie)"
                   type="number"
                   size="small"
-                  value={pdfOverrides.page1?.priceNet ?? ""}
+                  value={pdfOverridesSafe.page1?.priceNet ?? ""}
                   onChange={(e) => {
                     const v = parsePln(e.target.value);
                     updatePage1({ priceNet: v }, "typing");
@@ -164,7 +165,7 @@ export function EdycjaPdfSection({
                   type="number"
                   size="small"
                   required
-                  value={pdfOverrides.page1?.priceGross ?? ""}
+                  value={pdfOverridesSafe.page1?.priceGross ?? ""}
                   onChange={(e) => {
                     const v = parsePln(e.target.value);
                     updatePage1({ priceGross: v }, "typing");
@@ -192,7 +193,7 @@ export function EdycjaPdfSection({
                 multiline
                 minRows={3}
                 size="small"
-                value={pdfOverrides.page2?.[key] ?? DEFAULT_PDF_OVERRIDES_PAGE2[key]}
+                value={pdfOverridesSafe.page2?.[key] ?? DEFAULT_PDF_OVERRIDES_PAGE2[key]}
                 onChange={(e) => updatePage2({ [key]: e.target.value }, "typing")}
                 onBlur={() => onDirtyChange?.("commit")}
               />
@@ -202,7 +203,7 @@ export function EdycjaPdfSection({
               multiline
               minRows={2}
               size="small"
-              value={pdfOverrides.page2?.note ?? ""}
+              value={pdfOverridesSafe.page2?.note ?? ""}
               onChange={(e) => updatePage2({ note: e.target.value }, "typing")}
               onBlur={() => onDirtyChange?.("commit")}
             />

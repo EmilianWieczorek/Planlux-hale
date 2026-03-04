@@ -243,7 +243,7 @@ export function AdminPanel({ api, currentUser }: Props) {
         Panel admina
       </Typography>
       <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2, borderBottom: 1, borderColor: "divider" }}>
-        {canManage && <Tab icon={<People />} iconPosition="start" label="Użytkownicy" />}
+        {canManage && <Tab icon={<People />} iconPosition="start" label="Użytkownicy" data-testid="admin-users-open" />}
         <Tab icon={<Timeline />} iconPosition="start" label="Aktywność" />
         <Tab icon={<PictureAsPdf />} iconPosition="start" label="Historia PDF" />
         <Tab icon={<Email />} iconPosition="start" label="Historia e-mail" />
@@ -272,7 +272,7 @@ export function AdminPanel({ api, currentUser }: Props) {
               >
                 Synchronizuj użytkowników
               </Button>
-              <Button variant="contained" startIcon={<Add />} onClick={openCreateModal}>
+              <Button variant="contained" startIcon={<Add />} onClick={openCreateModal} data-testid="admin-user-create-open">
                 Dodaj użytkownika
               </Button>
             </div>
@@ -283,9 +283,9 @@ export function AdminPanel({ api, currentUser }: Props) {
           {loading ? (
             <Typography color="text.secondary">Ładowanie...</Typography>
           ) : users.length === 0 ? (
-            <Typography color="text.secondary">Brak użytkowników.</Typography>
+            <Typography color="text.secondary" data-testid="empty-state">Brak użytkowników.</Typography>
           ) : (
-            <Table size="small">
+            <Table size="small" data-testid="admin-users-table">
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
@@ -378,9 +378,9 @@ export function AdminPanel({ api, currentUser }: Props) {
             Wszystkie wygenerowane PDF wszystkich użytkowników.
           </p>
           {pdfs.length === 0 ? (
-            <Typography color="text.secondary">Brak wygenerowanych PDF.</Typography>
+            <Typography color="text.secondary" data-testid="empty-state">Brak wygenerowanych PDF.</Typography>
           ) : (
-            <Table size="small">
+            <Table size="small" data-testid="history-pdf-table">
               <TableHead>
                 <TableRow>
                   <TableCell>Klient</TableCell>
@@ -419,9 +419,9 @@ export function AdminPanel({ api, currentUser }: Props) {
             Wszystkie wysłane e-maile wszystkich użytkowników.
           </p>
           {emails.length === 0 ? (
-            <Typography color="text.secondary">Brak wysłanych e-maili.</Typography>
+            <Typography color="text.secondary" data-testid="empty-state">Brak wysłanych e-maili.</Typography>
           ) : (
-            <Table size="small">
+            <Table size="small" data-testid="history-email-table">
               <TableHead>
                 <TableRow>
                   <TableCell>Do</TableCell>
@@ -465,6 +465,7 @@ export function AdminPanel({ api, currentUser }: Props) {
             value={formEmail}
             onChange={(e) => setFormEmail(e.target.value)}
             required
+            inputProps={{ "data-testid": "admin-user-email" }}
           />
           <TextField
             margin="dense"
@@ -475,6 +476,7 @@ export function AdminPanel({ api, currentUser }: Props) {
             onChange={(e) => setFormPassword(e.target.value)}
             placeholder={editingUser ? "Zostaw puste, aby nie zmieniać" : ""}
             required={!editingUser}
+            inputProps={{ "data-testid": "admin-user-password" }}
           />
           <TextField
             margin="dense"
@@ -482,10 +484,11 @@ export function AdminPanel({ api, currentUser }: Props) {
             fullWidth
             value={formDisplayName}
             onChange={(e) => setFormDisplayName(e.target.value)}
+            inputProps={{ "data-testid": "admin-user-displayName" }}
           />
           <FormControl fullWidth margin="dense">
             <InputLabel>Rola</InputLabel>
-            <Select value={["ADMIN","SZEF","HANDLOWIEC"].includes(formRole) ? formRole : "HANDLOWIEC"} label="Rola" onChange={(e) => setFormRole(e.target.value)}>
+            <Select value={["ADMIN","SZEF","HANDLOWIEC"].includes(formRole) ? formRole : "HANDLOWIEC"} label="Rola" onChange={(e) => setFormRole(e.target.value)} inputProps={{ "data-testid": "admin-user-role" }}>
               <MenuItem value="ADMIN">Admin</MenuItem>
               <MenuItem value="SZEF">Szef</MenuItem>
               <MenuItem value="HANDLOWIEC">Handlowiec</MenuItem>
@@ -496,7 +499,7 @@ export function AdminPanel({ api, currentUser }: Props) {
           <Button onClick={() => setModalOpen(false)} disabled={submitting}>
             Anuluj
           </Button>
-          <Button onClick={handleSubmit} variant="contained" disabled={submitting}>
+          <Button onClick={handleSubmit} variant="contained" disabled={submitting} data-testid="admin-user-save">
             {submitting ? "Zapisywanie…" : editingUser ? "Zapisz" : "Utwórz"}
           </Button>
         </DialogActions>
@@ -540,7 +543,7 @@ export function AdminPanel({ api, currentUser }: Props) {
         onClose={() => setSnackbar((s) => ({ ...s, open: false }))}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       >
-        <Alert severity={snackbar.severity} onClose={() => setSnackbar((s) => ({ ...s, open: false }))}>
+        <Alert severity={snackbar.severity} onClose={() => setSnackbar((s) => ({ ...s, open: false }))} data-testid="admin-toast">
           {snackbar.message}
         </Alert>
       </Snackbar>

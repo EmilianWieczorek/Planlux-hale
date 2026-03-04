@@ -3,7 +3,8 @@
  * { ok: false, error: "Unauthorized" } lub "Forbidden" gdy brak sesji / zła rola.
  * @vitest-environment node
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+vi.mock("electron", () => ({ app: { getPath: () => require("path").join(require("os").tmpdir(), "planlux-test") } }));
 import { setSession, getSession, type SessionUser } from "./ipc";
 
 describe("IPC auth session", () => {

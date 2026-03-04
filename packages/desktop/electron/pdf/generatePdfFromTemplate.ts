@@ -182,7 +182,7 @@ export function mapOfferDataToPayload(
 
 export type GeneratePdfFromTemplateResult =
   | { ok: true; filePath: string; fileName: string }
-  | { ok: false; error: string; details?: string };
+  | { ok: false; error: string; details?: string; stage?: "TEMPLATE_MISSING" | "RENDER_FAILED" | "PRINT_FAILED" | "WRITE_FAILED" };
 
 /**
  * Resolve template dir, render HTML, write to userData/tmp, loadFile, printToPDF, save to Documents/Planlux Hale/output.
@@ -204,7 +204,19 @@ export async function generatePdfFromTemplate(
   options?: GeneratePdfFromTemplateOptions | null,
   pdfOverrides?: PdfOverridesForGenerator | null
 ): Promise<GeneratePdfFromTemplateResult> {
+  const isE2E = process.env.PLANLUX_E2E === "1";
   const templateDir = getPdfTemplateDir();
+  if (isE2E || process.env.PLANLUX_LOG_LEVEL === "debug") {
+    const outDir = options?.previewMode ? getPdfPreviewDir() : getPdfOutputDir();
+    logger.info("[E2E/pdf] pipeline start", {
+      isE2E,
+      PLANLUX_E2E_DIR: process.env.PLANLUX_E2E_DIR,
+      templateDir: templateDir ? path.resolve(templateDir) : null,
+      templateIndexExists: templateDir ? fs.existsSync(path.join(templateDir, "index.html")) : false,
+      outputDir: path.resolve(outDir),
+      outputDirExists: fs.existsSync(outDir),
+    });
+  }
   if (isDev()) {
     logger.info("[pdf] templateDir", templateDir ?? "(brak)");
     logger.info("[pdf] templateConfig", templateConfig != null);
@@ -244,7 +256,7 @@ export async function generatePdfFromTemplate(
     logger.info("[pdf] template source", fromDist ? "dist/assets" : "packages/desktop/assets (dev)");
   }
   if (!templateDir) {
-    return { ok: false, error: "Szablon Planlux-PDF nie został znaleziony (brak index.html w assets/pdf-template/Planlux-PDF)." };
+    return { ok: false, error: "Szablon Planlux-PDF nie został znaleziony (brak index.html w assets/pdf-template/Planlux-PDF).", stage: "TEMPLATE_MISSING" };
   }
 
   const now = new Date();
@@ -268,7 +280,7 @@ export async function generatePdfFromTemplate(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[pdf] renderPdfTemplateHtml failed", e);
-    return { ok: false, error: msg, details: e instanceof Error ? e.stack : undefined };
+    return { ok: false, error: msg, details: e instanceof Error ? e.stack : undefined, stage: "RENDER_FAILED" };
   }
 
   const baseDir = app.getPath("userData");
@@ -298,7 +310,7 @@ export async function generatePdfFromTemplate(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[pdf] write temp HTML/assets failed", e);
-    return { ok: false, error: `Zapis tymczasowy: ${msg}` };
+    return { ok: false, error: `Zapis tymczasowy: ${msg}`, stage: "RENDER_FAILED" };
   }
 
   const printResult = await runPrintToPdfFromFile(tempHtmlPath, logger);
@@ -307,7 +319,7 @@ export async function generatePdfFromTemplate(
   } catch (_) {}
 
   if (!printResult.ok) {
-    return { ok: false, error: printResult.error, details: printResult.details };
+    return { ok: false, error: printResult.error, details: printResult.details, stage: "PRINT_FAILED" };
   }
 
   const outputDir = options?.previewMode ? getPdfPreviewDir() : getPdfOutputDir();
@@ -325,6 +337,10 @@ export async function generatePdfFromTemplate(
 
   try {
     fs.writeFileSync(filePath, printResult.buffer);
+    const stat = fs.statSync(filePath);
+    if (isE2E || process.env.PLANLUX_LOG_LEVEL === "debug") {
+      logger.info("[E2E/pdf] file written", { filePath: path.resolve(filePath), size: stat.size, fileName });
+    }
     if (isDev()) {
       logger.info("[pdf] final PDF", { filePath, fileName });
     } else {
@@ -333,7 +349,7 @@ export async function generatePdfFromTemplate(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[pdf] save PDF failed", e);
-    return { ok: false, error: `Zapis PDF: ${msg}` };
+    return { ok: false, error: `Zapis PDF: ${msg}`, stage: "WRITE_FAILED" };
   }
 
   return { ok: true, filePath, fileName };

@@ -16,15 +16,17 @@ describe("AdminPanel – no infinite update loop", () => {
   });
 
   it("mounts and loads users without infinite re-renders", async () => {
-    const { findByText } = render(<AdminPanel api={mockApi} currentUser={currentUser} />);
-    await findByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 3000 });
+    const { findAllByText } = render(<AdminPanel api={mockApi} currentUser={currentUser} />);
+    const els = await findAllByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 3000 });
+    expect(els.length).toBeGreaterThan(0);
     expect(mockApi).toHaveBeenCalledWith("planlux:getUsers");
   });
 
   it("role dropdown has Admin, Szef, Handlowiec options", async () => {
     mockApi.mockResolvedValue({ ok: true, users: [] });
-    const { findByText } = render(<AdminPanel api={mockApi} currentUser={currentUser} />);
-    await findByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 2000 });
+    const { findAllByText } = render(<AdminPanel api={mockApi} currentUser={currentUser} />);
+    const els = await findAllByText(/Użytkownicy|Ładowanie/u, {}, { timeout: 2000 });
+    expect(els.length).toBeGreaterThan(0);
     expect(mockApi).toHaveBeenCalledWith("planlux:getUsers");
   });
 });

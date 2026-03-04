@@ -13,6 +13,10 @@ build/
 .cache/
 coverage/
 
+# E2E marker (test launcher writes; main reads)
+.e2e-run-dir
+.e2e-handler-entered
+
 # logs
 *.log
 npm-debug.log*

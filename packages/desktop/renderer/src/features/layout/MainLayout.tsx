@@ -317,12 +317,12 @@ export function MainLayout({ user, onLogout, api }: Props) {
         <h1 style={styles.title}>Planlux Hale</h1>
         <nav style={styles.nav}>
           {(["dashboard", "kalkulator", "oferty"] as const).map((t) => (
-            <button key={t} onClick={() => handleTabChange(t)} style={styles.navBtn(tab === t)}>
+            <button key={t} onClick={() => handleTabChange(t)} style={styles.navBtn(tab === t)} data-testid={t === "dashboard" ? "nav-dashboard" : t === "kalkulator" ? "nav-kalkulator" : "nav-oferty"}>
               {t === "dashboard" ? "Dashboard" : t === "kalkulator" ? "Kalkulator" : "Oferty"}
             </button>
           ))}
           {canAccessAdmin && (
-            <button onClick={() => handleTabChange("admin")} style={styles.navBtn(tab === "admin")}>
+            <button onClick={() => handleTabChange("admin")} style={styles.navBtn(tab === "admin")} data-testid="nav-admin">
               Panel admina
             </button>
           )}
@@ -346,13 +346,14 @@ export function MainLayout({ user, onLogout, api }: Props) {
             size="small"
             sx={{ color: "inherit", textTransform: "none", fontSize: 12 }}
             onClick={() => setEmailDialogOpen(true)}
+            data-testid="offer-send-email"
           >
             Wyślij e-mail
           </Button>
           {!hasRealInternet && <span style={styles.chip}>OFFLINE</span>}
           {outboxCount > 0 && <span style={styles.chip}>{outboxCount} w kolejce</span>}
           <span style={{ fontSize: 12, opacity: 0.9 }}>{user.email}</span>
-          <button onClick={onLogout} style={{ ...styles.navBtn(false), background: "transparent" }}>
+          <button onClick={onLogout} style={{ ...styles.navBtn(false), background: "transparent" }} data-testid="logout-button">
             Wyloguj
           </button>
         </div>
@@ -378,6 +379,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
               fullWidth
               required
               placeholder="adres@example.com"
+              inputProps={{ "data-testid": "email-to" }}
             />
             <TextField
               label="Temat"
@@ -385,6 +387,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
               onChange={(e) => setEmailSubject(e.target.value)}
               fullWidth
               required
+              inputProps={{ "data-testid": "email-subject" }}
             />
             <TextField
               label="Treść"
@@ -394,6 +397,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
               multiline
               rows={5}
               required
+              inputProps={{ "data-testid": "email-body" }}
             />
           </Box>
         </DialogContent>
@@ -401,7 +405,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
           <Button onClick={() => !emailSending && setEmailDialogOpen(false)} disabled={emailSending}>
             Anuluj
           </Button>
-          <Button variant="contained" onClick={handleSendEmailSubmit} disabled={emailSending}>
+          <Button variant="contained" onClick={handleSendEmailSubmit} disabled={emailSending} data-testid="email-send-submit">
             {emailSending ? "Wysyłanie…" : "Wyślij"}
           </Button>
         </DialogActions>
@@ -413,7 +417,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       >
         {emailSnackbar && (
-          <Alert severity={emailSnackbar.severity} onClose={() => setEmailSnackbar(null)}>
+          <Alert severity={emailSnackbar.severity} onClose={() => setEmailSnackbar(null)} data-testid="email-status">
             {emailSnackbar.message}
           </Alert>
         )}

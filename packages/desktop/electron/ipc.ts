@@ -8,10 +8,12 @@ import crypto from "crypto";
 import path from "path";
 import fs from "fs";
 import type { GeneratePdfPayload } from "@planlux/shared";
-import { generatePdfPipeline } from "./pdf/generatePdf";
+import { generatePdfPipeline, getTestPdfFileName, getE2EPlaceholderPdfBuffer } from "./pdf/generatePdf";
 import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTemplateOptions } from "./pdf/generatePdfFromTemplate";
-import { getTestPdfFileName } from "./pdf/generatePdf";
+import { getPdfOutputDir } from "./pdf/generatePdf";
 import { getPdfTemplateDir } from "./pdf/pdfPaths";
+import { getE2EConfig } from "./e2eEnv";
+
 import { createSendEmailForFlush } from "./smtpSend";
 import { sendEmail as sendSmtpEmail } from "./mail";
 import { parseRecipients, allowedEmailHistoryStatus } from "./emailService";
@@ -246,7 +248,7 @@ export async function registerIpcHandlers(deps: {
     try {
       const result = await listUsersFromBackend(appConfig.backend.url);
       if (!result.ok || !Array.isArray(result.users)) {
-        return { ok: false, error: result.error ?? "Błąd synchronizacji" };
+        return { ok: false, error: (result as { error?: string }).error ?? "Błąd synchronizacji" };
       }
       let synced = 0;
       const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
@@ -268,20 +270,13 @@ export async function registerIpcHandlers(deps: {
             db.prepare("UPDATE users SET role = ?, display_name = ?, active = ?, updated_at = ? WHERE email = ?").run(role, displayName, active, now, email);
           }
         } else {
-          db.prepare(
-            "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
-              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(
-            uuid(),
-            email,
-            SENTINEL_NO_PASSWORD,
-            role,
-            displayName,
-            active,
-            now,
-            now,
-            ...(hasLastSynced ? [now] : [])
-          );
+          const insertCols = "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
+            (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+          if (hasLastSynced) {
+            db.prepare(insertCols).run(uuid(), email, SENTINEL_NO_PASSWORD, role, displayName, active, now, now, now);
+          } else {
+            db.prepare(insertCols).run(uuid(), email, SENTINEL_NO_PASSWORD, role, displayName, active, now, now);
+          }
         }
         synced++;
       }
@@ -307,6 +302,36 @@ export async function registerIpcHandlers(deps: {
       }
       const db = getDb();
       const emailNorm = email.trim().toLowerCase();
+
+      // E2E only: skip backend, use local DB (seeded users). Production unchanged when PLANLUX_E2E is not set.
+      if (process.env.PLANLUX_E2E === "1") {
+        const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
+          | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
+          | undefined;
+        if (!row) {
+          return { ok: false, error: "Zaloguj się przy połączeniu z internetem (brak danych offline)." };
+        }
+        if (row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) {
+          return { ok: false, error: "Zaloguj się przy połączeniu z internetem, aby włączyć logowanie offline." };
+        }
+        if (!verifyPassword(password, row.password_hash)) {
+          return { ok: false, error: "Nieprawidłowy email lub hasło" };
+        }
+        const user: SessionUser = {
+          id: row.id,
+          email: row.email,
+          role: normalizeRole(row.role),
+          displayName: row.display_name ?? null,
+        };
+        currentUser = user;
+        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
+        const mustChangePassword = row.must_change_password === 1;
+        return {
+          ok: true,
+          user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+          mustChangePassword: mustChangePassword ?? false,
+        };
+      }
 
       const { config: appConfig } = await import("../src/config");
       const { loginViaBackend } = await import("./authBackend");
@@ -340,16 +365,19 @@ export async function registerIpcHandlers(deps: {
             };
           }
           const id = uuid();
-          db.prepare(
-            "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
-              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, ?, ?)"
-          ).run(id, emailNorm, hash, role, displayName, now, now, ...(hasLastSynced ? [now] : [] as string[]));
+          const loginInsertSql = "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
+            (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, ?, ?)");
+          if (hasLastSynced) {
+            db.prepare(loginInsertSql).run(id, emailNorm, hash, role, displayName, now, now, now);
+          } else {
+            db.prepare(loginInsertSql).run(id, emailNorm, hash, role, displayName, now, now);
+          }
           const user: SessionUser = { id, email: emailNorm, role, displayName };
           currentUser = user;
           db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), id, config.appVersion);
           return { ok: true, user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName }, mustChangePassword: false };
         }
-        return { ok: false, error: loginResult.error ?? "Nieprawidłowy email lub hasło" };
+        return { ok: false, error: (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło" };
       } catch (_onlineErr) {
         const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
           | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
@@ -697,10 +725,13 @@ export async function registerIpcHandlers(deps: {
         return { ok: true, id: existing.id, temporaryPassword: tempPassword };
       }
       const id = uuid();
-      db.prepare(
-        "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
-          (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)"
-      ).run(id, email, hash, role, displayName ?? null, creatorId, now, now, ...(hasLastSynced ? [now] : []));
+      const createUserInsertSql = "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
+        (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)");
+      if (hasLastSynced) {
+        db.prepare(createUserInsertSql).run(id, email, hash, role, displayName ?? null, creatorId, now, now, now);
+      } else {
+        db.prepare(createUserInsertSql).run(id, email, hash, role, displayName ?? null, creatorId, now, now);
+      }
       logger.info("[admin] createUser (backend + local insert)", { email, role });
       return { ok: true, id, temporaryPassword: tempPassword };
     } catch (e) {
@@ -843,7 +874,7 @@ export async function registerIpcHandlers(deps: {
   });
 
   const PDF_HANDLER_TIMEOUT_MS = 20_000;
-  type PdfHandlerResult = { ok: true; pdfId: string; filePath: string; fileName: string } | { ok: false; error: string; details?: string };
+  type PdfHandlerResult = { ok: true; pdfId: string; filePath: string; fileName: string } | { ok: false; error: string; details?: string; stage?: string };
 
   async function handlePdfGenerate(
     offerData: unknown,
@@ -856,11 +887,74 @@ export async function registerIpcHandlers(deps: {
     if (!p?.offer || !p?.pricing || !p?.offerNumber) {
       return { ok: false, error: "Nieprawidłowe dane do generowania PDF (wymagane: offer, pricing, offerNumber)." };
     }
+    const desktopRootFromIpc = path.join(__dirname, "..", "..");
+    if (fs.existsSync(path.join(desktopRootFromIpc, ".e2e-run-dir"))) {
+      try {
+        fs.appendFileSync(path.join(desktopRootFromIpc, ".e2e-handler-entered"), `[${new Date().toISOString()}] handlePdfGenerate\n`);
+      } catch {
+        // ignore
+      }
+    }
+    const userDataPath = app.getPath("userData");
+    const isE2EByPath = path.basename(userDataPath).startsWith("planlux-e2e-");
+    const e2eDirFromEnv = process.env.PLANLUX_E2E === "1" && process.env.PLANLUX_E2E_DIR
+      ? (path.isAbsolute(process.env.PLANLUX_E2E_DIR) ? process.env.PLANLUX_E2E_DIR : path.resolve(process.cwd(), process.env.PLANLUX_E2E_DIR))
+      : null;
+    /** File-based E2E marker (test writes before launch) when env is not visible in child process. */
+    let e2eDirFromFile: string | null = null;
+    const markerCandidates = [
+      path.join(__dirname, "..", "..", ".e2e-run-dir"),
+      path.join(process.cwd(), ".e2e-run-dir"),
+      path.join(app.getAppPath(), ".e2e-run-dir"),
+    ];
+    for (const markerPath of markerCandidates) {
+      try {
+        if (fs.existsSync(markerPath)) {
+          const content = fs.readFileSync(markerPath, "utf8").trim();
+          if (path.isAbsolute(content)) e2eDirFromFile = content;
+          else if (content) e2eDirFromFile = path.resolve(path.dirname(markerPath), content);
+          if (e2eDirFromFile) break;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const isE2E = isE2EByPath || e2eDirFromEnv != null || e2eDirFromFile != null;
+    const e2eOutputDir = isE2EByPath ? path.join(userDataPath, "pdfs") : (e2eDirFromEnv ? path.join(e2eDirFromEnv, "pdfs") : (e2eDirFromFile ? path.join(e2eDirFromFile, "pdfs") : null));
+    const e2eBaseForLog = e2eDirFromFile ?? e2eDirFromEnv ?? (isE2EByPath ? userDataPath : null);
+    if (e2eBaseForLog) {
+      try {
+        const logDir = path.join(e2eBaseForLog, "logs");
+        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(path.join(logDir, "pdf-handler.log"), `[${new Date().toISOString()}] entered isE2E=${isE2E} e2eOutputDir=${e2eOutputDir ?? ""}\n`);
+      } catch {
+        // ignore
+      }
+    }
+    if (isE2E || process.env.PLANLUX_LOG_LEVEL === "debug") {
+      logger.info("[E2E/pdf] handlePdfGenerate start", { isE2EByPath, isE2E, userDataPath, e2eDirFromEnv: e2eDirFromEnv ?? undefined, e2eDirFromFile: e2eDirFromFile ?? undefined, client: p.offer.clientName });
+    }
     logger.info("[pdf] start", { client: p.offer.clientName });
     const now = new Date();
 
     let result: { ok: true; filePath: string; fileName: string } | { ok: false; error: string; details?: string };
-    const templateResult = await generatePdfFromTemplate(
+
+    if (isE2E && e2eOutputDir) {
+      try {
+        const outputDir = e2eOutputDir;
+        if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+        const fileName = getTestPdfFileName();
+        const filePath = path.join(outputDir, fileName);
+        fs.writeFileSync(filePath, getE2EPlaceholderPdfBuffer());
+        result = { ok: true, filePath, fileName };
+        logger.info("[E2E/pdf] placeholder PDF written", { filePath, size: getE2EPlaceholderPdfBuffer().length });
+      } catch (e2eErr) {
+        const msg = e2eErr instanceof Error ? e2eErr.message : String(e2eErr);
+        logger.error("[E2E/pdf] placeholder write failed", e2eErr);
+        return { ok: false, error: msg, details: e2eErr instanceof Error ? e2eErr.stack : undefined };
+      }
+    } else {
+      const templateResult = await generatePdfFromTemplate(
       {
         userId: p.userId,
         offer: p.offer,
@@ -877,15 +971,16 @@ export async function registerIpcHandlers(deps: {
       (pdfOverrides as import("./pdf/generatePdfFromTemplate").PdfOverridesForGenerator | null | undefined) ?? undefined
     );
 
-    if (templateResult.ok) {
-      result = templateResult;
-    } else {
-      logger.error("[pdf] Planlux template failed – brak fallbacku, używamy tylko naszego layoutu", templateResult.error);
-      result = { ok: false, error: templateResult.error ?? "Błąd generowania PDF z szablonu Planlux" };
+      if (templateResult.ok) {
+        result = templateResult;
+      } else {
+        logger.error("[pdf] Planlux template failed – brak fallbacku, używamy tylko naszego layoutu", templateResult.error);
+        result = { ok: false, error: templateResult.error ?? "Błąd generowania PDF z szablonu Planlux" };
+      }
     }
 
     if (!result.ok) {
-      return { ok: false, error: result.error, details: result.details };
+      return { ok: false, error: result.error, details: result.details, stage: (result as { stage?: string }).stage };
     }
 
     const pdfId = uuid();
@@ -2813,7 +2908,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const row = getAccountByUserId(db as import("./emailService").Db, user.id);
       if (!row) return { ok: true, account: null };
       const r = row as Record<string, unknown>;
-      const secure = row.secure === 1 || row.secure === true || String(row.secure).toLowerCase() === "true" ? 1 : 0;
+      const secureVal = row.secure as number | boolean | string | undefined;
+      const secure = secureVal === 1 || secureVal === true || String(secureVal).toLowerCase() === "true" ? 1 : 0;
       return { ok: true, account: { id: row.id, user_id: row.user_id, name: row.name, from_name: row.from_name, from_email: row.from_email, host: row.host, port: row.port, secure, auth_user: row.auth_user, reply_to: row.reply_to, active: row.active, created_at: r.created_at, updated_at: r.updated_at } };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
@@ -2881,7 +2977,8 @@ console.log("[IPC] handler registered: planlux:checkInternet");
         await setSmtpPassword(targetUserId, smtpPass);
       }
       const port = Number(account.port) || 587;
-      const secure = account.secure === 1 || account.secure === true || String(account.secure).toLowerCase() === "true";
+      const secureVal = account.secure as number | boolean | string | undefined;
+      const secure = secureVal === 1 || secureVal === true || String(secureVal).toLowerCase() === "true";
       const { port: normPort, secure: normSecure } = normalizeSmtpPortSecure(port, secure);
       logger.info("[smtp] testForUser (no password in logs)", { host: account.host, port: normPort, secure: normSecure, user_id: targetUserId, auth_user: account.auth_user || account.from_email, from_email: account.from_email });
       if (/smtp\.cyberfolks\.pl/i.test(account.host)) {

@@ -18,8 +18,16 @@ import { dumpFkInfo } from "../src/infra/db";
 import { createSendEmailForFlush } from "./smtpSend";
 import { checkInternet } from "./checkInternet";
 import { sendEmail as sendGenericEmailSmtp } from "./mail";
+import { getE2EConfig, ensureE2EDirs } from "./e2eEnv";
 
-const dbPath = path.join(app.getPath("userData"), "planlux-hale.db");
+const e2eConfig = getE2EConfig();
+if (e2eConfig.isE2E) {
+  app.setPath("userData", e2eConfig.e2eBaseDir);
+  ensureE2EDirs(e2eConfig.e2eBaseDir);
+}
+const dbPath = e2eConfig.isE2E
+  ? path.join(e2eConfig.e2eBaseDir, "planlux-hale.e2e.db")
+  : path.join(app.getPath("userData"), "planlux-hale.db");
 
 let mainWindow: BrowserWindow | null = null;
 let db: ReturnType<typeof Database> | null = null;
@@ -460,6 +468,8 @@ app.whenReady().then(async () => {
 });
 
 async function runStartup(): Promise<void> {
+  const e2e = getE2EConfig();
+  if (e2e.isE2E) logger.info("[E2E] enabled dir=" + e2e.e2eBaseDir);
   if (process.argv.includes("--test-pdf")) {
     const { generatePdfFromTemplate } = await import("./pdf/generatePdfFromTemplate");
     const mock = {
@@ -536,6 +546,40 @@ async function runStartup(): Promise<void> {
       logger.info("[seed] Admin user created (dev only)");
     }
   }
+
+  // E2E-only seed: ensure admin + salesperson exist so tests can log in without UI/backend.
+  if (e2eConfig.isE2E) {
+    const crypto = require("crypto");
+    const salt = "planlux-hale-v1";
+    const hash = (p: string) => crypto.scryptSync(p, salt, 64).toString("hex");
+    const ensureUser = (email: string, password: string, role: string, displayName: string) => {
+      const existing = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
+      if (!existing) {
+        database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, 0, datetime('now'), datetime('now'))")
+          .run(crypto.randomUUID(), email, hash(password), role, displayName);
+        return true;
+      }
+      return false;
+    };
+    const a = ensureUser("emilian@planlux.pl", "1234", "ADMIN", "Admin E2E");
+    const b = ensureUser("test@planlux.pl", "Planlux123", "HANDLOWIEC", "Handlowiec E2E");
+    if (a || b) logger.info("[E2E] seed users ensured (emilian@planlux.pl, test@planlux.pl)");
+
+    // E2E pricing: allow Kalkulator PDF generation without backend (minimal cennik for first default variant).
+    try {
+      const pricingCount = (database.prepare("SELECT COUNT(*) as c FROM pricing_cache").get() as { c: number }).c;
+      if (pricingCount === 0) {
+        const cennik = [{ wariant_hali: "T18_T35_DACH", Nazwa: "Hala T-18 + T-35 dach", area_min_m2: 1, area_max_m2: 5000, cena: 100 }];
+        database.prepare(
+          "INSERT INTO pricing_cache (pricing_version, last_updated, cennik_json, dodatki_json, standard_json, fetched_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        ).run(1, new Date().toISOString(), JSON.stringify(cennik), JSON.stringify([]), JSON.stringify([]));
+        logger.info("[E2E] pricing_cache seeded (minimal cennik for T18_T35_DACH)");
+      }
+    } catch (e) {
+      logger.warn("[E2E] pricing seed skipped", e);
+    }
+  }
+
   createWindow();
 
   // Auto-update: check on startup (tylko w produkcji, gdy jest opublikowany release)

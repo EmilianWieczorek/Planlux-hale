@@ -104,6 +104,7 @@ export function LoginScreen({ onLogin, api }: Props) {
           onChange={(e) => setEmail(e.target.value)}
           style={styles.input}
           required
+          data-testid="login-email"
         />
         <input
           type="password"
@@ -112,8 +113,9 @@ export function LoginScreen({ onLogin, api }: Props) {
           onChange={(e) => setPassword(e.target.value)}
           style={styles.input}
           required
+          data-testid="login-password"
         />
-        <button type="submit" style={styles.button} disabled={loading}>
+        <button type="submit" style={styles.button} disabled={loading} data-testid="login-submit">
           {loading ? "Logowanie..." : "Zaloguj się"}
         </button>
       </form>
