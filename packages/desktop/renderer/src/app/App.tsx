@@ -50,6 +50,7 @@ export default function App() {
   const [reminderOpen, setReminderOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{ version: string; downloaded?: boolean } | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [configOffline, setConfigOffline] = useState(false);
   const lastActivityRef = useRef(Date.now());
   const reminderTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -112,13 +113,15 @@ export default function App() {
     if (!user?.id) return;
     let cancelled = false;
     (async () => {
-      const [draftRes, offersRes] = await Promise.all([
+      const [draftRes, offersRes, configStatusRes] = await Promise.all([
         api("planlux:loadOfferDraft") as Promise<{ ok: boolean; draft?: unknown }>,
         api("planlux:getOffersCrm", { statusFilter: "in_progress", searchQuery: "" }) as Promise<{ ok: boolean; offers?: unknown[] }>,
+        api("planlux:getConfigSyncStatus") as Promise<{ status?: string }>,
       ]);
       if (cancelled) return;
       if (draftRes.ok && draftRes.draft) offerDraftStore.hydrate(draftRes.draft as Parameters<typeof offerDraftStore.hydrate>[0]);
       if (offersRes.ok && Array.isArray(offersRes.offers)) setInProgressCount(offersRes.offers.length);
+      setConfigOffline((configStatusRes?.status ?? "") === "offline");
     })();
     return () => { cancelled = true; };
   }, [user?.id]);
@@ -201,6 +204,11 @@ export default function App() {
   return (
     <ThemeProvider theme={planluxTheme}>
       <CssBaseline />
+      {configOffline && (
+        <Alert severity="warning" sx={{ borderRadius: 0 }}>
+          Pracujesz w trybie offline — dane mogą być nieaktualne
+        </Alert>
+      )}
       <MainLayout user={user} onLogout={handleLogout} api={api} />
       <Dialog open={inProgressCount > 0} onClose={() => setInProgressCount(0)}>
         <DialogTitle>Niedokończone oferty</DialogTitle>

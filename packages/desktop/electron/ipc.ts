@@ -295,7 +295,7 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  ipcMain.handle("planlux:login", async (_, email: string, password: string) => {
+  const handleLogin = async (_event: unknown, email: string, password: string) => {
     try {
       if (typeof email !== "string" || typeof password !== "string") {
         return { ok: false, error: "Invalid input" };
@@ -377,7 +377,28 @@ export async function registerIpcHandlers(deps: {
           db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), id, config.appVersion);
           return { ok: true, user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName }, mustChangePassword: false };
         }
-        return { ok: false, error: (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło" };
+        const backendError = (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło";
+        tryLocalLogin: {
+          const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
+            | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
+            | undefined;
+          if (!row || row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) break tryLocalLogin;
+          if (!verifyPassword(password, row.password_hash)) break tryLocalLogin;
+          const user: SessionUser = {
+            id: row.id,
+            email: row.email,
+            role: normalizeRole(row.role),
+            displayName: row.display_name ?? null,
+          };
+          currentUser = user;
+          db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
+          return {
+            ok: true,
+            user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+            mustChangePassword: row.must_change_password === 1,
+          };
+        }
+        return { ok: false, error: backendError };
       } catch (_onlineErr) {
         const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
           | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
@@ -410,6 +431,18 @@ export async function registerIpcHandlers(deps: {
       logger.error("login failed", e);
       return { ok: false, error: String(e) };
     }
+  };
+
+  ipcMain.handle("planlux:login", (_, email: string, password: string) => handleLogin(_, email, password));
+  ipcMain.handle("login", (_, payloadOrEmail: unknown, passwordMaybe?: string) => {
+    const email = typeof payloadOrEmail === "object" && payloadOrEmail != null && "email" in payloadOrEmail
+      ? String((payloadOrEmail as { email: string }).email ?? "")
+      : String(payloadOrEmail ?? "");
+    const password = typeof passwordMaybe === "string" ? passwordMaybe
+      : typeof payloadOrEmail === "object" && payloadOrEmail != null && "password" in payloadOrEmail
+        ? String((payloadOrEmail as { password: string }).password ?? "")
+        : "";
+    return handleLogin(_, email, password);
   });
 
   ipcMain.handle("planlux:changePassword", async (_, newPassword: string) => {
@@ -470,6 +503,16 @@ export async function registerIpcHandlers(deps: {
     } catch (e) {
       logger.error("getPricingCache failed", e);
       return { ok: false, error: String(e) };
+    }
+  });
+
+  ipcMain.handle("planlux:getConfigSyncStatus", async () => {
+    try {
+      const { getConfigSyncStatus } = await import("../src/services/configSync");
+      return getConfigSyncStatus();
+    } catch (e) {
+      logger.error("getConfigSyncStatus failed", e);
+      return { status: "error" as const, error: String(e) };
     }
   });
 

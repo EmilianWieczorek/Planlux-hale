@@ -278,6 +278,32 @@ COMMIT;
   } catch (e) {
     logger.warn("[migration] offer_counters skipped", e);
   }
+  // Supabase config cache tables (extend schema for remote pricing config).
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS config_sync_meta (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL DEFAULT 0,
+        last_synced_at TEXT DEFAULT NULL
+      );
+      INSERT OR IGNORE INTO config_sync_meta (id, version) VALUES (1, 0);
+      CREATE TABLE IF NOT EXISTS pricing_surface (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS addons_surcharges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS standard_included (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_json TEXT NOT NULL
+      );
+    `);
+    logger.info("[migration] config_sync_meta, pricing_surface, addons_surcharges, standard_included ready");
+  } catch (e) {
+    logger.warn("[migration] Supabase config tables skipped", e);
+  }
   const { runCrmMigrations } = require("./migrations/crmMigrations");
   runCrmMigrations(database, logger);
 
@@ -527,6 +553,12 @@ async function runStartup(): Promise<void> {
   });
 
   const database = getDb();
+  try {
+    const { syncConfig } = await import("../src/services/configSync");
+    await syncConfig(database, logger);
+  } catch (e) {
+    logger.warn("[configSync] startup sync failed – app continues with local data", e);
+  }
   await registerIpcHandlers({
     getDb,
     getDbPath: () => dbPath,
@@ -535,16 +567,33 @@ async function runStartup(): Promise<void> {
     logger,
   });
   console.log("[IPC] Planlux IPC handlers initialized");
-  // Seed admin only in development (production: create admin via other means; no credentials in logs)
-  if (process.env.NODE_ENV !== "production") {
-    const existing = database.prepare("SELECT id FROM users WHERE email = ?").get("admin@planlux.pl");
+  // Seed default admin accounts if missing (so login works without backend / when backend returns "Unknown action").
+  const crypto = require("crypto");
+  const salt = "planlux-hale-v1";
+  const hash = (p: string) => crypto.scryptSync(p, salt, 64).toString("hex");
+  const ensureAdmin = (email: string, password: string, displayName: string) => {
+    const existing = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
     if (!existing) {
-      const crypto = require("crypto");
-      const hash = crypto.scryptSync("admin123", "planlux-hale-v1", 64).toString("hex");
-      database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin')")
-        .run(crypto.randomUUID(), "admin@planlux.pl", hash);
-      logger.info("[seed] Admin user created (dev only)");
+      const hasCols = (database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
+      const hasMustChange = hasCols.includes("must_change_password");
+      const hasCreated = hasCols.includes("created_at");
+      const hasUpdated = hasCols.includes("updated_at");
+      if (hasMustChange && hasCreated && hasUpdated) {
+        database.prepare(
+          "INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, 'ADMIN', 1, ?, 0, datetime('now'), datetime('now'))"
+        ).run(crypto.randomUUID(), email, hash(password), displayName);
+      } else {
+        database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, ?)")
+          .run(crypto.randomUUID(), email, hash(password), displayName);
+      }
+      logger.info("[seed] Admin user created", { email });
+      return true;
     }
+    return false;
+  };
+  ensureAdmin("emilian@planlux.pl", "admin123", "Admin");
+  if (process.env.NODE_ENV !== "production") {
+    ensureAdmin("admin@planlux.pl", "admin123", "Admin");
   }
 
   // E2E-only seed: ensure admin + salesperson exist so tests can log in without UI/backend.
