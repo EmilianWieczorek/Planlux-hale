@@ -206,6 +206,7 @@ COMMIT;
     "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN password_set_at TEXT DEFAULT NULL",
     "ALTER TABLE users ADD COLUMN created_by_user_id TEXT DEFAULT NULL",
+    "ALTER TABLE users ADD COLUMN last_synced_at TEXT DEFAULT NULL",
   ];
   for (const sql of migrations) {
     try {
@@ -520,7 +521,7 @@ async function runStartup(): Promise<void> {
     getDb,
     getDbPath: () => dbPath,
     apiClient,
-    config: { appVersion: config.appVersion },
+    config: { appVersion: config.appVersion, updatesUrl: config.updatesUrl },
     logger,
   });
   console.log("[IPC] Planlux IPC handlers initialized");

@@ -24,8 +24,9 @@ import {
   Tabs,
   Tab,
 } from "@mui/material";
-import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email, Mail, ContentCopy } from "@mui/icons-material";
+import { Add, Edit, Block, CheckCircle, People, Timeline, PictureAsPdf, Email, Mail, ContentCopy, SystemUpdate } from "@mui/icons-material";
 import { AdminEmailTab } from "./AdminEmailTab";
+import { AdminUpdatesTab } from "./AdminUpdatesTab";
 import { tokens } from "../../theme/tokens";
 import { canManageUsers } from "@planlux/shared";
 
@@ -63,6 +64,7 @@ const tabActivity = (canManage: boolean) => (canManage ? 1 : 0);
 const tabPdf = (canManage: boolean) => (canManage ? 2 : 1);
 const tabEmailHist = (canManage: boolean) => (canManage ? 3 : 2);
 const tabEmail = (canManage: boolean) => (canManage ? 4 : 3);
+const tabUpdates = (canManage: boolean) => (canManage ? 5 : 4);
 
 export function AdminPanel({ api, currentUser }: Props) {
   const canManage = canManageUsers(currentUser.role);
@@ -246,18 +248,37 @@ export function AdminPanel({ api, currentUser }: Props) {
         <Tab icon={<PictureAsPdf />} iconPosition="start" label="Historia PDF" />
         <Tab icon={<Email />} iconPosition="start" label="Historia e-mail" />
         <Tab icon={<Mail />} iconPosition="start" label="E-mail" />
+        <Tab icon={<SystemUpdate />} iconPosition="start" label="Aktualizacje" />
       </Tabs>
 
       {canManage && tab === 0 && (
         <div style={styles.card}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
             <h2 style={styles.h2}>Użytkownicy</h2>
-            <Button variant="contained" startIcon={<Add />} onClick={openCreateModal}>
-              Dodaj użytkownika
-            </Button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={async () => {
+                  try {
+                    const r = (await api("planlux:syncUsers")) as { ok: boolean; syncedCount?: number; error?: string };
+                    if (r.ok) setSnackbar({ open: true, message: r.syncedCount != null ? `Zsynchronizowano ${r.syncedCount} użytkowników` : "Synchronizacja zakończona", severity: "success" });
+                    else setSnackbar({ open: true, message: r.error ?? "Błąd synchronizacji", severity: "error" });
+                  } catch (e) {
+                    setSnackbar({ open: true, message: e instanceof Error ? e.message : "Błąd", severity: "error" });
+                  }
+                  loadUsers();
+                }}
+              >
+                Synchronizuj użytkowników
+              </Button>
+              <Button variant="contained" startIcon={<Add />} onClick={openCreateModal}>
+                Dodaj użytkownika
+              </Button>
+            </div>
           </div>
           <p style={{ color: tokens.color.textMuted, marginBottom: 16 }}>
-            Zarządzanie użytkownikami w lokalnej bazie SQLite.
+            Użytkownicy z arkusza USERS (Google Sheets). Synchronizacja przy starcie i na żądanie.
           </p>
           {loading ? (
             <Typography color="text.secondary">Ładowanie...</Typography>
@@ -388,6 +409,8 @@ export function AdminPanel({ api, currentUser }: Props) {
       )}
 
       {tab === tabEmail(canManage) && <AdminEmailTab api={api} />}
+
+      {tab === tabUpdates(canManage) && <AdminUpdatesTab api={api} />}
 
       {tab === tabEmailHist(canManage) && (
         <div style={styles.card}>

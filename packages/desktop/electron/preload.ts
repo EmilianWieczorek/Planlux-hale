@@ -6,6 +6,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const ALLOWED_CHANNELS = new Set([
   "planlux:login",
+  "planlux:syncUsers",
   "planlux:logout",
   "planlux:changePassword",
   "planlux:endSession",
@@ -79,6 +80,12 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:getPdfPreviewHtml",
   "planlux:downloadUpdate",
   "planlux:quitAndInstall",
+  "planlux:app:getVersion",
+  "planlux:app:openExternal",
+  "planlux:app:getUpdatesUrl",
+  "planlux:updates:getCurrentVersion",
+  "planlux:updates:openExternal",
+  "planlux:updates:getUpdatesUrl",
   "shell:openPath",
   "shell:showItemInFolder",
 ]);
@@ -94,6 +101,16 @@ const planlux = {
   platform: "desktop" as const,
   version: process.env.npm_package_version ?? "1.0.0",
   invoke: safeInvoke,
+  app: {
+    getVersion: () => safeInvoke("planlux:app:getVersion"),
+    openExternal: (url: string) => safeInvoke("planlux:app:openExternal", url),
+    getUpdatesUrl: () => safeInvoke("planlux:app:getUpdatesUrl"),
+  },
+  updates: {
+    getCurrentVersion: () => safeInvoke("planlux:updates:getCurrentVersion"),
+    openExternal: (url: string) => safeInvoke("planlux:updates:openExternal", url),
+    getUpdatesUrl: () => safeInvoke("planlux:updates:getUpdatesUrl"),
+  },
   onUpdateAvailable: (cb: (info: { version: string }) => void) => {
     ipcRenderer.on("planlux:update-available", (_: unknown, info: { version: string }) => cb(info));
   },

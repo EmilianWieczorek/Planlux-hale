@@ -72,7 +72,11 @@ function hashPassword(password: string): string {
   return crypto.scryptSync(password, SALT, 64).toString("hex");
 }
 
+/** Sentinel hash for users synced from backend who have never logged in online (blocks offline login until first online login). */
+const SENTINEL_NO_PASSWORD = hashPassword("__offline_not_set__");
+
 function verifyPassword(password: string, hash: string): boolean {
+  if (!hash || hash === SENTINEL_NO_PASSWORD) return false;
   const h = hashPassword(password);
   return crypto.timingSafeEqual(Buffer.from(h, "hex"), Buffer.from(hash, "hex"));
 }
@@ -228,10 +232,73 @@ export async function registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
   getDbPath?: () => string;
   apiClient: import("@planlux/shared").ApiClient;
-  config: { appVersion: string };
+  config: { appVersion: string; updatesUrl?: string };
   logger: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void };
 }) {
   const { getDb, getDbPath, config, apiClient, logger } = deps;
+
+  /** Sync users from Apps Script (listUsers). Upsert by email; new users get sentinel password until first online login. */
+  async function syncUsersFromBackend(): Promise<{ ok: boolean; syncedCount?: number; error?: string }> {
+    const { config: appConfig } = await import("../src/config");
+    const { listUsersFromBackend } = await import("./authBackend");
+    const db = getDb();
+    const now = new Date().toISOString();
+    try {
+      const result = await listUsersFromBackend(appConfig.backend.url);
+      if (!result.ok || !Array.isArray(result.users)) {
+        return { ok: false, error: result.error ?? "Błąd synchronizacji" };
+      }
+      let synced = 0;
+      const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
+      for (const u of result.users) {
+        const email = (u.email ?? "").trim().toLowerCase();
+        if (!email) continue;
+        const role = normalizeRole(u.role ?? "HANDLOWIEC");
+        const displayName = (u.name ?? "").trim() || null;
+        const active = u.active !== false ? 1 : 0;
+        const existing = db.prepare("SELECT id, password_hash FROM users WHERE email = ?").get(email) as
+          | { id: string; password_hash: string }
+          | undefined;
+        if (existing) {
+          if (hasLastSynced) {
+            db.prepare(
+              "UPDATE users SET role = ?, display_name = ?, active = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
+            ).run(role, displayName, active, now, now, email);
+          } else {
+            db.prepare("UPDATE users SET role = ?, display_name = ?, active = ?, updated_at = ? WHERE email = ?").run(role, displayName, active, now, email);
+          }
+        } else {
+          db.prepare(
+            "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
+              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          ).run(
+            uuid(),
+            email,
+            SENTINEL_NO_PASSWORD,
+            role,
+            displayName,
+            active,
+            now,
+            now,
+            ...(hasLastSynced ? [now] : [])
+          );
+        }
+        synced++;
+      }
+      return { ok: true, syncedCount: synced };
+    } catch (e) {
+      logger.warn("[auth] syncUsersFromBackend failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  ipcMain.handle("planlux:syncUsers", async () => {
+    try {
+      return await syncUsersFromBackend();
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
 
   ipcMain.handle("planlux:login", async (_, email: string, password: string) => {
     try {
@@ -239,30 +306,78 @@ export async function registerIpcHandlers(deps: {
         return { ok: false, error: "Invalid input" };
       }
       const db = getDb();
-      const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(email.trim().toLowerCase()) as
-        | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
-        | undefined;
-      if (!row || !verifyPassword(password, row.password_hash)) {
-        return { ok: false, error: "Nieprawidłowy email lub hasło" };
+      const emailNorm = email.trim().toLowerCase();
+
+      const { config: appConfig } = await import("../src/config");
+      const { loginViaBackend } = await import("./authBackend");
+
+      try {
+        const loginResult = await loginViaBackend(appConfig.backend.url, emailNorm, password);
+        if (loginResult.ok && loginResult.user) {
+          const backendUser = loginResult.user;
+          const role = normalizeRole(backendUser.role ?? "HANDLOWIEC");
+          const displayName = (backendUser.name ?? "").trim() || null;
+          const hash = hashPassword(password);
+          const now = new Date().toISOString();
+          const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
+          const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
+          if (existing) {
+            if (hasLastSynced) {
+              db.prepare(
+                "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
+              ).run(role, displayName, hash, now, now, emailNorm);
+            } else {
+              db.prepare("UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, updated_at = ? WHERE email = ?").run(role, displayName, hash, now, emailNorm);
+            }
+            const row = db.prepare("SELECT id, must_change_password FROM users WHERE email = ?").get(emailNorm) as { id: string; must_change_password?: number };
+            const user: SessionUser = { id: row.id, email: emailNorm, role, displayName };
+            currentUser = user;
+            db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
+            return {
+              ok: true,
+              user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+              mustChangePassword: row.must_change_password === 1,
+            };
+          }
+          const id = uuid();
+          db.prepare(
+            "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
+              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, ?, ?)"
+          ).run(id, emailNorm, hash, role, displayName, now, now, ...(hasLastSynced ? [now] : [] as string[]));
+          const user: SessionUser = { id, email: emailNorm, role, displayName };
+          currentUser = user;
+          db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), id, config.appVersion);
+          return { ok: true, user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName }, mustChangePassword: false };
+        }
+        return { ok: false, error: loginResult.error ?? "Nieprawidłowy email lub hasło" };
+      } catch (_onlineErr) {
+        const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
+          | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
+          | undefined;
+        if (!row) {
+          return { ok: false, error: "Zaloguj się przy połączeniu z internetem (brak danych offline)." };
+        }
+        if (row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) {
+          return { ok: false, error: "Zaloguj się przy połączeniu z internetem, aby włączyć logowanie offline." };
+        }
+        if (!verifyPassword(password, row.password_hash)) {
+          return { ok: false, error: "Nieprawidłowy email lub hasło" };
+        }
+        const user: SessionUser = {
+          id: row.id,
+          email: row.email,
+          role: normalizeRole(row.role),
+          displayName: row.display_name ?? null,
+        };
+        currentUser = user;
+        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
+        const mustChangePassword = row.must_change_password === 1;
+        return {
+          ok: true,
+          user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+          mustChangePassword: mustChangePassword ?? false,
+        };
       }
-      const user: SessionUser = {
-        id: row.id,
-        email: row.email,
-        role: normalizeRole(row.role),
-        displayName: row.display_name ?? null,
-      };
-      currentUser = user;
-      const sessionId = uuid();
-      db.prepare(
-        "INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)"
-      ).run(sessionId, row.id, config.appVersion);
-      const mustChangePassword = row.must_change_password === 1;
-      return {
-        ok: true,
-        user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
-        sessionId,
-        mustChangePassword: mustChangePassword ?? false,
-      };
     } catch (e) {
       logger.error("login failed", e);
       return { ok: false, error: String(e) };
@@ -545,27 +660,49 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** Admin: utwórz użytkownika. Wymaga roli ADMIN. */
+  /** Admin: utwórz użytkownika w Sheets (Apps Script upsertUser), potem sync + zapisz hasło lokalnie. */
   ipcMain.handle("planlux:createUser", async (_, payload: { email: string; password: string; displayName?: string; role?: string }) => {
     try {
       requireRole(["ADMIN"]);
-      const db = getDb();
       const email = (payload.email ?? "").trim().toLowerCase();
       if (!email) return { ok: false, error: "Email jest wymagany" };
-      const password = payload.password ?? "";
-      if (password.length < 4) return { ok: false, error: "Hasło musi mieć min. 4 znaki" };
-      const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-      if (existing) return { ok: false, error: "Użytkownik z tym adresem email już istnieje" };
-      const id = uuid();
-      const hash = hashPassword(password);
+      const tempPassword = payload.password ?? "";
+      if (tempPassword.length < 4) return { ok: false, error: "Hasło musi mieć min. 4 znaki" };
       const role = normalizeRole(payload.role ?? "HANDLOWIEC");
-      const displayName = (payload.displayName ?? "").trim() || null;
+      const displayName = (payload.displayName ?? "").trim() || undefined;
+      const { config: appConfig } = await import("../src/config");
+      const { upsertUserViaBackend } = await import("./authBackend");
+      const upsertResult = await upsertUserViaBackend(appConfig.backend.url, {
+        email,
+        name: displayName ?? undefined,
+        role,
+        tempPassword,
+        active: 1,
+      });
+      if (!upsertResult.ok) {
+        return { ok: false, error: upsertResult.error ?? "Błąd zapisu użytkownika w systemie" };
+      }
+      await syncUsersFromBackend();
+      const db = getDb();
+      const hash = hashPassword(tempPassword);
+      const now = new Date().toISOString();
+      const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
+      const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email) as { id: string } | undefined;
       const creatorId = currentUser?.id ?? null;
+      if (existing) {
+        db.prepare(
+          "UPDATE users SET password_hash = ?, must_change_password = 1, password_set_at = NULL, updated_at = ? WHERE email = ?"
+        ).run(hash, now, email);
+        logger.info("[admin] createUser (backend + local password)", { email, role });
+        return { ok: true, id: existing.id, temporaryPassword: tempPassword };
+      }
+      const id = uuid();
       db.prepare(
-        "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, password_set_at, created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1, NULL, ?, datetime('now'), datetime('now'))"
-      ).run(id, email, hash, role, displayName, creatorId);
-      logger.info("[admin] createUser", { email, role });
-      return { ok: true, id, temporaryPassword: password };
+        "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
+          (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)"
+      ).run(id, email, hash, role, displayName ?? null, creatorId, now, now, ...(hasLastSynced ? [now] : []));
+      logger.info("[admin] createUser (backend + local insert)", { email, role });
+      return { ok: true, id, temporaryPassword: tempPassword };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
@@ -3590,6 +3727,52 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) return { ok: false, error: e.message };
       return { ok: false, error: e instanceof Error ? e.message : String(e), items: [] };
     }
+  });
+
+  /** App version (Electron app.getVersion()). */
+  ipcMain.handle("planlux:app:getVersion", async () => {
+    return { ok: true, version: app.getVersion() };
+  });
+
+  /** Open URL in default external browser. */
+  ipcMain.handle("planlux:app:openExternal", async (_, url: string) => {
+    if (typeof url !== "string" || !url.trim()) return { ok: false, error: "Invalid URL" };
+    try {
+      await shell.openExternal(url.trim());
+      return { ok: true };
+    } catch (e) {
+      const ser = serializeError(e);
+      logger.warn("[app] openExternal failed", { message: ser.message });
+      return { ok: false, error: ser.message };
+    }
+  });
+
+  /** Updates URL from env (PLANLUX_UPDATES_URL) for renderer to fetch version/history. */
+  ipcMain.handle("planlux:app:getUpdatesUrl", async () => {
+    return { ok: true, updatesUrl: config.updatesUrl ?? "" };
+  });
+
+  /** Updates checker: current app version (renderer uses only planlux:updates:* for updates). */
+  ipcMain.handle("planlux:updates:getCurrentVersion", async () => {
+    return { ok: true, version: app.getVersion() };
+  });
+
+  /** Updates checker: open download URL in default browser. */
+  ipcMain.handle("planlux:updates:openExternal", async (_, url: string) => {
+    if (typeof url !== "string" || !url.trim()) return { ok: false, error: "Invalid URL" };
+    try {
+      await shell.openExternal(url.trim());
+      return { ok: true };
+    } catch (e) {
+      const ser = serializeError(e);
+      logger.warn("[updates] openExternal failed", { message: ser.message });
+      return { ok: false, error: ser.message };
+    }
+  });
+
+  /** Updates checker: URL for version/history fetch (main + renderer; fallback w config). */
+  ipcMain.handle("planlux:updates:getUpdatesUrl", async () => {
+    return { ok: true, updatesUrl: config.updatesUrl ?? "" };
   });
 
   /** Debug: PRAGMA table_info + last 20 rows dla email_history i email_outbox + schema version flags (diagnostyka użytkowników). */

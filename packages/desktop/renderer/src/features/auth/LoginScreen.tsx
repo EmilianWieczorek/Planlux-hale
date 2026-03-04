@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { tokens } from "../../theme/tokens";
 
 const styles = {
@@ -56,13 +56,27 @@ const styles = {
 
 interface Props {
   onLogin: (email: string, password: string) => Promise<boolean>;
+  /** Invoke planlux:syncUsers (optional). Called on mount with short delay to refresh user list from backend. */
+  api?: (channel: string, ...args: unknown[]) => Promise<unknown>;
 }
 
-export function LoginScreen({ onLogin }: Props) {
+export function LoginScreen({ onLogin, api }: Props) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!api) return;
+    const timeoutMs = 500;
+    const t = setTimeout(() => {
+      Promise.race([
+        api("planlux:syncUsers"),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
+      ]).catch(() => {});
+    }, timeoutMs);
+    return () => clearTimeout(t);
+  }, [api]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

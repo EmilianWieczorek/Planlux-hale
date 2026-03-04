@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Button,
   Dialog,
@@ -9,7 +9,9 @@ import {
   Box,
   Snackbar,
   Alert,
+  Typography,
 } from "@mui/material";
+import { GetApp } from "@mui/icons-material";
 import { Kalkulator } from "../kalkulator/Kalkulator";
 import { OfertyView } from "../oferty/OfertyView";
 import { DashboardView } from "../dashboard/DashboardView";
@@ -17,7 +19,21 @@ import { AdminPanel } from "../admin/AdminPanel";
 import { ClearDataDialog } from "./ClearDataDialog";
 import { offerDraftStore } from "../../state/offerDraftStore";
 import { tokens } from "../../theme/tokens";
-import { canAccessAdminPanel } from "@planlux/shared";
+import { canAccessAdminPanel, isUpdateAvailable, isBelowMinSupported } from "@planlux/shared";
+
+const UPDATE_SUPPRESS_STORAGE_KEY = "planlux-updates-suppressed";
+const UPDATE_CHECK_DELAY_MS = 5000;
+const DEFAULT_SUPPRESS_MIN = 360;
+
+type VersionResponse = {
+  ok?: boolean;
+  latest?: string;
+  minSupported?: string;
+  force?: boolean;
+  message?: string;
+  downloadUrl?: string;
+  checkIntervalMin?: number;
+};
 
 type Tab = "dashboard" | "kalkulator" | "oferty" | "admin";
 
@@ -147,6 +163,114 @@ export function MainLayout({ user, onLogout, api }: Props) {
     const t = setInterval(enqueue, 90_000);
     return () => clearInterval(t);
   }, [api, user.id]);
+
+  /** Update check: version from Apps Script. Banner (non-force) / modal (force). */
+  const [updateBannerOpen, setUpdateBannerOpen] = useState(false);
+  const [updateForceModalOpen, setUpdateForceModalOpen] = useState(false);
+  const [updateVersionInfo, setUpdateVersionInfo] = useState<VersionResponse | null>(null);
+  const [updateCurrentVersion, setUpdateCurrentVersion] = useState("");
+
+  const nextCheckTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
+
+  const runUpdateCheck = useCallback(async () => {
+    const scheduleNext = (intervalMin: number) => {
+      nextCheckTimeoutRef.current = setTimeout(runUpdateCheck, intervalMin * 60 * 1000);
+    };
+    try {
+      const [urlRes, versionRes] = await Promise.all([
+        api("planlux:updates:getUpdatesUrl"),
+        api("planlux:updates:getCurrentVersion"),
+      ]);
+      const updatesUrl = (urlRes as { ok?: boolean; updatesUrl?: string })?.updatesUrl ?? "";
+      const cur = (versionRes as { ok?: boolean; version?: string })?.version ?? "";
+      if (cur) setUpdateCurrentVersion(cur);
+      if (!updatesUrl?.trim()) {
+        scheduleNext(DEFAULT_SUPPRESS_MIN);
+        return;
+      }
+      const versionUrl = `${updatesUrl}${updatesUrl.includes("?") ? "&" : "?"}action=version`;
+      const res = await fetch(versionUrl, { method: "GET", signal: AbortSignal.timeout(10000) });
+      if (!res.ok) {
+        scheduleNext(DEFAULT_SUPPRESS_MIN);
+        return;
+      }
+      const data = (await res.json()) as VersionResponse;
+      const intervalMin = typeof data?.checkIntervalMin === "number" ? data.checkIntervalMin : DEFAULT_SUPPRESS_MIN;
+      if (!data?.ok || !data.latest) {
+        scheduleNext(intervalMin);
+        return;
+      }
+      setUpdateVersionInfo(data);
+      const isForce = data.force === true || (data.minSupported && isBelowMinSupported(cur, data.minSupported));
+      const hasUpdate = cur && data.latest && isUpdateAvailable(cur, data.latest);
+      if (isForce && hasUpdate) {
+        setUpdateForceModalOpen(true);
+        scheduleNext(intervalMin);
+        return;
+      }
+      if (!hasUpdate) {
+        scheduleNext(intervalMin);
+        return;
+      }
+      try {
+        const raw = localStorage.getItem(UPDATE_SUPPRESS_STORAGE_KEY);
+        const parsed = raw ? (JSON.parse(raw) as { suppressedUntil?: number; latestVersionShown?: string }) : null;
+        const now = Date.now();
+        if (parsed?.suppressedUntil != null && parsed.suppressedUntil > now && parsed.latestVersionShown === data.latest) {
+          scheduleNext(intervalMin);
+          return;
+        }
+      } catch {
+        /* ignore */
+      }
+      setUpdateBannerOpen(true);
+      scheduleNext(intervalMin);
+    } catch {
+      scheduleNext(DEFAULT_SUPPRESS_MIN);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    const t = setTimeout(runUpdateCheck, UPDATE_CHECK_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [runUpdateCheck]);
+
+  useEffect(() => {
+    return () => {
+      if (nextCheckTimeoutRef.current) clearTimeout(nextCheckTimeoutRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = () => runUpdateCheck();
+    window.addEventListener("planlux-run-update-check", handler);
+    return () => window.removeEventListener("planlux-run-update-check", handler);
+  }, [runUpdateCheck]);
+
+  const handleUpdateLater = useCallback(() => {
+    const info = updateVersionInfo;
+    if (!info?.latest) return;
+    const intervalMin = typeof info.checkIntervalMin === "number" ? info.checkIntervalMin : DEFAULT_SUPPRESS_MIN;
+    try {
+      localStorage.setItem(
+        UPDATE_SUPPRESS_STORAGE_KEY,
+        JSON.stringify({ suppressedUntil: Date.now() + intervalMin * 60 * 1000, latestVersionShown: info.latest })
+      );
+    } catch {
+      /* ignore */
+    }
+    setUpdateBannerOpen(false);
+  }, [updateVersionInfo]);
+
+  const handleUpdateDownload = useCallback(async () => {
+    const url = updateVersionInfo?.downloadUrl ?? "";
+    if (!url) return;
+    try {
+      await api("planlux:updates:openExternal", url);
+    } catch {
+      /* ignore */
+    }
+  }, [api, updateVersionInfo?.downloadUrl]);
 
   const handleSendEmailSubmit = async () => {
     const to = emailTo.trim();
@@ -294,6 +418,46 @@ export function MainLayout({ user, onLogout, api }: Props) {
           </Alert>
         )}
       </Snackbar>
+
+      {/* Banner: dostępna aktualizacja (nie force) */}
+      <Snackbar
+        open={updateBannerOpen}
+        autoHideDuration={null}
+        anchorOrigin={{ vertical: "top", horizontal: "center" }}
+        sx={{ mt: 2 }}
+      >
+        <Alert severity="info" onClose={() => setUpdateBannerOpen(false)} sx={{ maxWidth: 480 }}>
+          <Typography variant="subtitle2">Dostępna aktualizacja {updateVersionInfo?.latest}</Typography>
+          {updateVersionInfo?.message && (
+            <Typography variant="body2" display="block" sx={{ mt: 0.5 }}>{updateVersionInfo.message}</Typography>
+          )}
+          <Box sx={{ mt: 1, display: "flex", gap: 1 }}>
+            <Button size="small" variant="contained" startIcon={<GetApp />} onClick={handleUpdateDownload}>
+              Pobierz
+            </Button>
+            <Button size="small" onClick={handleUpdateLater}>Później</Button>
+          </Box>
+        </Alert>
+      </Snackbar>
+
+      {/* Modal blokujący: force */}
+      <Dialog open={updateForceModalOpen} disableEscapeKeyDown onClose={() => {}} maxWidth="sm" fullWidth>
+        <DialogTitle>Aktualizacja wymagana</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Twoja wersja ({updateCurrentVersion}) jest zbyt stara. Zainstaluj najnowszą wersję ({updateVersionInfo?.latest}), aby kontynuować.
+          </Typography>
+          {updateVersionInfo?.message && (
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>{updateVersionInfo.message}</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button variant="contained" startIcon={<GetApp />} onClick={handleUpdateDownload}>
+            Pobierz aktualizację
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <main style={styles.content}>
         {tab === "dashboard" && (
           <DashboardView api={api} userId={user.id} isAdmin={isBossOrAdmin} />

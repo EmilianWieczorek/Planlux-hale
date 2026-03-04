@@ -186,7 +186,7 @@ export default function App() {
   }
 
   if (!user) {
-    return <LoginScreen onLogin={handleLogin} />;
+    return <LoginScreen onLogin={handleLogin} api={api} />;
   }
 
   if (mustChangePassword) {
