@@ -358,6 +358,17 @@ COMMIT;
 
 function getDb() {
   if (!db) {
+    if (process.env.FORCE_RESET_DB === "true") {
+      const toDelete = path.normalize(dbPath);
+      if (fs.existsSync(toDelete)) {
+        try {
+          fs.rmSync(toDelete, { force: true });
+          logger.info("[DEV] Deleted local DB: " + toDelete);
+        } catch (e) {
+          logger.warn("[DEV] Failed to delete local DB", { path: toDelete, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+    }
     db = new Database(dbPath);
     db.exec(SCHEMA_SQL);
     runMigrations(db);
@@ -570,7 +581,10 @@ async function runStartup(): Promise<void> {
   const { createSupabaseClient } = await import("./supabase/client");
   const { createSupabaseApiAdapter } = await import("./supabase/apiAdapter");
   const supabase = createSupabaseClient(electronCfg);
-  apiClient = createSupabaseApiAdapter({ supabase }) as ApiClient;
+  apiClient = createSupabaseApiAdapter({
+    supabase,
+    supabaseUrl: electronCfg.supabase?.url,
+  }) as ApiClient;
 
   logger.info("[app] started", {
     version: config.appVersion,
@@ -580,6 +594,8 @@ async function runStartup(): Promise<void> {
   logger.info("[app] config", sanitizeConfigForLog(electronCfg));
 
   const database = getDb();
+  const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
+  seedBaseIfEmpty(database);
   const { getLocalVersion } = await import("../src/infra/db");
   if (getLocalVersion(database) === 0) {
     const cachePath = path.join(app.getPath("userData"), "pricing_cache.json");

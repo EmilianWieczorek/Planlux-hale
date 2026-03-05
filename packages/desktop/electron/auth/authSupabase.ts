@@ -90,13 +90,16 @@ export async function loginViaSupabase(
     .eq("id", userId)
     .maybeSingle();
 
+  const defaultRole = "HANDLOWIEC";
+  const displayNameFromEmail = (emailNorm.split("@")[0] || "User").trim() || "User";
+
   if (profileError) {
-    await supabase.auth.signOut();
     const msg = profileError.message ?? "Błąd profilu użytkownika";
     const lower = msg.toLowerCase();
     const isSchemaMissing =
       (lower.includes("could not find table") || lower.includes("schema cache")) && lower.includes("profiles");
     if (isSchemaMissing) {
+      await supabase.auth.signOut();
       logger.child("auth").error("Supabase profile fetch failed – profiles table missing", {
         userId,
         errorMessage: msg,
@@ -107,15 +110,23 @@ export async function loginViaSupabase(
         { expose: true, details: { hint: "Run: supabase db push" } }
       );
     }
-    logger.child("auth").error("Supabase profile fetch failed", {
+    logger.child("auth").warn("Supabase profile fetch failed – continuing with defaults", {
       userId,
       errorMessage: msg,
     });
-    return { ok: false, error: msg };
+    return {
+      ok: true,
+      user: {
+        id: userId,
+        email: emailNorm,
+        role: defaultRole,
+        name: displayNameFromEmail,
+      },
+    };
   }
 
   if (!profile) {
-    logger.child("auth").warn("Profile missing for user after login", { userId, email: emailNorm });
+    logger.child("auth").warn("Profile missing for user after login – continuing with defaults", { userId, email: emailNorm });
     try {
       const { error: insertErr } = await supabase.from("profiles").insert({
         id: userId,
@@ -133,17 +144,26 @@ export async function loginViaSupabase(
         error: e instanceof Error ? e.message : String(e),
       });
     }
+    return {
+      ok: true,
+      user: {
+        id: userId,
+        email: emailNorm,
+        role: defaultRole,
+        name: displayNameFromEmail,
+      },
+    };
   }
 
-  const role = normalizeRole((profile?.role as string) ?? "SALES");
-  const displayName = (profile?.display_name as string) ?? null;
+  const role = normalizeRole((profile.role as string) ?? defaultRole);
+  const displayName = (profile.display_name as string)?.trim() || displayNameFromEmail;
   return {
     ok: true,
     user: {
       id: userId,
-      email: (profile?.email as string) ?? emailNorm,
+      email: (profile.email as string) ?? emailNorm,
       role,
-      name: displayName ?? undefined,
+      name: displayName,
     },
   };
 }

@@ -3,9 +3,16 @@
  * Uses existing schema in shared; provides typed helpers.
  */
 
-import type { CachedBase } from "./baseSync";
-
 type Db = ReturnType<typeof import("better-sqlite3")>;
+
+/** Cached pricing base (from Supabase or local fallback). */
+export interface CachedBase {
+  version: number;
+  lastUpdated: string;
+  cennik: unknown[];
+  dodatki: unknown[];
+  standard: unknown[];
+}
 
 /** DEV-only: dump FK info for pdfs, email_outbox, email_history and database_list. */
 export function dumpFkInfo(db: Db): { pdfs: unknown[]; email_outbox: unknown[]; email_history: unknown[]; database_list: unknown[] } {
@@ -34,7 +41,17 @@ export function dumpFkInfo(db: Db): { pdfs: unknown[]; email_outbox: unknown[]; 
   return result;
 }
 
+/** Local version from config_sync_meta if present, else from pricing_cache. */
 export function getLocalVersion(db: Db): number {
+  try {
+    const hasMeta = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config_sync_meta'").get() as { name?: string } | undefined;
+    if (hasMeta?.name) {
+      const metaRow = db.prepare("SELECT version FROM config_sync_meta WHERE id = 1").get() as { version: number } | undefined;
+      if (metaRow != null) return metaRow.version;
+    }
+  } catch {
+    // ignore
+  }
   const row = db.prepare("SELECT MAX(pricing_version) as v FROM pricing_cache").get() as { v: number | null };
   return row?.v ?? 0;
 }
@@ -55,6 +72,106 @@ export function saveBase(db: Db, base: CachedBase): void {
     JSON.stringify(base.dodatki),
     JSON.stringify(base.standard)
   );
+  updateConfigSyncMeta(db, base.version);
+  writeBaseToLocalTables(db, base);
+}
+
+/** Write base to pricing_surface, addons_surcharges, standard_included so local fallback has data. */
+export function writeBaseToLocalTables(db: Db, base: CachedBase): void {
+  try {
+    const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
+    if (!hasSurface?.name) return;
+    db.prepare("DELETE FROM pricing_surface").run();
+    const insSurface = db.prepare("INSERT INTO pricing_surface (data_json) VALUES (?)");
+    for (const row of base.cennik) {
+      insSurface.run(JSON.stringify(row));
+    }
+    db.prepare("DELETE FROM addons_surcharges").run();
+    const insAddons = db.prepare("INSERT INTO addons_surcharges (data_json) VALUES (?)");
+    for (const row of base.dodatki) {
+      insAddons.run(JSON.stringify(row));
+    }
+    db.prepare("DELETE FROM standard_included").run();
+    const insStandard = db.prepare("INSERT INTO standard_included (data_json) VALUES (?)");
+    for (const row of base.standard) {
+      insStandard.run(JSON.stringify(row));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/** Update config_sync_meta.version and last_synced_at after a successful base save. */
+export function updateConfigSyncMeta(db: Db, version: number): void {
+  try {
+    const now = new Date().toISOString();
+    db.prepare("UPDATE config_sync_meta SET version = ?, last_synced_at = ? WHERE id = 1").run(version, now);
+  } catch {
+    // Table may not exist in older DBs
+  }
+}
+
+/**
+ * Load base pricing from local SQLite tables (pricing_surface, addons_surcharges, standard_included).
+ * Used when Supabase base_pricing returns empty or fetch fails.
+ * Returns null if tables are missing or cennik would be empty.
+ */
+export function loadBaseFromLocalTables(db: Db): CachedBase | null {
+  try {
+    const hasMeta = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config_sync_meta'").get() as { name?: string } | undefined;
+    const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
+    if (!hasMeta?.name || !hasSurface?.name) return null;
+
+    const metaRow = db.prepare("SELECT version FROM config_sync_meta WHERE id = 1").get() as { version: number } | undefined;
+    const version = metaRow?.version ?? 1;
+    const lastUpdated = new Date().toISOString();
+
+    const cennikRows = db.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>;
+    const cennik: unknown[] = [];
+    for (const row of cennikRows) {
+      try {
+        const parsed = JSON.parse(row.data_json);
+        cennik.push(typeof parsed === "object" && parsed != null ? parsed : row.data_json);
+      } catch {
+        // skip invalid row
+      }
+    }
+
+    let dodatki: unknown[] = [];
+    try {
+      const addonsRows = db.prepare("SELECT data_json FROM addons_surcharges").all() as Array<{ data_json: string }>;
+      for (const row of addonsRows) {
+        try {
+          const parsed = JSON.parse(row.data_json);
+          dodatki.push(typeof parsed === "object" && parsed != null ? parsed : row.data_json);
+        } catch {
+          // skip
+        }
+      }
+    } catch {
+      // table may not exist
+    }
+
+    let standard: unknown[] = [];
+    try {
+      const stdRows = db.prepare("SELECT data_json FROM standard_included").all() as Array<{ data_json: string }>;
+      for (const row of stdRows) {
+        try {
+          const parsed = JSON.parse(row.data_json);
+          standard.push(typeof parsed === "object" && parsed != null ? parsed : row.data_json);
+        } catch {
+          // skip
+        }
+      }
+    } catch {
+      // table may not exist
+    }
+
+    if (cennik.length === 0) return null;
+    return { version, lastUpdated, cennik, dodatki, standard };
+  } catch {
+    return null;
+  }
 }
 
 export function getCachedBase(db: Db): CachedBase | null {

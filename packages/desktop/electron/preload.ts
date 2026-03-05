@@ -14,6 +14,7 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:endSession",
   "planlux:getPricingCache",
   "planlux:getConfigSyncStatus",
+  "planlux:diagnostics",
   "planlux:testSupabaseConnection",
   "planlux:testEndToEnd",
   "planlux:syncPricing",

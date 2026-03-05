@@ -71,6 +71,44 @@ function normalizeRole(r: string): string {
   return "HANDLOWIEC";
 }
 
+/** Map normalized role (ADMIN/SZEF/HANDLOWIEC) to DB enum. Tables may use (ADMIN,BOSS,SALESPERSON) or (HANDLOWIEC,SZEF,ADMIN). */
+function roleForDb(db: DbLike, normalizedRole: string): string {
+  const roleUpper = (normalizedRole ?? "").trim().toUpperCase();
+  try {
+    const sqlRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as { sql: string } | undefined;
+    const sqlDef = (sqlRow?.sql ?? "").toUpperCase();
+    if (sqlDef.includes("'BOSS'") && sqlDef.includes("'SALESPERSON'")) {
+      if (roleUpper === "ADMIN") return "ADMIN";
+      if (roleUpper === "SZEF") return "BOSS";
+      return "SALESPERSON";
+    }
+  } catch {
+    // ignore
+  }
+  return normalizedRole;
+}
+
+/** Ensure local users row exists before any dependent inserts (avoids SQLITE_CONSTRAINT_FOREIGNKEY). */
+function ensureLocalUserExists(
+  db: DbLike,
+  params: { id: string; email: string; display_name: string | null; role: string; password_hash: string; created_at: string }
+): void {
+  const colNames = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
+  if (!colNames.includes("id") || !colNames.includes("email") || !colNames.includes("password_hash")) return;
+  const roleDb = roleForDb(db, params.role);
+  const displayName = params.display_name ?? "";
+  const now = params.created_at;
+  db.prepare(
+    "INSERT OR IGNORE INTO users (id, email, display_name, role, active, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
+  ).run(params.id, params.email, displayName, roleDb, params.password_hash, now, now);
+  db.prepare("UPDATE users SET email = ?, display_name = ?, role = ?, active = 1 WHERE id = ?").run(
+    params.email,
+    displayName,
+    roleDb,
+    params.id
+  );
+}
+
 function isNetworkError(err: unknown): boolean {
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
@@ -145,14 +183,21 @@ export async function performLogin(
         const now = new Date().toISOString();
         const backendUserId = (backendUser as { id?: string }).id;
         const userId = backendUserId ?? deps.uuid();
-        const colNames = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
-        if (colNames.includes("id") && colNames.includes("email") && colNames.includes("password_hash")) {
-          db.prepare(
-            "INSERT OR IGNORE INTO users (id, email, role, display_name, active, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
-          ).run(userId, emailNorm, role, displayName, hashed.hash, now, now);
+        ensureLocalUserExists(db, {
+          id: userId,
+          email: emailNorm,
+          display_name: displayName,
+          role,
+          password_hash: hashed.hash,
+          created_at: now,
+        });
+        if (process.env.LOG_LEVEL === "debug") {
+          console.log("[login] ensured local user", { id: userId, email: emailNorm, role });
         }
+        const colNames = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
         const hasLastSynced = colNames.includes("last_synced_at");
         const hasPasswordUnavail = colNames.includes("password_unavailable");
+        const roleDb = roleForDb(db, role);
         const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
         const userIdFinal = existing?.id ?? userId;
         if (existing) {
@@ -160,20 +205,20 @@ export async function performLogin(
             if (hasLastSynced) {
               db.prepare(
                 "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, password_unavailable = 0, last_online_login_at = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
-              ).run(role, displayName, hashed.hash, hashed.salt, hashed.version, now, now, now, emailNorm);
+              ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, now, emailNorm);
             } else {
               db.prepare(
                 "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, password_unavailable = 0, last_online_login_at = ?, updated_at = ? WHERE email = ?"
-              ).run(role, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
+              ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
             }
           } else if (hasLastSynced) {
             db.prepare(
               "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
-            ).run(role, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
+            ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
           } else {
             db.prepare(
               "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, updated_at = ? WHERE email = ?"
-            ).run(role, displayName, hashed.hash, hashed.salt, hashed.version, now, emailNorm);
+            ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, emailNorm);
           }
         } else {
           if (hasPasswordUnavail) {
@@ -184,9 +229,9 @@ export async function performLogin(
               "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, last_online_login_at, role, display_name, active, created_at, updated_at" +
               (hasLastSynced ? ", last_synced_at) VALUES (" + vals + ")" : ") VALUES (" + vals + ")");
             if (hasLastSynced) {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, role, displayName, now, now, now);
+              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, roleDb, displayName, now, now, now);
             } else {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, role, displayName, now, now);
+              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, roleDb, displayName, now, now);
             }
           } else {
             const vals = hasLastSynced ? "?, ?, ?, ?, ?, 1, ?, ?, ?" : "?, ?, ?, ?, ?, 1, ?, ?";
@@ -194,9 +239,9 @@ export async function performLogin(
               "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
               (hasLastSynced ? ", last_synced_at) VALUES (" + vals + ")" : ") VALUES (" + vals + ")");
             if (hasLastSynced) {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, role, displayName, now, now, now);
+              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, roleDb, displayName, now, now, now);
             } else {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, role, displayName, now, now);
+              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, roleDb, displayName, now, now);
             }
           }
         }

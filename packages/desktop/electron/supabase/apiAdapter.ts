@@ -20,6 +20,14 @@ import type {
 
 type RawRecord = Record<string, unknown>;
 
+/** Parsed base_pricing row payload from Supabase. */
+type BasePricingPayload = {
+  cennik?: unknown;
+  dodatki?: unknown;
+  standard?: unknown;
+  [k: string]: unknown;
+};
+
 /** Normalize one cennik row: Supabase (variant/name/price/unit) or Polish (wariant_hali/Nazwa/cena/stawka_jedn) -> app canonical. */
 function normalizeCennikRow(raw: RawRecord): CennikRow {
   const n = raw as Record<string, unknown>;
@@ -131,6 +139,8 @@ function normalizeBasePayload(p: Record<string, unknown>): {
 export interface SupabaseApiAdapterConfig {
   supabase: SupabaseClient;
   userId?: string;
+  /** Optional: base URL for logging (e.g. Supabase project URL). */
+  supabaseUrl?: string;
 }
 
 export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
@@ -141,7 +151,7 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   heartbeat: (payload: HeartbeatPayload) => Promise<{ ok: boolean; message?: string; id?: string }>;
   reserveOfferNumber: (payload: ReserveOfferNumberPayload) => Promise<ReserveOfferNumberResponse>;
 } {
-  const { supabase, userId } = config;
+  const { supabase, userId, supabaseUrl } = config;
 
   /** Single source: base_pricing. Query: select payload, version from base_pricing order by version desc limit 1 */
   const basePricingQuery = () =>
@@ -190,18 +200,44 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   }
 
   async function getBase(): Promise<BaseResponse> {
-    const { data, error } = await basePricingQuery();
-    if (error) throw new Error(error.message);
-    const rowVersion = data?.version != null ? Number(data.version) : 0;
-    const p = parsePayload(data?.payload);
-    console.info("pricing payload keys", Object.keys(p));
-    console.info("cennik count", (p.cennik as unknown[] | undefined)?.length ?? 0);
-    console.info("dodatki count", (p.dodatki as unknown[] | undefined)?.length ?? 0);
-    console.info("standard count", (p.standard as unknown[] | undefined)?.length ?? 0);
-    if (!Array.isArray(p.cennik) || p.cennik.length === 0) {
-      throw new Error("CONFIG_ERROR: base_pricing payload empty");
+    const { data: row, error } = await basePricingQuery();
+    if (process.env.LOG_LEVEL === "debug") {
+      const url = supabaseUrl ?? (supabase as any).supabaseUrl ?? "Supabase";
+      const fullUrl = url + "/rest/v1/base_pricing?select=payload,version";
+      const responseStatus = error ? (error as any).code ?? 500 : 200;
+      const body =
+        error != null
+          ? JSON.stringify({ error: (error as any).message, code: (error as any).code })
+          : row != null
+            ? JSON.stringify({ version: row.version, payloadKeys: row.payload != null && typeof row.payload === "object" ? Object.keys(row.payload as object) : null })
+            : "null";
+      console.log("BASE FETCH URL:", fullUrl, "STATUS:", responseStatus, "BODY:", body.slice(0, 500));
     }
-    const normalized = normalizeBasePayload(p);
+    if (error) {
+      throw new Error("BASE_PRICING_EMPTY");
+    }
+    const rowVersion = row?.version != null ? Number(row.version) : 0;
+    const p = (parsePayload(row?.payload) ?? {}) as BasePricingPayload;
+    const cennikArr = Array.isArray(p.cennik) ? p.cennik : [];
+    const dodatkiArr = Array.isArray(p.dodatki) ? p.dodatki : [];
+    const standardArr = Array.isArray(p.standard) ? p.standard : [];
+    const hasValidStructure =
+      typeof rowVersion === "number" &&
+      Array.isArray(cennikArr) &&
+      Array.isArray(dodatkiArr) &&
+      Array.isArray(standardArr);
+    if (!hasValidStructure || cennikArr.length === 0) {
+      throw new Error("BASE_PRICING_EMPTY");
+    }
+    if (process.env.LOG_LEVEL === "debug") {
+      console.log("pricing payload keys", Object.keys(p), "version", rowVersion, "cennik", cennikArr.length, "dodatki", dodatkiArr.length, "standard", standardArr.length);
+    }
+    const normalized = normalizeBasePayload({
+      ...p,
+      cennik: cennikArr,
+      dodatki: dodatkiArr,
+      standard: standardArr,
+    } as Record<string, unknown>);
     return {
       ok: true,
       meta: { ...normalized.meta, version: rowVersion },

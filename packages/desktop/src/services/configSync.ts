@@ -4,8 +4,8 @@
  * On app start: compare meta version with local; if different, download and save.
  */
 
-import type { CachedBase } from "../infra/baseSync";
-import { getLocalVersion, saveBase } from "../infra/db";
+import { getLocalVersion, loadBaseFromLocalTables, saveBase, type CachedBase } from "../infra/db";
+import { seedBaseIfEmpty } from "../infra/seedBase";
 
 type Db = ReturnType<typeof import("better-sqlite3")>;
 
@@ -69,7 +69,7 @@ export async function syncConfig(
     return lastSyncResult;
   }
 
-  const forceRefresh = process.env.LOG_LEVEL === "debug";
+  const forceRefresh = process.env.LOG_LEVEL === "debug" || localVersion === 0;
   if (!forceRefresh && meta.version <= localVersion) {
     log.info("[configSync] unchanged", { version: meta.version });
     lastSyncResult = { status: "unchanged", version: meta.version, lastUpdated: meta.lastUpdated };
@@ -90,16 +90,49 @@ export async function syncConfig(
       dodatki: res.dodatki ?? [],
       standard: res.standard ?? [],
     };
+    if (!baseData.cennik?.length) {
+      throw new Error("BASE_PRICING_EMPTY");
+    }
   } catch (e) {
     log.error("[configSync] Backend base fetch failed", e);
-    lastSyncResult = {
-      status: "offline",
-      version: localVersion,
-      error: "Pracujesz w trybie offline — dane mogą być nieaktualne",
-    };
-    return lastSyncResult;
+    let local = loadBaseFromLocalTables(db);
+    if (!local || local.cennik.length === 0) {
+      const seeded = seedBaseIfEmpty(db);
+      if (seeded) {
+        log.info("[configSync] seeded local base (pricing_surface, addons_surcharges, standard_included)");
+        local = loadBaseFromLocalTables(db);
+      }
+    }
+    if (local && local.cennik.length > 0) {
+      baseData = {
+        meta: { version: local.version, lastUpdated: local.lastUpdated },
+        cennik: local.cennik,
+        dodatki: local.dodatki,
+        standard: local.standard,
+      };
+      log.info("[configSync] using local fallback from SQLite", {
+        cennik: baseData.cennik.length,
+        dodatki: baseData.dodatki.length,
+        standard: baseData.standard.length,
+      });
+    } else {
+      log.error("[configSync] No pricing base available (backend empty and local fallback empty)");
+      lastSyncResult = {
+        status: "error",
+        version: localVersion,
+        error: "No pricing base available",
+      };
+      return lastSyncResult;
+    }
   }
 
+  if (!Array.isArray(baseData.cennik) || baseData.cennik.length === 0) {
+    throw new Error("BASE_PRICING_EMPTY_FINAL");
+  }
+
+  if (process.env.LOG_LEVEL === "debug") {
+    log.info("[configSync] variants after fetch", { count: baseData.cennik.length });
+  }
   log.info("[configSync] payload loaded", {
     version: baseData.meta.version,
     cennik: baseData.cennik.length,
@@ -112,7 +145,7 @@ export async function syncConfig(
   if (process.env.LOG_LEVEL === "debug") {
     log.info("[configSync] variants after fetch", { count: variantsCount, first5: variants.slice(0, 5) });
   }
-  if (variantsCount === 0 && baseData.cennik.length > 0) {
+  if (variantsCount === 0 && Array.isArray(baseData.cennik) && baseData.cennik.length > 0) {
     const firstRow = baseData.cennik[0] as Record<string, unknown>;
     const payloadKeys = Object.keys(firstRow);
     const errMsg = `Pricing sync: zero variants – calculator will not work. Payload keys on first cennik row: ${payloadKeys.join(", ")}. Ensure base_pricing.payload.cennik has wariant_hali (or variant) and cena.`;
@@ -120,7 +153,7 @@ export async function syncConfig(
     lastSyncResult = { status: "error", version: localVersion, error: errMsg };
     return lastSyncResult;
   }
-  if (variantsCount === 0 && baseData.cennik.length === 0) {
+  if (variantsCount === 0 && (!Array.isArray(baseData.cennik) || baseData.cennik.length === 0)) {
     log.warn("[configSync] base has no cennik rows – not overwriting cache");
     lastSyncResult = { status: "unchanged", version: localVersion, error: "Brak pozycji cennika" };
     return lastSyncResult;

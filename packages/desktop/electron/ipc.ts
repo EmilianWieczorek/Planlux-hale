@@ -65,10 +65,12 @@ function requireAuth(): SessionUser {
   }
 }
 
-/** Throws AppError if not logged in, session expired, or role not in allowed. Returns session user. */
+/** Throws AppError if not logged in, session expired, or role not in allowed. Returns session user. Role comparison is case-insensitive. */
 function requireRole(allowedRoles: string[]): SessionUser {
   const user = requireAuth();
-  if (!allowedRoles.includes(user.role)) throw new AppError("AUTH_FORBIDDEN", "Brak uprawnień.", { expose: true });
+  const userRoleUpper = (user.role ?? "").trim().toUpperCase();
+  const allowed = allowedRoles.some((r) => (r ?? "").trim().toUpperCase() === userRoleUpper);
+  if (!allowed) throw new AppError("AUTH_FORBIDDEN", "Brak uprawnień.", { expose: true });
   return user;
 }
 
@@ -537,6 +539,44 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
+  /** Diagnostics: localVersion, remoteVersion, variantsCount, currentUser, lastSyncResult. Only when LOG_LEVEL=debug. */
+  ipcMain.handle("planlux:diagnostics", async () => {
+    if (process.env.LOG_LEVEL !== "debug") {
+      return { ok: true, enabled: false, message: "Set LOG_LEVEL=debug to enable" };
+    }
+    try {
+      const { getLocalVersion, getCachedBase } = await import("../src/infra/db");
+      const { getConfigSyncStatus } = await import("../src/services/configSync");
+      const db = getDb();
+      const localVersion = getLocalVersion(db);
+      const lastSyncResult = getConfigSyncStatus();
+      const base = getCachedBase(db);
+      const variantsCount = base?.cennik?.length ?? 0;
+      const user = getSession();
+      let remoteVersion: number | null = null;
+      try {
+        if (apiClient?.getMeta) {
+          const metaRes = await apiClient.getMeta();
+          if (metaRes?.meta?.version != null) remoteVersion = Number(metaRes.meta.version);
+        }
+      } catch {
+        // ignore
+      }
+      return {
+        ok: true,
+        enabled: true,
+        localVersion,
+        remoteVersion,
+        variantsCount,
+        currentUser: user ? { id: user.id, email: user.email, role: user.role } : null,
+        lastSyncResult,
+      };
+    } catch (e) {
+      logger.error("diagnostics failed", e);
+      return { ok: false, enabled: true, error: String(e) };
+    }
+  });
+
   ipcMain.handle(
     "planlux:testSupabaseConnection",
     wrap("planlux:testSupabaseConnection", async () => {
@@ -599,18 +639,9 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:syncPricing", wrap("planlux:syncPricing", async () => {
     try {
-      const { syncBaseIfNeeded } = await import("../src/infra/baseSync");
-      const { getLocalVersion, saveBase } = await import("../src/infra/db");
-      const appConfig = getConfig();
+      const { syncConfig } = await import("../src/services/configSync");
       const db = getDb();
-      const result = await syncBaseIfNeeded(
-        apiClient,
-        getBackendUrl(appConfig),
-        globalThis.fetch.bind(globalThis),
-        () => getLocalVersion(db),
-        (base) => saveBase(db, base),
-        logger
-      );
+      const result = await syncConfig(db, logger, apiClient);
       return {
         ok: result.status !== "error",
         status: result.status,
@@ -626,20 +657,12 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("base:sync", wrap("base:sync", async () => {
     try {
-      const { syncBaseIfNeeded } = await import("../src/infra/baseSync");
-      const { getLocalVersion, saveBase, getCachedBase } = await import("../src/infra/db");
+      const { syncConfig } = await import("../src/services/configSync");
+      const { getCachedBase } = await import("../src/infra/db");
       const { createOutboxStorage } = await import("../src/db/outboxStorage");
       const { flushOutbox } = await import("@planlux/shared");
-      const appConfig = getConfig();
       const db = getDb();
-      const result = await syncBaseIfNeeded(
-        apiClient,
-        getBackendUrl(appConfig),
-        globalThis.fetch.bind(globalThis),
-        () => getLocalVersion(db),
-        (base) => saveBase(db, base),
-        logger
-      );
+      const result = await syncConfig(db, logger, apiClient);
       const base = getCachedBase(db);
       if (result.status === "synced" || result.status === "unchanged" || result.status === "offline") {
         flushOutbox({

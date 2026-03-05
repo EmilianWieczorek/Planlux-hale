@@ -97,7 +97,9 @@ export function requireValidSession(token?: string | null): Session {
  */
 export function requireRole(sessionToken: string | null | undefined, allowedRoles: string[]): SessionUser {
   const session = requireValidSession(sessionToken);
-  if (!allowedRoles.includes(session.role)) throw new Error("Forbidden");
+  const sessionRoleUpper = (session.role ?? "").trim().toUpperCase();
+  const allowed = allowedRoles.some((r) => (r ?? "").trim().toUpperCase() === sessionRoleUpper);
+  if (!allowed) throw new Error("Forbidden");
   return {
     id: session.userId,
     email: session.email,
