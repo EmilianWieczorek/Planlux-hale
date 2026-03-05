@@ -1,5 +1,5 @@
 /**
- * Typy request/response dla backendu Apps Script.
+ * Typy request/response dla backendu (Supabase / Edge Functions).
  */
 
 export interface MetaResponse {

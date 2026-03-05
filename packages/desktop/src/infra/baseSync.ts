@@ -74,7 +74,14 @@ export async function syncBaseIfNeeded(
   const localVersion = getLocalVersion();
   logger?.info("[baseSync] syncBaseIfNeeded start", { localVersion });
 
-  const meta = await getRemoteMeta(baseUrl, fetchFn);
+  let meta: { version: number; lastUpdated: string } | null = null;
+  try {
+    const metaResponse = await api.getMeta();
+    if (metaResponse?.meta) meta = metaResponse.meta;
+  } catch {
+    // fallback: try HTTP meta (legacy backend)
+    meta = await getRemoteMeta(baseUrl, fetchFn);
+  }
   if (!meta) {
     logger?.warn("[baseSync] offline or meta fetch failed");
     return {

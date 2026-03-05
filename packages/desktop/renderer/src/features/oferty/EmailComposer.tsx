@@ -22,6 +22,7 @@ import {
   ListItemSecondaryAction,
 } from "@mui/material";
 import { Send, AttachFile, Delete } from "@mui/icons-material";
+import { getErrorMessage } from "../../lib/errorMessage";
 
 export type SendResult = { ok: boolean; error?: string; queued?: boolean };
 
@@ -102,7 +103,7 @@ export function EmailComposer({
           setTimeout(() => onClose(), 1500);
         }
       } else {
-        setError(res.error ?? "Błąd wysyłki");
+        setError(getErrorMessage(res));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Błąd wysyłki");

@@ -7,6 +7,9 @@ import { ipcMain, app, shell, net, dialog } from "electron";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
+import { hashPassword, verifyPassword, validatePassword, isLegacyHash, LEGACY_SALT } from "./auth/password";
+import * as session from "./auth/session";
+import { performLogin } from "./auth/login";
 import type { GeneratePdfPayload } from "@planlux/shared";
 import { generatePdfPipeline, getTestPdfFileName, getE2EPlaceholderPdfBuffer } from "./pdf/generatePdf";
 import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTemplateOptions } from "./pdf/generatePdfFromTemplate";
@@ -20,33 +23,59 @@ import { parseRecipients, allowedEmailHistoryStatus } from "./emailService";
 import { createFilePdfTemplateConfigStore } from "./pdf/pdfTemplateConfigStore";
 import { getPreviewHtmlWithInlinedAssets } from "./pdf/renderTemplate";
 import { getNextOfferNumber as getNextOfferNumberLocal } from "./offerCounters";
+import { generateTempOfferNumber, finalizeOfferNumber } from "./offers/numbering";
+import { wrapIpcHandler } from "./ipc/response";
+import { getConfig, getPublicConfig, getBackendUrl } from "./config";
+import { AppError, authErrors, dbErrors } from "./errors/AppError";
 
-/** Session: current user in main process. Set on login, cleared on logout. */
+/** Session: current user in main process. Set on login, cleared on logout. Backed by auth/session for expiry. */
 export type SessionUser = { id: string; email: string; role: string; displayName: string | null };
 let currentUser: SessionUser | null = null;
 
 export function setSession(user: SessionUser | null): void {
+  if (!user) {
+    session.revokeSession();
+    currentUser = null;
+    return;
+  }
+  session.createSession(user);
   currentUser = user;
 }
 
 export function getSession(): SessionUser | null {
+  const s = session.getCurrentSession();
+  if (!s || !session.isSessionValid(s)) {
+    currentUser = null;
+    return null;
+  }
+  currentUser = { id: s.userId, email: s.email, role: s.role, displayName: s.displayName };
   return currentUser;
 }
 
-/** Throws if not logged in. Returns session user. */
+/** Throws AppError if not logged in or session expired. Returns session user. */
 function requireAuth(): SessionUser {
-  if (!currentUser) throw new Error("Unauthorized");
-  return currentUser;
+  try {
+    const s = session.requireValidSession();
+    currentUser = { id: s.userId, email: s.email, role: s.role, displayName: s.displayName };
+    return currentUser;
+  } catch (e) {
+    currentUser = null;
+    if (e instanceof Error && e.message === "AUTH_SESSION_EXPIRED") throw authErrors.sessionExpired();
+    throw new AppError("AUTH_UNAUTHORIZED", "Sesja wygasła. Zaloguj się ponownie.", { expose: true, cause: e });
+  }
 }
 
-/** Throws if not logged in or role not in allowed. Returns session user. */
+/** Throws AppError if not logged in, session expired, or role not in allowed. Returns session user. */
 function requireRole(allowedRoles: string[]): SessionUser {
   const user = requireAuth();
-  if (!allowedRoles.includes(user.role)) throw new Error("Forbidden");
+  if (!allowedRoles.includes(user.role)) throw new AppError("AUTH_FORBIDDEN", "Brak uprawnień.", { expose: true });
   return user;
 }
 
-const SALT = "planlux-hale-v1";
+/** Placeholder hash for users synced from backend without password (never verifies). Check password_unavailable for offline message. */
+function placeholderHash(): string {
+  return crypto.scryptSync("__unavailable__", LEGACY_SALT, 64).toString("hex");
+}
 
 /** Safe serialization for IPC and logging – never pass raw Error (TLS/socket have circular refs). */
 function serializeError(err: unknown): { message: string; code: string | null; reason: string | null; stack: string | null } {
@@ -68,19 +97,6 @@ function normalizeRole(input: string): AllowedRole {
   if (r === "ADMIN") return "ADMIN";
   if (r === "SZEF" || r === "BOSS" || r === "MANAGER") return "SZEF";
   return "HANDLOWIEC";
-}
-
-function hashPassword(password: string): string {
-  return crypto.scryptSync(password, SALT, 64).toString("hex");
-}
-
-/** Sentinel hash for users synced from backend who have never logged in online (blocks offline login until first online login). */
-const SENTINEL_NO_PASSWORD = hashPassword("__offline_not_set__");
-
-function verifyPassword(password: string, hash: string): boolean {
-  if (!hash || hash === SENTINEL_NO_PASSWORD) return false;
-  const h = hashPassword(password);
-  return crypto.timingSafeEqual(Buffer.from(h, "hex"), Buffer.from(hash, "hex"));
 }
 
 function uuid(): string {
@@ -234,21 +250,31 @@ export async function registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
   getDbPath?: () => string;
   apiClient: import("@planlux/shared").ApiClient;
+  getSupabase?: () => import("@supabase/supabase-js").SupabaseClient;
   config: { appVersion: string; updatesUrl?: string };
   logger: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void };
 }) {
-  const { getDb, getDbPath, config, apiClient, logger } = deps;
+  const { getDb, getDbPath, config, apiClient, getSupabase, logger } = deps;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const wrap = (channel: string, handler: (event: unknown, ...args: any[]) => Promise<unknown> | unknown) =>
+    wrapIpcHandler(channel, handler as (event: unknown, ...args: unknown[]) => Promise<unknown>, { log: (msg, meta) => logger.error(msg, meta) });
 
-  /** Sync users from Apps Script (listUsers). Upsert by email; new users get sentinel password until first online login. */
+  /** Sync users from Supabase profiles (or legacy backend). Upsert by email; new users get sentinel password until first online login. */
   async function syncUsersFromBackend(): Promise<{ ok: boolean; syncedCount?: number; error?: string }> {
-    const { config: appConfig } = await import("../src/config");
-    const { listUsersFromBackend } = await import("./authBackend");
     const db = getDb();
     const now = new Date().toISOString();
     try {
-      const result = await listUsersFromBackend(appConfig.backend.url);
+      let result: { ok: boolean; users?: Array<{ email: string; role?: string; name?: string; active?: boolean }>; error?: string };
+      if (getSupabase) {
+        const { listProfilesFromSupabase } = await import("./auth/authSupabase");
+        result = await listProfilesFromSupabase(getSupabase());
+      } else {
+        const appConfig = getConfig();
+        const { listUsersFromBackend } = await import("./authBackend");
+        result = await listUsersFromBackend(getBackendUrl(appConfig));
+      }
       if (!result.ok || !Array.isArray(result.users)) {
-        return { ok: false, error: (result as { error?: string }).error ?? "Błąd synchronizacji" };
+        return { ok: false, error: result.error ?? "Błąd synchronizacji" };
       }
       let synced = 0;
       const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
@@ -258,6 +284,7 @@ export async function registerIpcHandlers(deps: {
         const role = normalizeRole(u.role ?? "HANDLOWIEC");
         const displayName = (u.name ?? "").trim() || null;
         const active = u.active !== false ? 1 : 0;
+        const hasPasswordUnavail = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
         const existing = db.prepare("SELECT id, password_hash FROM users WHERE email = ?").get(email) as
           | { id: string; password_hash: string }
           | undefined;
@@ -270,12 +297,23 @@ export async function registerIpcHandlers(deps: {
             db.prepare("UPDATE users SET role = ?, display_name = ?, active = ?, updated_at = ? WHERE email = ?").run(role, displayName, active, now, email);
           }
         } else {
-          const insertCols = "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
-            (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-          if (hasLastSynced) {
-            db.prepare(insertCols).run(uuid(), email, SENTINEL_NO_PASSWORD, role, displayName, active, now, now, now);
+          const ph = placeholderHash();
+          if (hasPasswordUnavail) {
+            const insertCols = "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, display_name, active, created_at, updated_at" +
+              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)");
+            if (hasLastSynced) {
+              db.prepare(insertCols).run(uuid(), email, ph, null, 0, role, displayName, active, now, now, now);
+            } else {
+              db.prepare(insertCols).run(uuid(), email, ph, null, 0, role, displayName, active, now, now);
+            }
           } else {
-            db.prepare(insertCols).run(uuid(), email, SENTINEL_NO_PASSWORD, role, displayName, active, now, now);
+            const insertCols = "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
+              (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            if (hasLastSynced) {
+              db.prepare(insertCols).run(uuid(), email, ph, role, displayName, active, now, now, now);
+            } else {
+              db.prepare(insertCols).run(uuid(), email, ph, role, displayName, active, now, now);
+            }
           }
         }
         synced++;
@@ -287,35 +325,33 @@ export async function registerIpcHandlers(deps: {
     }
   }
 
-  ipcMain.handle("planlux:syncUsers", async () => {
-    try {
-      return await syncUsersFromBackend();
-    } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
-    }
-  });
+  ipcMain.handle("planlux:syncUsers", wrap("planlux:syncUsers", async () => {
+    const result = await syncUsersFromBackend();
+    if (!result.ok) throw new AppError("SYNC_USERS_ERROR", result.error ?? "Błąd synchronizacji użytkowników.", { expose: true });
+    return result as { ok: true; syncedCount?: number };
+  }));
 
   const handleLogin = async (_event: unknown, email: string, password: string) => {
     try {
       if (typeof email !== "string" || typeof password !== "string") {
-        return { ok: false, error: "Invalid input" };
+        return { ok: false, error: "Invalid input", errorCode: "AUTH_UNKNOWN_ERROR" };
       }
       const db = getDb();
       const emailNorm = email.trim().toLowerCase();
 
-      // E2E only: skip backend, use local DB (seeded users). Production unchanged when PLANLUX_E2E is not set.
+      // E2E only: skip backend, use local DB (seeded users).
       if (process.env.PLANLUX_E2E === "1") {
         const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
-          | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
+          | { id: string; email: string; role: string; password_hash: string; password_salt?: string | null; password_algo_version?: number | null; password_unavailable?: number | null; display_name: string; must_change_password?: number }
           | undefined;
         if (!row) {
-          return { ok: false, error: "Zaloguj się przy połączeniu z internetem (brak danych offline)." };
+          return { ok: false, error: "Zaloguj się przy połączeniu z internetem (brak danych offline).", errorCode: "AUTH_OFFLINE_USER_NOT_FOUND" };
         }
-        if (row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) {
-          return { ok: false, error: "Zaloguj się przy połączeniu z internetem, aby włączyć logowanie offline." };
+        if (row.password_unavailable === 1) {
+          return { ok: false, error: "Zaloguj się raz online, aby aktywować tryb offline.", errorCode: "AUTH_OFFLINE_REQUIRES_ONLINE_LOGIN_ONCE" };
         }
-        if (!verifyPassword(password, row.password_hash)) {
-          return { ok: false, error: "Nieprawidłowy email lub hasło" };
+        if (!verifyPassword(password, row)) {
+          return { ok: false, error: "Nieprawidłowy email lub hasło", errorCode: "AUTH_INVALID_CREDENTIALS" };
         }
         const user: SessionUser = {
           id: row.id,
@@ -323,117 +359,50 @@ export async function registerIpcHandlers(deps: {
           role: normalizeRole(row.role),
           displayName: row.display_name ?? null,
         };
+        const sess = session.createSession(user);
         currentUser = user;
         db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
-        const mustChangePassword = row.must_change_password === 1;
         return {
           ok: true,
           user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
-          mustChangePassword: mustChangePassword ?? false,
+          mustChangePassword: row.must_change_password === 1,
+          token: sess.token,
         };
       }
 
-      const { config: appConfig } = await import("../src/config");
+      const appConfig = getConfig();
       const { loginViaBackend } = await import("./authBackend");
+      const { loginViaSupabase } = await import("./auth/authSupabase");
+      const result = await performLogin(emailNorm, password, {
+        getDb: () => getDb() as import("./auth/login").DbLike,
+        backendUrl: getBackendUrl(appConfig),
+        backendLogin: loginViaBackend,
+        supabaseLogin: getSupabase ? (em, pw) => loginViaSupabase(getSupabase!(), em, pw) : undefined,
+        onlineTimeoutMs: appConfig.backend.healthTimeoutMs,
+        uuid,
+      });
 
-      try {
-        const loginResult = await loginViaBackend(appConfig.backend.url, emailNorm, password);
-        if (loginResult.ok && loginResult.user) {
-          const backendUser = loginResult.user;
-          const role = normalizeRole(backendUser.role ?? "HANDLOWIEC");
-          const displayName = (backendUser.name ?? "").trim() || null;
-          const hash = hashPassword(password);
-          const now = new Date().toISOString();
-          const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
-          const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
-          if (existing) {
-            if (hasLastSynced) {
-              db.prepare(
-                "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
-              ).run(role, displayName, hash, now, now, emailNorm);
-            } else {
-              db.prepare("UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, updated_at = ? WHERE email = ?").run(role, displayName, hash, now, emailNorm);
-            }
-            const row = db.prepare("SELECT id, must_change_password FROM users WHERE email = ?").get(emailNorm) as { id: string; must_change_password?: number };
-            const user: SessionUser = { id: row.id, email: emailNorm, role, displayName };
-            currentUser = user;
-            db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
-            return {
-              ok: true,
-              user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
-              mustChangePassword: row.must_change_password === 1,
-            };
-          }
-          const id = uuid();
-          const loginInsertSql = "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
-            (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, ?, ?)");
-          if (hasLastSynced) {
-            db.prepare(loginInsertSql).run(id, emailNorm, hash, role, displayName, now, now, now);
-          } else {
-            db.prepare(loginInsertSql).run(id, emailNorm, hash, role, displayName, now, now);
-          }
-          const user: SessionUser = { id, email: emailNorm, role, displayName };
-          currentUser = user;
-          db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), id, config.appVersion);
-          return { ok: true, user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName }, mustChangePassword: false };
-        }
-        const backendError = (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło";
-        tryLocalLogin: {
-          const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
-            | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
-            | undefined;
-          if (!row || row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) break tryLocalLogin;
-          if (!verifyPassword(password, row.password_hash)) break tryLocalLogin;
-          const user: SessionUser = {
-            id: row.id,
-            email: row.email,
-            role: normalizeRole(row.role),
-            displayName: row.display_name ?? null,
-          };
-          currentUser = user;
-          db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
-          return {
-            ok: true,
-            user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
-            mustChangePassword: row.must_change_password === 1,
-          };
-        }
-        return { ok: false, error: backendError };
-      } catch (_onlineErr) {
-        const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as
-          | { id: string; email: string; role: string; password_hash: string; display_name: string; must_change_password?: number }
-          | undefined;
-        if (!row) {
-          return { ok: false, error: "Zaloguj się przy połączeniu z internetem (brak danych offline)." };
-        }
-        if (row.password_hash === SENTINEL_NO_PASSWORD || !row.password_hash) {
-          return { ok: false, error: "Zaloguj się przy połączeniu z internetem, aby włączyć logowanie offline." };
-        }
-        if (!verifyPassword(password, row.password_hash)) {
-          return { ok: false, error: "Nieprawidłowy email lub hasło" };
-        }
-        const user: SessionUser = {
-          id: row.id,
-          email: row.email,
-          role: normalizeRole(row.role),
-          displayName: row.display_name ?? null,
-        };
-        currentUser = user;
-        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), row.id, config.appVersion);
-        const mustChangePassword = row.must_change_password === 1;
+      if (result.ok) {
+        const sess = session.createSession(result.user);
+        currentUser = result.user;
+        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), result.user.id, config.appVersion);
         return {
           ok: true,
-          user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
-          mustChangePassword: mustChangePassword ?? false,
+          user: { id: result.user.id, email: result.user.email, role: result.user.role, displayName: result.user.displayName },
+          mustChangePassword: result.mustChangePassword,
+          token: sess.token,
         };
       }
+      return { ok: false, error: result.message, errorCode: result.code };
+
     } catch (e) {
       logger.error("login failed", e);
-      return { ok: false, error: String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: msg, errorCode: "AUTH_UNKNOWN_ERROR" };
     }
   };
 
-  ipcMain.handle("planlux:login", (_, email: string, password: string) => handleLogin(_, email, password));
+  ipcMain.handle("planlux:login", wrap("planlux:login", (_, email: string, password: string) => handleLogin(_, email, password)));
   ipcMain.handle("login", (_, payloadOrEmail: unknown, passwordMaybe?: string) => {
     const email = typeof payloadOrEmail === "object" && payloadOrEmail != null && "email" in payloadOrEmail
       ? String((payloadOrEmail as { email: string }).email ?? "")
@@ -445,54 +414,70 @@ export async function registerIpcHandlers(deps: {
     return handleLogin(_, email, password);
   });
 
-  ipcMain.handle("planlux:changePassword", async (_, newPassword: string) => {
+  ipcMain.handle("planlux:changePassword", wrap("planlux:changePassword", async (_, newPassword: string) => {
+    const user = requireAuth();
+    const validation = validatePassword(newPassword);
+    if (!validation.ok) throw new AppError("VALIDATION_ERROR", validation.reason, { expose: true });
+    const db = getDb();
     try {
-      const user = requireAuth();
-      if (typeof newPassword !== "string" || newPassword.length < 8) {
-        return { ok: false, error: "Hasło musi mieć co najmniej 8 znaków" };
+      const hashed = hashPassword(newPassword);
+      const hasSalt = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_salt");
+      if (hasSalt) {
+        db.prepare(
+          "UPDATE users SET password_hash = ?, password_salt = ?, password_algo_version = ?, must_change_password = 0, password_set_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+        ).run(hashed.hash, hashed.salt, hashed.version, user.id);
+      } else {
+        db.prepare(
+          "UPDATE users SET password_hash = ?, must_change_password = 0, password_set_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+        ).run(hashed.hash, user.id);
       }
-      const db = getDb();
-      const hash = hashPassword(newPassword);
-      db.prepare(
-        "UPDATE users SET password_hash = ?, must_change_password = 0, password_set_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
-      ).run(hash, user.id);
       logger.info("[auth] changePassword", { userId: user.id });
       return { ok: true };
     } catch (e) {
-      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
-        return { ok: false, error: e.message };
-      }
       logger.error("[auth] changePassword failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      if (e instanceof Error && (e.message.includes("SQLITE_CONSTRAINT") || e.message.includes("constraint"))) throw dbErrors.constraint();
+      throw AppError.fromUnknown(e);
     }
-  });
+  }));
 
-  ipcMain.handle("planlux:logout", async () => {
+  ipcMain.handle("planlux:logout", wrap("planlux:logout", async () => {
     try {
+      session.revokeSession();
+      currentUser = null;
       const db = getDb();
       const row = db.prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1").get() as { id: string } | undefined;
       if (row) db.prepare("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?").run(row.id);
-      currentUser = null;
       return { ok: true };
     } catch (e) {
       logger.error("logout failed", e);
+      session.revokeSession();
       currentUser = null;
       return { ok: false, error: String(e) };
     }
-  });
+  }));
 
-  ipcMain.handle("planlux:endSession", async () => {
+  ipcMain.handle("planlux:endSession", wrap("planlux:endSession", async () => {
     try {
+      session.revokeSession();
+      currentUser = null;
       const db = getDb();
       const row = db.prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1").get() as { id: string } | undefined;
       if (row) db.prepare("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?").run(row.id);
-      currentUser = null;
       return { ok: true };
     } catch (e) {
       logger.error("endSession failed", e);
-      return { ok: false };
+      throw AppError.fromUnknown(e);
     }
-  });
+  }));
+
+  ipcMain.handle("planlux:session", wrap("planlux:session", () => {
+    const s = session.getCurrentSession();
+    if (!s || !session.isSessionValid(s)) return { ok: false, session: null };
+    return {
+      ok: true,
+      session: { userId: s.userId, email: s.email, role: s.role, displayName: s.displayName, expiresAt: s.expiresAt },
+    };
+  }));
 
   ipcMain.handle("planlux:getPricingCache", async () => {
     try {
@@ -516,15 +501,75 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  ipcMain.handle("planlux:syncPricing", async () => {
+  ipcMain.handle(
+    "planlux:testSupabaseConnection",
+    wrap("planlux:testSupabaseConnection", async () => {
+      const { testSupabaseConnection } = await import("./supabase/testConnection");
+      return testSupabaseConnection();
+    })
+  );
+
+  /** Test E2E: create offer w Supabase, finalize RPC, upload PDF, invoke send_offer_email (akceptuje CONFIG_SMTP_MISSING). */
+  ipcMain.handle("planlux:testEndToEnd", wrap("planlux:testEndToEnd", async () => {
+    if (!getSupabase) return { ok: false, error: "Supabase not configured" };
+    const user = requireAuth();
+    const supabase = getSupabase();
+    const steps: string[] = [];
+    try {
+      const { data: conn } = await supabase.from("profiles").select("id").limit(1).maybeSingle();
+      if (conn == null) return { ok: false, error: "Connection failed", steps: ["profiles select"] };
+      steps.push("profiles ok");
+
+      const { data: offer, error: insErr } = await supabase
+        .from("offers")
+        .insert({
+          created_by: user.id,
+          offer_number_status: "TEMP",
+          status: "DRAFT",
+          payload: { testE2E: true, at: new Date().toISOString() },
+          totals: {},
+        })
+        .select("id")
+        .single();
+      if (insErr || !offer?.id) return { ok: false, error: insErr?.message ?? "Insert offer failed", steps };
+      steps.push("offer created");
+      const offerId = (offer as { id: string }).id;
+
+      const { data: rpcData, error: rpcErr } = await supabase.rpc("rpc_finalize_offer_number", { p_offer_id: offerId });
+      if (rpcErr || !(rpcData as { ok?: boolean })?.ok) {
+        return { ok: false, error: (rpcData as { error?: string })?.error ?? rpcErr?.message ?? "RPC failed", steps };
+      }
+      steps.push("number finalized");
+
+      const path = `${user.id}/${offerId}/test-e2e.pdf`;
+      const buf = new Uint8Array(37);
+      buf.set([0x25, 0x50, 0x44, 0x46], 0);
+      const { error: upErr } = await supabase.storage.from("offer-pdfs").upload(path, buf, { contentType: "application/pdf", upsert: true });
+      if (upErr) return { ok: false, error: upErr.message, steps };
+      steps.push("pdf uploaded");
+
+      const { data: fnData, error: fnErr } = await supabase.functions.invoke("send_offer_email", {
+        body: { offer_id: offerId, to_email: "test@example.com", subject: "E2E test", attachPdf: false },
+      });
+      if (fnErr) return { ok: false, error: fnErr.message, steps };
+      const body = fnData as { ok?: boolean; error?: string };
+      if (body?.ok) steps.push("email sent"); else if (body?.error?.includes("CONFIG_SMTP_MISSING")) steps.push("email skipped (no SMTP)"); else return { ok: false, error: body?.error ?? "send_offer_email failed", steps };
+
+      return { ok: true, steps };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e), steps };
+    }
+  }));
+
+  ipcMain.handle("planlux:syncPricing", wrap("planlux:syncPricing", async () => {
     try {
       const { syncBaseIfNeeded } = await import("../src/infra/baseSync");
       const { getLocalVersion, saveBase } = await import("../src/infra/db");
-      const { config } = await import("../src/config");
+      const appConfig = getConfig();
       const db = getDb();
       const result = await syncBaseIfNeeded(
         apiClient,
-        config.backend.url,
+        getBackendUrl(appConfig),
         globalThis.fetch.bind(globalThis),
         () => getLocalVersion(db),
         (base) => saveBase(db, base),
@@ -539,45 +584,50 @@ export async function registerIpcHandlers(deps: {
       };
     } catch (e) {
       logger.error("syncPricing failed", e);
-      return { ok: false, status: "error", error: String(e) };
+      throw AppError.fromUnknown(e);
     }
-  });
+  }));
 
-  ipcMain.handle("base:sync", async () => {
-    const { syncBaseIfNeeded } = await import("../src/infra/baseSync");
-    const { getLocalVersion, saveBase, getCachedBase } = await import("../src/infra/db");
-    const { createOutboxStorage } = await import("../src/db/outboxStorage");
-    const { flushOutbox } = await import("@planlux/shared");
-    const { config } = await import("../src/config");
-    const db = getDb();
-    const result = await syncBaseIfNeeded(
-      apiClient,
-      config.backend.url,
-      globalThis.fetch.bind(globalThis),
-      () => getLocalVersion(db),
-      (base) => saveBase(db, base),
-      logger
-    );
-    const base = getCachedBase(db);
-    if (result.status === "synced" || result.status === "unchanged" || result.status === "offline") {
-      flushOutbox({
-        api: apiClient,
-        storage: createOutboxStorage(db as Parameters<typeof createOutboxStorage>[0]),
-        isOnline: () => true,
-        sendEmail: createSendEmailForFlush(getDb),
-      }).then((r) => {
-        if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush after sync", r);
-      }).catch((e) => logger.error("[outbox] flush after sync failed", e));
+  ipcMain.handle("base:sync", wrap("base:sync", async () => {
+    try {
+      const { syncBaseIfNeeded } = await import("../src/infra/baseSync");
+      const { getLocalVersion, saveBase, getCachedBase } = await import("../src/infra/db");
+      const { createOutboxStorage } = await import("../src/db/outboxStorage");
+      const { flushOutbox } = await import("@planlux/shared");
+      const appConfig = getConfig();
+      const db = getDb();
+      const result = await syncBaseIfNeeded(
+        apiClient,
+        getBackendUrl(appConfig),
+        globalThis.fetch.bind(globalThis),
+        () => getLocalVersion(db),
+        (base) => saveBase(db, base),
+        logger
+      );
+      const base = getCachedBase(db);
+      if (result.status === "synced" || result.status === "unchanged" || result.status === "offline") {
+        flushOutbox({
+          api: apiClient,
+          storage: createOutboxStorage(db as Parameters<typeof createOutboxStorage>[0]),
+          isOnline: () => true,
+          sendEmail: createSendEmailForFlush(getDb),
+        }).then((r) => {
+          if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush after sync", r);
+        }).catch((e) => logger.error("[outbox] flush after sync failed", e));
+      }
+      return {
+        ok: result.status !== "error",
+        status: result.status,
+        version: result.version,
+        lastUpdated: result.lastUpdated ?? base?.lastUpdated,
+        data: base,
+        error: result.error,
+      };
+    } catch (e) {
+      logger.error("base:sync failed", e);
+      throw AppError.fromUnknown(e);
     }
-    return {
-      ok: result.status !== "error",
-      status: result.status,
-      version: result.version,
-      lastUpdated: result.lastUpdated ?? base?.lastUpdated,
-      data: base,
-      error: result.error,
-    };
-  });
+  }));
 
   ipcMain.handle("planlux:calculatePrice", async (_, input: unknown) => {
     try {
@@ -618,23 +668,42 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  ipcMain.handle("planlux:seedAdmin", async () => {
+  ipcMain.handle("planlux:seedAdmin", wrap("planlux:seedAdmin", async () => {
     try {
       const db = getDb();
-      const existing = db.prepare("SELECT id FROM users WHERE email = ?").get("admin@planlux.pl");
-      if (existing) return { ok: true, message: "Admin already exists" };
+      const anyAdmin = db.prepare("SELECT id FROM users WHERE role = 'ADMIN' AND active = 1 LIMIT 1").get();
+      if (anyAdmin) return { ok: true, message: "Admin already exists" };
+      const seedCfg = getConfig().seed;
+      const initialPassword = seedCfg.adminInitialPassword ?? crypto.randomBytes(12).toString("base64url").slice(0, 16);
+      const validation = validatePassword(initialPassword);
+      const isProd = getConfig().mode === "production" && !process.env.VITE_DEV_SERVER_URL;
+      if (!validation.ok && isProd) throw new AppError("CONFIG_SEED_PASSWORD", "W produkcji ustaw ADMIN_INITIAL_PASSWORD (min. 8 znaków, litera + cyfra).", { expose: true });
+      if (!validation.ok) {
+        const fallback = "Admin1" + Date.now().toString(36).slice(-4);
+        const v2 = validatePassword(fallback);
+        if (!v2.ok) throw new AppError("VALIDATION_ERROR", validation.reason, { expose: true });
+      }
+      const passwordToUse = validation.ok ? initialPassword : "Admin1" + Date.now().toString(36).slice(-4);
+      const hashed = hashPassword(passwordToUse);
       const id = uuid();
-      const hash = hashPassword("admin123");
-      db.prepare(
-        "INSERT INTO users (id, email, password_hash, role, active) VALUES (?, ?, ?, 'ADMIN', 1)"
-      ).run(id, "admin@planlux.pl", hash);
-      logger.info("Seeded admin user");
-      return { ok: true };
+      const hasPasswordUnavail = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
+      const adminEmail = seedCfg.adminInitialEmail;
+      if (hasPasswordUnavail) {
+        db.prepare(
+          "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, active, display_name) VALUES (?, ?, ?, ?, ?, 0, 'ADMIN', 1, 'Admin')"
+        ).run(id, adminEmail, hashed.hash, hashed.salt, hashed.version);
+      } else {
+        db.prepare(
+          "INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin')"
+        ).run(id, adminEmail, hashed.hash);
+      }
+      logger.info("Seeded admin user (show initial password once)", { email: adminEmail });
+      return { ok: true, initialPassword: passwordToUse };
     } catch (e) {
       logger.error("seedAdmin failed", e);
-      return { ok: false, error: String(e) };
+      throw AppError.fromUnknown(e);
     }
-  });
+  }));
 
   /** Dodaje heartbeat do outbox i zapisuje lokalnie w activity (dla panelu admina). */
   ipcMain.handle("planlux:enqueueHeartbeat", async () => {
@@ -731,49 +800,81 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** Admin: utwórz użytkownika w Sheets (Apps Script upsertUser), potem sync + zapisz hasło lokalnie. */
+  /** Admin: utwórz użytkownika w Supabase (Edge Function create-user) lub legacy backend; potem sync + zapisz hasło lokalnie. */
   ipcMain.handle("planlux:createUser", async (_, payload: { email: string; password: string; displayName?: string; role?: string }) => {
     try {
       requireRole(["ADMIN"]);
       const email = (payload.email ?? "").trim().toLowerCase();
       if (!email) return { ok: false, error: "Email jest wymagany" };
       const tempPassword = payload.password ?? "";
-      if (tempPassword.length < 4) return { ok: false, error: "Hasło musi mieć min. 4 znaki" };
+      const validation = validatePassword(tempPassword);
+      if (!validation.ok) return { ok: false, error: validation.reason };
       const role = normalizeRole(payload.role ?? "HANDLOWIEC");
       const displayName = (payload.displayName ?? "").trim() || undefined;
-      const { config: appConfig } = await import("../src/config");
-      const { upsertUserViaBackend } = await import("./authBackend");
-      const upsertResult = await upsertUserViaBackend(appConfig.backend.url, {
-        email,
-        name: displayName ?? undefined,
-        role,
-        tempPassword,
-        active: 1,
-      });
-      if (!upsertResult.ok) {
-        return { ok: false, error: upsertResult.error ?? "Błąd zapisu użytkownika w systemie" };
+
+      if (getSupabase) {
+        const { data, error } = await getSupabase().functions.invoke("create-user", {
+          body: { email, password: tempPassword, displayName, role },
+        });
+        if (error) {
+          const msg = (data as { error?: string })?.error ?? error.message ?? "Błąd tworzenia użytkownika. Użyj Supabase Dashboard → Authentication → Users lub wdróż Edge Function create-user.";
+          return { ok: false, error: msg };
+        }
+        if ((data as { ok?: boolean })?.ok !== true) {
+          return { ok: false, error: (data as { error?: string })?.error ?? "Błąd tworzenia użytkownika" };
+        }
+      } else {
+        const appConfig = getConfig();
+        const { upsertUserViaBackend } = await import("./authBackend");
+        const upsertResult = await upsertUserViaBackend(getBackendUrl(appConfig), {
+          email,
+          name: displayName ?? undefined,
+          role,
+          tempPassword,
+          active: 1,
+        });
+        if (!upsertResult.ok) {
+          return { ok: false, error: upsertResult.error ?? "Błąd zapisu użytkownika w systemie" };
+        }
       }
       await syncUsersFromBackend();
       const db = getDb();
-      const hash = hashPassword(tempPassword);
+      const hashed = hashPassword(tempPassword);
       const now = new Date().toISOString();
       const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
+      const hasPasswordUnavail = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
       const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email) as { id: string } | undefined;
       const creatorId = currentUser?.id ?? null;
       if (existing) {
-        db.prepare(
-          "UPDATE users SET password_hash = ?, must_change_password = 1, password_set_at = NULL, updated_at = ? WHERE email = ?"
-        ).run(hash, now, email);
+        if (hasPasswordUnavail) {
+          db.prepare(
+            "UPDATE users SET password_hash = ?, password_salt = ?, password_algo_version = ?, password_unavailable = 0, must_change_password = 1, password_set_at = NULL, updated_at = ? WHERE email = ?"
+          ).run(hashed.hash, hashed.salt, hashed.version, now, email);
+        } else {
+          db.prepare(
+            "UPDATE users SET password_hash = ?, must_change_password = 1, password_set_at = NULL, updated_at = ? WHERE email = ?"
+          ).run(hashed.hash, now, email);
+        }
         logger.info("[admin] createUser (backend + local password)", { email, role });
         return { ok: true, id: existing.id, temporaryPassword: tempPassword };
       }
       const id = uuid();
-      const createUserInsertSql = "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
-        (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)");
-      if (hasLastSynced) {
-        db.prepare(createUserInsertSql).run(id, email, hash, role, displayName ?? null, creatorId, now, now, now);
+      if (hasPasswordUnavail) {
+        const createUserInsertSql = "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
+          (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, ?, ?, ?)");
+        if (hasLastSynced) {
+          db.prepare(createUserInsertSql).run(id, email, hashed.hash, hashed.salt, hashed.version, role, displayName ?? null, creatorId, now, now, now);
+        } else {
+          db.prepare(createUserInsertSql).run(id, email, hashed.hash, hashed.salt, hashed.version, role, displayName ?? null, creatorId, now, now);
+        }
       } else {
-        db.prepare(createUserInsertSql).run(id, email, hash, role, displayName ?? null, creatorId, now, now);
+        const createUserInsertSql = "INSERT INTO users (id, email, password_hash, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
+          (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)");
+        if (hasLastSynced) {
+          db.prepare(createUserInsertSql).run(id, email, hashed.hash, role, displayName ?? null, creatorId, now, now, now);
+        } else {
+          db.prepare(createUserInsertSql).run(id, email, hashed.hash, role, displayName ?? null, creatorId, now, now);
+        }
       }
       logger.info("[admin] createUser (backend + local insert)", { email, role });
       return { ok: true, id, temporaryPassword: tempPassword };
@@ -785,6 +886,37 @@ export async function registerIpcHandlers(deps: {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
+
+  /** DEV ONLY: bootstrap user from legacy app_users into Supabase Auth + profiles via Edge Function create-user. */
+  ipcMain.handle(
+    "planlux:authBootstrapFromAppUsers",
+    async (
+      _,
+      payload: {
+        email: string;
+        password: string;
+      }
+    ) => {
+      const appConfig = getConfig();
+      if (appConfig.mode !== "dev") {
+        return { ok: false, error: "Bootstrap użytkowników z app_users jest dostępny tylko w trybie dev." };
+      }
+      try {
+        requireRole(["ADMIN"]);
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : "Brak uprawnień ADMIN" };
+      }
+      if (!getSupabase) return { ok: false, error: "Supabase not configured" };
+      const email = (payload.email ?? "").trim().toLowerCase();
+      const password = payload.password ?? "";
+      if (!email) return { ok: false, error: "Email jest wymagany" };
+      if (!password) return { ok: false, error: "Hasło jest wymagane" };
+
+      const { bootstrapUserFromAppUsers } = await import("./auth/authSupabase");
+      const result = await bootstrapUserFromAppUsers(getSupabase(), email, password);
+      return result;
+    }
+  );
 
   /** Admin: aktualizuj użytkownika. Wymaga roli ADMIN. */
   ipcMain.handle("planlux:updateUser", async (_, targetUserId: string, payload: { email?: string; displayName?: string; role?: string; password?: string }) => {
@@ -813,9 +945,18 @@ export async function registerIpcHandlers(deps: {
         values.push(role);
       }
       if (payload.password !== undefined && payload.password.length > 0) {
-        if (payload.password.length < 4) return { ok: false, error: "Hasło musi mieć min. 4 znaki" };
+        const validation = validatePassword(payload.password);
+        if (!validation.ok) return { ok: false, error: validation.reason };
+        const hashed = hashPassword(payload.password);
         updates.push("password_hash = ?");
-        values.push(hashPassword(payload.password));
+        values.push(hashed.hash);
+        const hasSalt = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_salt");
+        if (hasSalt) {
+          updates.push("password_salt = ?");
+          values.push(hashed.salt);
+          updates.push("password_algo_version = ?");
+          values.push(hashed.version);
+        }
       }
       if (updates.length === 0) return { ok: true };
       updates.push("updated_at = datetime('now')");
@@ -851,25 +992,17 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  ipcMain.handle("planlux:getOffers", async () => {
-    try {
-      const user = requireAuth();
-      const db = getDb();
-      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
-      const rows = seeAll
-        ? db.prepare("SELECT * FROM offers ORDER BY created_at DESC LIMIT 200").all()
-        : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
-      return { ok: true, data: rows };
-    } catch (e) {
-      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
-        return { ok: false, error: e.message };
-      }
-      logger.error("getOffers failed", e);
-      return { ok: false, error: String(e) };
-    }
-  });
+  ipcMain.handle("planlux:getOffers", wrap("planlux:getOffers", async () => {
+    const user = requireAuth();
+    const db = getDb();
+    const seeAll = user.role === "ADMIN" || user.role === "SZEF";
+    const rows = seeAll
+      ? db.prepare("SELECT * FROM offers ORDER BY created_at DESC LIMIT 200").all()
+      : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
+    return { ok: true, data: rows };
+  }));
 
-  ipcMain.handle("planlux:saveOffer", async (_, offer: unknown) => {
+  ipcMain.handle("planlux:saveOffer", wrap("planlux:saveOffer", async (_, offer: unknown) => {
     try {
       const db = getDb();
       const o = offer as {
@@ -912,9 +1045,10 @@ export async function registerIpcHandlers(deps: {
       return { ok: true };
     } catch (e) {
       logger.error("saveOffer failed", e);
-      return { ok: false, error: String(e) };
+      if (e instanceof Error && (e.message.includes("SQLITE_CONSTRAINT") || e.message.includes("constraint"))) throw dbErrors.constraint();
+      throw AppError.fromUnknown(e);
     }
-  });
+  }));
 
   const PDF_HANDLER_TIMEOUT_MS = 20_000;
   type PdfHandlerResult = { ok: true; pdfId: string; filePath: string; fileName: string } | { ok: false; error: string; details?: string; stage?: string };
@@ -1332,9 +1466,9 @@ export async function registerIpcHandlers(deps: {
   });
 
   /** Alias dla kompatybilności wstecznej – ta sama logika co pdf:generate. */
-  ipcMain.handle("planlux:generatePdf", async (_, payload: unknown, templateConfig?: unknown, options?: unknown) => {
+  ipcMain.handle("planlux:generatePdf", wrap("planlux:generatePdf", async (_, payload: unknown, templateConfig?: unknown, options?: unknown) => {
     return runPdfGenerateWithTimeout(payload, templateConfig, options as GeneratePdfFromTemplateOptions | null | undefined);
-  });
+  }));
 
   const pdfTemplateConfigStore = createFilePdfTemplateConfigStore(app.getPath("userData"));
 
@@ -1447,14 +1581,18 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** Ping backendu przed reserveOfferNumber. Jedyny sposób określenia online. */
+  /** Ping Supabase (lub legacy backend) przed reserveOfferNumber. Określa online. */
   async function checkOnline(): Promise<boolean> {
     try {
-      const { config } = await import("../src/config");
+      if (getSupabase) {
+        const { error } = await getSupabase().from("profiles").select("id").limit(1).maybeSingle();
+        return !error;
+      }
+      const appConfig = getConfig();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
       try {
-        const res = await fetch(config.backend.url, {
+        const res = await fetch(getBackendUrl(appConfig), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "health" }),
@@ -1471,36 +1609,18 @@ export async function registerIpcHandlers(deps: {
     }
   }
 
-  /** Tworzy ofertę: numer zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
-  ipcMain.handle("planlux:createOffer", async (_, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
+  /** Tworzy ofertę: numer TEMP (TEMP-deviceId-epoch-rand); finalizacja przy PDF/e-mail/sync. */
+  ipcMain.handle("planlux:createOffer", wrap("planlux:createOffer", async (_, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
     try {
       const user = requireAuth();
-      const numRes = await (async () => {
-        const db = getDb();
-        const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(user.id) as { display_name: string | null; email?: string } | undefined;
-        const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
-        const year = new Date().getFullYear();
-        try {
-          const hasTable = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_counters'").get() as { name?: string } | undefined)?.name === "offer_counters";
-          if (hasTable) {
-            const plxNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
-            logger.info("[offer] createOffer local PLX", { offerNumber: plxNumber });
-            return { ok: true, offerNumber: plxNumber, isTemp: false };
-          }
-          logger.warn("[offer] offer_counters table missing, using TEMP fallback");
-        } catch (e) {
-          logger.warn("[offer] offer_counters failed, using TEMP fallback", e);
-        }
-        const { getDeviceId } = await import("./deviceId");
-        const deviceId = getDeviceId();
-        return { ok: true, offerNumber: `TEMP-${deviceId}-${Date.now()}`, isTemp: true };
-      })();
-      if (!numRes?.ok || !numRes.offerNumber) return { ok: false, error: "Nie udało się zarezerwować numeru oferty" };
+      const { getDeviceId } = await import("./deviceId");
+      const deviceId = getDeviceId();
+      const tempNumber = generateTempOfferNumber(deviceId);
 
       const offerId = uuid();
       const db = getDb();
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
-      if (tables.length === 0) return { ok: true, offerId, offerNumber: numRes.offerNumber, isTemp: numRes.isTemp ?? false };
+      if (tables.length === 0) return { ok: true, offerId, offerNumber: tempNumber, isTemp: true };
 
       const clientName = (minimalData?.clientName ?? "").trim();
       const w = minimalData?.widthM ?? 0;
@@ -1517,19 +1637,27 @@ export async function registerIpcHandlers(deps: {
         clientLastName = parts.slice(1).join(" ") ?? "";
       }
       const nowIso = new Date().toISOString();
-      db.prepare(
-        `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
-      ).run(offerId, numRes.offerNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+      const hasStatus = (db.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>).some((c) => c.name === "offer_number_status");
+      if (hasStatus) {
+        db.prepare(
+          `INSERT INTO offers_crm (id, offer_number, offer_number_status, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+           VALUES (?, ?, 'TEMP', ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
+        ).run(offerId, tempNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+      } else {
+        db.prepare(
+          `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
+           VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
+        ).run(offerId, tempNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+      }
 
       const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
       if (auditTables.length > 0) {
         db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'CREATE_OFFER', ?)").run(
-          uuid(), offerId, user.id, JSON.stringify({ offerNumber: numRes.offerNumber, clientName, widthM: w, lengthM: l })
+          uuid(), offerId, user.id, JSON.stringify({ offerNumber: tempNumber, clientName, widthM: w, lengthM: l })
         );
       }
-      logger.info("[crm] createOffer ok", { offerId, offerNumber: numRes.offerNumber });
-      return { ok: true, offerId, offerNumber: numRes.offerNumber, isTemp: numRes.isTemp ?? false };
+      logger.info("[crm] createOffer ok", { offerId, offerNumber: tempNumber });
+      return { ok: true, offerId, offerNumber: tempNumber, isTemp: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
@@ -1537,7 +1665,7 @@ export async function registerIpcHandlers(deps: {
       logger.error("[crm] createOffer failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-  });
+  }));
 
   /** Auto-numer oferty: zawsze lokalnie z offer_counters (offline-first). TEMP tylko przy wyjątku. */
   ipcMain.handle("planlux:getNextOfferNumber", async () => {
@@ -2058,49 +2186,44 @@ export async function registerIpcHandlers(deps: {
   }
 
   /** CRM: szczegóły oferty (pełne dane). Owner lub BOSS/ADMIN ma dostęp. */
-  ipcMain.handle("planlux:getOfferDetails", async (_, offerId: string) => {
-    try {
-      const user = requireAuth();
-      const db = getDb();
-      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", offer: null };
-      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
-      if (!row) return { ok: false, error: "Oferta nie znaleziona", offer: null };
-      const offer = {
-        id: row.id,
-        offerNumber: row.offer_number,
-        userId: row.user_id,
-        status: row.status,
-        createdAt: row.created_at,
-        pdfGeneratedAt: row.pdf_generated_at ?? null,
-        emailedAt: row.emailed_at ?? null,
-        realizedAt: row.realized_at ?? null,
-        clientFirstName: row.client_first_name ?? "",
-        clientLastName: row.client_last_name ?? "",
-        companyName: row.company_name ?? "",
-        nip: row.nip ?? "",
-        phone: row.phone ?? "",
-        email: row.email ?? "",
-        variantHali: row.variant_hali ?? "",
-        widthM: row.width_m ?? 0,
-        lengthM: row.length_m ?? 0,
-        heightM: row.height_m ?? null,
-        areaM2: row.area_m2 ?? 0,
-        hallSummary: row.hall_summary ?? "",
-        basePricePln: row.base_price_pln ?? 0,
-        additionsTotalPln: row.additions_total_pln ?? 0,
-        totalPln: row.total_pln ?? 0,
-        standardSnapshot: row.standard_snapshot ?? "[]",
-        addonsSnapshot: row.addons_snapshot ?? "[]",
-        noteHtml: row.note_html ?? "",
-        version: row.version ?? 1,
-        updatedAt: row.updated_at ?? "",
-      };
-      return { ok: true, offer };
-    } catch (e) {
-      logger.error("[crm] getOfferDetails failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e), offer: null };
-    }
-  });
+  ipcMain.handle("planlux:getOfferDetails", wrap("planlux:getOfferDetails", async (_, offerId: string) => {
+    const user = requireAuth();
+    const db = getDb();
+    if (!canAccessOffer(db, offerId, user.id)) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
+    const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
+    if (!row) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
+    const offer = {
+      id: row.id,
+      offerNumber: row.offer_number,
+      userId: row.user_id,
+      status: row.status,
+      createdAt: row.created_at,
+      pdfGeneratedAt: row.pdf_generated_at ?? null,
+      emailedAt: row.emailed_at ?? null,
+      realizedAt: row.realized_at ?? null,
+      clientFirstName: row.client_first_name ?? "",
+      clientLastName: row.client_last_name ?? "",
+      companyName: row.company_name ?? "",
+      nip: row.nip ?? "",
+      phone: row.phone ?? "",
+      email: row.email ?? "",
+      variantHali: row.variant_hali ?? "",
+      widthM: row.width_m ?? 0,
+      lengthM: row.length_m ?? 0,
+      heightM: row.height_m ?? null,
+      areaM2: row.area_m2 ?? 0,
+      hallSummary: row.hall_summary ?? "",
+      basePricePln: row.base_price_pln ?? 0,
+      additionsTotalPln: row.additions_total_pln ?? 0,
+      totalPln: row.total_pln ?? 0,
+      standardSnapshot: row.standard_snapshot ?? "[]",
+      addonsSnapshot: row.addons_snapshot ?? "[]",
+      noteHtml: row.note_html ?? "",
+      version: row.version ?? 1,
+      updatedAt: row.updated_at ?? "",
+    };
+    return { ok: true, offer };
+  }));
 
   /** CRM: audit trail oferty (offer_audit + event_log). Owner lub manager/admin ma dostęp. */
   ipcMain.handle("planlux:getOfferAudit", async (_, offerId: string) => {
@@ -2204,42 +2327,22 @@ export async function registerIpcHandlers(deps: {
         try {
           const userRow = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(row.user_id) as { display_name: string | null; email?: string } | undefined;
           const initial = getSalesInitial(userRow ? { displayName: userRow.display_name ?? undefined, email: userRow.email } : null);
-          const year = new Date().getFullYear();
-          let newNumber: string;
+          let result: { offerNumber: string };
           try {
-            newNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
+            result = finalizeOfferNumber(db as import("./db/types").DbLike, row.id, { initial });
+            const newNumber = result.offerNumber;
             log("wygenerowano lokalnie", { offerId: row.id, newNumber });
-          } catch (e) {
-            const errMsg = e instanceof Error ? e.message : String(e);
-            errLog("offer_counters failed – przechodzę do następnej", { offerId: row.id, error: e });
-            failed.push({ offerId: row.id, error: errMsg });
-            continue;
-          }
-          try {
-            db.transaction(() => {
-              const stmt = db.prepare("UPDATE offers_crm SET offer_number = ?, updated_at = datetime('now') WHERE id = ?");
-              const info = stmt.run(newNumber, row.id);
-              log("SQLite update ok", { rowsAffected: info.changes });
-              if (info.changes === 0) {
-                errLog("UPDATE offers_crm nie zaktualizował żadnego wiersza", { offerId: row.id });
-              }
-              const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
-              if (auditTables.length > 0) {
-                db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'OFFER_NUMBER_ASSIGNED', ?)").run(
-                  uuid(), row.id, row.user_id, JSON.stringify({ oldNumber: row.offer_number, newNumber })
-                );
-                const updAudit = db.prepare(
-                  "UPDATE offer_audit SET payload_json = REPLACE(payload_json, ?, ?) WHERE offer_id = ? AND payload_json LIKE '%' || ? || '%'"
-                );
-                updAudit.run(row.offer_number, newNumber, row.id, row.offer_number);
-                log("audit insert ok");
-              }
-            })();
+            const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
+            if (auditTables.length > 0) {
+              db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'OFFER_NUMBER_ASSIGNED', ?)").run(
+                uuid(), row.id, row.user_id, JSON.stringify({ oldNumber: row.offer_number, newNumber })
+              );
+            }
             updated.push({ offerId: row.id, oldNumber: row.offer_number, newNumber });
             log("TEMP→PLX zakończony sukcesem", { offerId: row.id, newNumber });
-          } catch (txErr) {
-            const errMsg = txErr instanceof Error ? txErr.message : String(txErr);
-            errLog("transakcja SQLite nie powiodła się", { offerId: row.id, error: txErr });
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            errLog("finalizeOfferNumber failed", { offerId: row.id, error: e });
             failed.push({ offerId: row.id, error: errMsg });
           }
         } catch (e) {
@@ -2256,7 +2359,7 @@ export async function registerIpcHandlers(deps: {
     }
   }
 
-  ipcMain.handle("planlux:syncTempOfferNumbers", () => doSyncTempOfferNumbers());
+  ipcMain.handle("planlux:syncTempOfferNumbers", wrap("planlux:syncTempOfferNumbers", () => doSyncTempOfferNumbers()));
 
   /** CRM: zamień numer oferty (np. TEMP→final po sync). Owner lub BOSS/ADMIN. */
   ipcMain.handle("planlux:replaceOfferNumber", async (_, offerId: string, newOfferNumber: string) => {
@@ -2675,35 +2778,27 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** Online = ping do backendu (nie navigator.onLine). */
-  ipcMain.handle("planlux:isOnline", async () => {
+  /** Online = Supabase or backend health check (strict timeout, no secrets in logs). */
+  ipcMain.handle("planlux:isOnline", wrap("planlux:isOnline", async () => {
     try {
-      const { config } = await import("../src/config");
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      let ok = false;
-      let err: unknown = null;
-      try {
-        const res = await fetch(config.backend.url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "health" }),
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-        ok = res.ok || res.status < 500;
-        if (!ok) err = new Error(`HTTP ${res.status}`);
-      } catch (e) {
-        clearTimeout(timeout);
-        err = e;
-      }
-      console.log("[IPC] isOnline ping ok =", ok, "error =", err);
-      return { ok: true, online: ok };
-    } catch (e) {
-      console.log("[IPC] isOnline outer error =", e);
+      const appConfig = getConfig();
+      const { getOnlineState } = await import("./net/online");
+      const state = await getOnlineState({
+        timeoutMs: appConfig.backend.healthTimeoutMs,
+        backendUrl: appConfig.backend.url,
+      });
+      const online = state === "online";
+      return { ok: true, online };
+    } catch {
       return { ok: true, online: false };
     }
-  });
+  }));
+
+  /** Public config for renderer (no secrets). */
+  ipcMain.handle("planlux:getConfig", wrap("planlux:getConfig", async () => {
+    const publicConfig = getPublicConfig(getConfig());
+    return { ok: true, ...publicConfig };
+  }));
 
 /** Real Internet check via Electron net.request (no navigator.onLine). */
 ipcMain.handle("planlux:checkInternet", async () => {
@@ -3134,7 +3229,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
   });
 
   /** Send offer email: templates, CC to office, auto PDF. Idempotencja: jeden mail na (offerId+to+subject+pdf) w 5 min. */
-  ipcMain.handle("planlux:email:sendOfferEmail", async (_, payload: unknown) => {
+  ipcMain.handle("planlux:email:sendOfferEmail", wrap("planlux:email:sendOfferEmail", async (_, payload: unknown) => {
     try {
       logger.info("[IPC] sendOfferEmail TS_VERSION=2026-03-02-email-history-fix");
       const user = requireAuth();
@@ -3183,6 +3278,12 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       const senderExists = db.prepare("SELECT id FROM users WHERE id = ? AND active = 1").get(effectiveUserId);
       if (!senderExists) return { ok: false, code: "ERR_FORBIDDEN", message: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)", error: "Użytkownik nadawcy nie istnieje lub jest nieaktywny (FK)" };
 
+      try {
+        const salespersonForInitial = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(senderUserId) as { display_name: string | null; email?: string } | undefined;
+        finalizeOfferNumber(db as import("./db/types").DbLike, resolvedOfferId, { initial: getSalesInitial(salespersonForInitial ? { displayName: salespersonForInitial.display_name ?? undefined, email: salespersonForInitial.email } : null) });
+      } catch (finalizeErr) {
+        logger.warn("[email] finalizeOfferNumber before send failed (using current number)", finalizeErr);
+      }
       const settings = getEmailSettings(db as import("./emailService").Db);
       const offerRow = db.prepare("SELECT offer_number, client_first_name, client_last_name, company_name, user_id FROM offers_crm WHERE id = ?").get(resolvedOfferId) as { offer_number: string; client_first_name: string; client_last_name: string; company_name: string; user_id: string } | undefined;
       if (!offerRow) return { ok: false, code: "ERR_NOT_FOUND", message: "Oferta nie znaleziona", error: "Oferta nie znaleziona" };
@@ -3632,7 +3733,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
       else if (msg.includes("insertPdf") || msg.includes("zapisać PDF")) friendly = "Nie udało się zapisać PDF w bazie. Sprawdź logi i spróbuj ponownie.";
       return { ok: false, code: "ERR_SMTP", message: friendly, error: friendly, details: e instanceof Error ? e.stack : undefined };
     }
-  });
+  }));
 
   const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
   const DANGEROUS_EXT = /\.(exe|bat|cmd|com|msi|scr|vbs|js|jar)$/i;

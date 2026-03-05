@@ -8,12 +8,13 @@ import { autoUpdater } from "electron-updater";
 import path from "path";
 import fs from "fs";
 import Database from "better-sqlite3";
-import { SCHEMA_SQL, ApiClient, flushOutbox } from "@planlux/shared";
+import { SCHEMA_SQL, flushOutbox } from "@planlux/shared";
+import type { ApiClient } from "@planlux/shared";
 import { registerIpcHandlers } from "./ipc"; // IPC handlers registered in whenReady before createWindow()
 import { config } from "../src/config";
-import { logger } from "../src/logger";
+import { getConfig, getBackendUrl, requireSupabase, sanitizeConfigForLog } from "./config";
+import { logger, initLogger } from "./logger";
 import { createOutboxStorage, type Db } from "../src/db/outboxStorage";
-import { getRemoteMeta } from "../src/infra/baseSync";
 import { dumpFkInfo } from "../src/infra/db";
 import { createSendEmailForFlush } from "./smtpSend";
 import { checkInternet } from "./checkInternet";
@@ -32,18 +33,7 @@ const dbPath = e2eConfig.isE2E
 let mainWindow: BrowserWindow | null = null;
 let db: ReturnType<typeof Database> | null = null;
 
-const apiClient = new ApiClient({
-  baseUrl: config.backend.url,
-  fetchFn: globalThis.fetch.bind(globalThis),
-  timeoutMs: config.backend.timeoutMs,
-  retries: config.backend.retries,
-  retryDelayMs: config.backend.retryDelayMs,
-  retryBackoffMultiplier: config.backend.retryBackoffMultiplier,
-  log: (level, message, data) => {
-    if (level === "error") logger.error(message, data);
-    else logger.warn(message, data);
-  },
-});
+let apiClient: ApiClient;
 
 function runMigrations(database: ReturnType<typeof Database>) {
   // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON) – idempotentna, bez cichego skip.
@@ -304,8 +294,31 @@ COMMIT;
   } catch (e) {
     logger.warn("[migration] Supabase config tables skipped", e);
   }
+  // Password auth v1: per-user salt, algo version, password_unavailable, last_online_login_at
+  try {
+    const usersCols = database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+    const colNames = new Set(usersCols.map((c) => c.name));
+    const migrations = [
+      { col: "password_salt", sql: "ALTER TABLE users ADD COLUMN password_salt TEXT DEFAULT NULL" },
+      { col: "password_algo_version", sql: "ALTER TABLE users ADD COLUMN password_algo_version INTEGER DEFAULT 0" },
+      { col: "password_unavailable", sql: "ALTER TABLE users ADD COLUMN password_unavailable INTEGER NOT NULL DEFAULT 0" },
+      { col: "last_online_login_at", sql: "ALTER TABLE users ADD COLUMN last_online_login_at TEXT DEFAULT NULL" },
+    ];
+    for (const { col, sql } of migrations) {
+      if (!colNames.has(col)) {
+        database.exec(sql);
+        colNames.add(col);
+        logger.info("[migration] users." + col + " added");
+      }
+    }
+    database.prepare("INSERT OR IGNORE INTO _migrations (id) VALUES (?)").run("password_auth_v1");
+  } catch (e) {
+    logger.warn("[migration] password_auth_v1 skipped", e);
+  }
   const { runCrmMigrations } = require("./migrations/crmMigrations");
   runCrmMigrations(database, logger);
+  const { runEmailHistoryToEmailMigration } = require("./db/migrations/0001_email_history_to_email");
+  runEmailHistoryToEmailMigration(database as import("./db/types").DbLike, logger);
 
   // Diagnostyka: logujemy aktualny kształt tabel users i smtp_accounts po migracjach.
   try {
@@ -429,21 +442,15 @@ function loadWindow(mainWindow: BrowserWindow) {
   }
 }
 
-function resolveWindowIconPath(): string | undefined {
-  const candidates = [
-    path.join(__dirname, "../build/icon.ico"),
-    path.join(__dirname, "../../build/icon.ico"),
-    path.join(app.getAppPath(), "build/icon.ico"),
-    path.join(process.resourcesPath, "build", "icon.ico"),
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
-  return undefined;
+function resolveAppIcon(): string | undefined {
+  const p = app.isPackaged
+    ? path.join(process.resourcesPath, "assets", "icon.ico")
+    : path.join(__dirname, "..", "assets", "icon.ico");
+  return fs.existsSync(p) ? p : undefined;
 }
 
 function createWindow() {
-  const iconPath = resolveWindowIconPath();
+  const iconPath = resolveAppIcon();
   mainWindow = new BrowserWindow({
     width: 1000,
     height: 700,
@@ -552,10 +559,25 @@ async function runStartup(): Promise<void> {
     callback({ path: filePath });
   });
 
+  const electronCfg = getConfig();
+  initLogger(app.getPath("userData"), { level: electronCfg.logging.level });
+  requireSupabase(electronCfg);
+  const { createSupabaseClient } = await import("./supabase/client");
+  const { createSupabaseApiAdapter } = await import("./supabase/apiAdapter");
+  const supabase = createSupabaseClient(electronCfg);
+  apiClient = createSupabaseApiAdapter({ supabase }) as ApiClient;
+
+  logger.info("[app] started", {
+    version: config.appVersion,
+    platform: process.platform,
+    env: process.env.VITE_DEV_SERVER_URL ? "dev" : "production",
+  });
+  logger.info("[app] config", sanitizeConfigForLog(electronCfg));
+
   const database = getDb();
   try {
     const { syncConfig } = await import("../src/services/configSync");
-    await syncConfig(database, logger);
+    await syncConfig(database, logger, apiClient);
   } catch (e) {
     logger.warn("[configSync] startup sync failed – app continues with local data", e);
   }
@@ -563,49 +585,64 @@ async function runStartup(): Promise<void> {
     getDb,
     getDbPath: () => dbPath,
     apiClient,
+    getSupabase: () => supabase,
     config: { appVersion: config.appVersion, updatesUrl: config.updatesUrl },
     logger,
   });
   console.log("[IPC] Planlux IPC handlers initialized");
-  // Seed default admin accounts if missing (so login works without backend / when backend returns "Unknown action").
-  const crypto = require("crypto");
-  const salt = "planlux-hale-v1";
-  const hash = (p: string) => crypto.scryptSync(p, salt, 64).toString("hex");
-  const ensureAdmin = (email: string, password: string, displayName: string) => {
-    const existing = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
-    if (!existing) {
+  // Seed a single admin only if no admin exists. No hardcoded credentials.
+  const { hashPassword, validatePassword } = await import("./auth/password");
+  const anyAdmin = database.prepare("SELECT id FROM users WHERE role = 'ADMIN' AND active = 1 LIMIT 1").get();
+  if (!anyAdmin) {
+    const adminEmail = electronCfg.seed.adminInitialEmail;
+    const initialPassword =
+      electronCfg.seed.adminInitialPassword ?? require("crypto").randomBytes(12).toString("base64url").slice(0, 16);
+    const validation = validatePassword(initialPassword);
+    const isProd = electronCfg.mode === "production" && !process.env.VITE_DEV_SERVER_URL;
+    if (!validation.ok && isProd) {
+      logger.warn("[seed] In production set ADMIN_INITIAL_PASSWORD (min 8 chars, 1 letter + 1 digit). Skipping admin seed.");
+    } else {
+      const passwordToUse = validation.ok ? initialPassword : "Admin1" + Date.now().toString(36).slice(-4);
+      const hashed = hashPassword(passwordToUse);
       const hasCols = (database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
       const hasMustChange = hasCols.includes("must_change_password");
       const hasCreated = hasCols.includes("created_at");
       const hasUpdated = hasCols.includes("updated_at");
-      if (hasMustChange && hasCreated && hasUpdated) {
+      const hasPasswordUnavail = hasCols.includes("password_unavailable");
+      const id = require("crypto").randomUUID();
+      if (hasPasswordUnavail) {
         database.prepare(
-          "INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, 'ADMIN', 1, ?, 0, datetime('now'), datetime('now'))"
-        ).run(crypto.randomUUID(), email, hash(password), displayName);
+          "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, 'ADMIN', 1, 'Admin', 0, datetime('now'), datetime('now'))"
+        ).run(id, adminEmail, hashed.hash, hashed.salt, hashed.version);
+      } else if (hasMustChange && hasCreated && hasUpdated) {
+        database.prepare(
+          "INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin', 0, datetime('now'), datetime('now'))"
+        ).run(id, adminEmail, hashed.hash);
       } else {
-        database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, ?)")
-          .run(crypto.randomUUID(), email, hash(password), displayName);
+        database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name) VALUES (?, ?, ?, 'ADMIN', 1, 'Admin')")
+          .run(id, adminEmail, hashed.hash);
       }
-      logger.info("[seed] Admin user created", { email });
-      return true;
+      logger.info("[seed] Admin user created – show initial password once", { email: adminEmail });
     }
-    return false;
-  };
-  ensureAdmin("emilian@planlux.pl", "admin123", "Admin");
-  if (process.env.NODE_ENV !== "production") {
-    ensureAdmin("admin@planlux.pl", "admin123", "Admin");
   }
 
   // E2E-only seed: ensure admin + salesperson exist so tests can log in without UI/backend.
   if (e2eConfig.isE2E) {
     const crypto = require("crypto");
-    const salt = "planlux-hale-v1";
-    const hash = (p: string) => crypto.scryptSync(p, salt, 64).toString("hex");
+    const { hashPassword: hashPasswordE2E } = await import("./auth/password");
     const ensureUser = (email: string, password: string, role: string, displayName: string) => {
       const existing = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
       if (!existing) {
-        database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, 0, datetime('now'), datetime('now'))")
-          .run(crypto.randomUUID(), email, hash(password), role, displayName);
+        const hashed = hashPasswordE2E(password);
+        const hasPasswordUnavail = (database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
+        if (hasPasswordUnavail) {
+          database.prepare(
+            "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, 0, datetime('now'), datetime('now'))"
+          ).run(crypto.randomUUID(), email, hashed.hash, hashed.salt, hashed.version, role, displayName);
+        } else {
+          database.prepare("INSERT INTO users (id, email, password_hash, role, active, display_name, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, 0, datetime('now'), datetime('now'))")
+            .run(crypto.randomUUID(), email, hashed.hash, role, displayName);
+        }
         return true;
       }
       return false;

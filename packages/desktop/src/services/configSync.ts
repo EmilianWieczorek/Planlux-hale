@@ -1,14 +1,18 @@
 /**
- * Sync config from Supabase to local SQLite cache.
+ * Sync config from backend (Supabase base_pricing) to local SQLite cache.
+ * Uses api.getMeta() / api.getBase() – no Supabase client in renderer.
  * On app start: compare meta version with local; if different, download and save.
- * If Supabase is unavailable, app runs with existing local data (offline).
  */
 
 import type { CachedBase } from "../infra/baseSync";
 import { getLocalVersion, saveBase } from "../infra/db";
-import { getPricingSurface, getAddons, getStandardIncluded, getMetaVersion } from "./supabaseService";
 
 type Db = ReturnType<typeof import("better-sqlite3")>;
+
+export interface BackendApiForConfigSync {
+  getMeta(): Promise<{ ok?: boolean; meta?: { version: number; lastUpdated?: string } }>;
+  getBase(): Promise<{ ok?: boolean; meta?: { version: number; lastUpdated: string }; cennik?: unknown[]; dodatki?: unknown[]; standard?: unknown[] }>;
+}
 
 export interface ConfigSyncResult {
   status: "synced" | "offline" | "unchanged" | "error";
@@ -25,23 +29,32 @@ export function getConfigSyncStatus(): ConfigSyncResult {
 }
 
 /**
- * 1. Fetch meta version from Supabase.
+ * 1. Fetch meta from backend (api.getMeta).
  * 2. Compare with local version (pricing_cache).
- * 3. If remote > local: download pricing_surface, addons_surcharges, standard_included and save to pricing_cache.
- * 4. On Supabase error: leave lastSyncResult as offline, do not throw – app continues with local data.
+ * 3. If remote > local: fetch full base (api.getBase) and save to pricing_cache.
+ * 4. On error: leave lastSyncResult as offline, do not throw – app continues with local data.
  */
 export async function syncConfig(
   db: Db,
-  logger?: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, d?: unknown) => void }
+  logger?: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, d?: unknown) => void },
+  api?: BackendApiForConfigSync
 ): Promise<ConfigSyncResult> {
   const log = logger ?? { info: () => {}, warn: () => {}, error: () => {} };
   const localVersion = getLocalVersion(db);
 
-  let meta: { version: number; last_updated?: string } | null = null;
+  if (!api) {
+    log.warn("[configSync] No API – skipping sync");
+    lastSyncResult = { status: "unchanged", version: localVersion };
+    return lastSyncResult;
+  }
+
+  let meta: { version: number; lastUpdated?: string } | null = null;
   try {
-    meta = await getMetaVersion();
+    const metaResponse = await api.getMeta();
+    if (metaResponse?.meta)
+      meta = { version: metaResponse.meta.version, lastUpdated: metaResponse.meta.lastUpdated };
   } catch (e) {
-    log.warn("[configSync] Supabase meta fetch failed – working offline", e);
+    log.warn("[configSync] Backend meta fetch failed – working offline", e);
     lastSyncResult = {
       status: "offline",
       version: localVersion,
@@ -51,29 +64,30 @@ export async function syncConfig(
   }
 
   if (!meta) {
-    log.warn("[configSync] No meta row in Supabase");
+    log.warn("[configSync] No meta from backend");
     lastSyncResult = { status: "offline", version: localVersion, error: "Brak wersji konfiguracji" };
     return lastSyncResult;
   }
 
   if (meta.version <= localVersion) {
     log.info("[configSync] unchanged", { version: meta.version });
-    lastSyncResult = { status: "unchanged", version: meta.version, lastUpdated: meta.last_updated };
+    lastSyncResult = { status: "unchanged", version: meta.version, lastUpdated: meta.lastUpdated };
     return lastSyncResult;
   }
 
-  log.info("[configSync] fetching from Supabase", { remoteVersion: meta.version });
-  let pricingSurface: unknown[];
-  let addons: unknown[];
-  let standardIncluded: unknown[];
+  log.info("[configSync] fetching base", { remoteVersion: meta.version });
+  let baseData: { meta: { version: number; lastUpdated: string }; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
   try {
-    [pricingSurface, addons, standardIncluded] = await Promise.all([
-      getPricingSurface(),
-      getAddons(),
-      getStandardIncluded(),
-    ]);
+    const res = await api.getBase();
+    if (!res?.ok || !res.meta) throw new Error("Invalid base response");
+    baseData = {
+      meta: res.meta,
+      cennik: res.cennik ?? [],
+      dodatki: res.dodatki ?? [],
+      standard: res.standard ?? [],
+    };
   } catch (e) {
-    log.error("[configSync] Supabase fetch failed", e);
+    log.error("[configSync] Backend base fetch failed", e);
     lastSyncResult = {
       status: "offline",
       version: localVersion,
@@ -83,11 +97,11 @@ export async function syncConfig(
   }
 
   const base: CachedBase = {
-    version: meta.version,
-    lastUpdated: meta.last_updated ?? new Date().toISOString(),
-    cennik: pricingSurface,
-    dodatki: addons,
-    standard: standardIncluded,
+    version: baseData.meta.version,
+    lastUpdated: baseData.meta.lastUpdated ?? new Date().toISOString(),
+    cennik: baseData.cennik,
+    dodatki: baseData.dodatki,
+    standard: baseData.standard,
   };
 
   try {

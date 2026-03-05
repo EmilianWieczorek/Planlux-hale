@@ -38,6 +38,23 @@ npm run build
 npm run desktop
 ```
 
+### Zmienne środowiskowe (dev)
+
+W trybie deweloperskim aplikacja ładuje `.env` z katalogu głównego lub `packages/desktop/`. Skopiuj `.env.example` do `.env` i uzupełnij w razie potrzeby:
+
+| Zmienna | Opis | Domyślnie (dev) |
+|--------|------|------------------|
+| `SUPABASE_URL` | URL projektu Supabase (health / auth) | – |
+| `SUPABASE_ANON_KEY` | Klucz anon Supabase | – |
+| `PLANLUX_BACKEND_URL` | Opcjonalnie: inny URL (np. updates) | – |
+| `SESSION_TTL_HOURS` | Czas życia sesji (godz.) | 12 |
+| `ONLINE_TIMEOUT_MS` | Limit czasu health check (ms) | 2000 |
+| `ADMIN_INITIAL_EMAIL` | E-mail pierwszego admina (seed) | admin@planlux.pl |
+| `ADMIN_INITIAL_PASSWORD` | Hasło seed (min. 8 znaków, litera + cyfra) | losowe w dev |
+| `LOG_LEVEL` | Poziom logów: debug, info, warn, error | debug (dev), info (prod) |
+
+**Uwaga:** W produkcji (zbudowana aplikacja) konfiguracja pochodzi ze zmiennych środowiskowych systemu/instalatora; plik `.env` jest używany tylko w dev.
+
 ## Build produkcyjny
 
 ```bash

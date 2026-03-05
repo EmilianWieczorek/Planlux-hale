@@ -164,7 +164,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
     return () => clearInterval(t);
   }, [api, user.id]);
 
-  /** Update check: version from Apps Script. Banner (non-force) / modal (force). */
+  /** Update check: version from updates URL. Banner (non-force) / modal (force). */
   const [updateBannerOpen, setUpdateBannerOpen] = useState(false);
   const [updateForceModalOpen, setUpdateForceModalOpen] = useState(false);
   const [updateVersionInfo, setUpdateVersionInfo] = useState<VersionResponse | null>(null);

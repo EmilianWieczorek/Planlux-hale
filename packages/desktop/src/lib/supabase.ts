@@ -1,11 +1,14 @@
 /**
- * Supabase client for remote config (pricing, addons, standard).
- * Uses anon/public key only – never service role in the desktop app.
+ * Supabase client runs only in the Electron main process (electron/supabase/client.ts).
+ * Renderer must not hold Supabase credentials; use IPC for backend data.
+ * Accessing supabase in renderer throws.
  */
+function throwNoSupabaseInRenderer(): never {
+  throw new Error("Supabase is only in main process; use IPC for backend data.");
+}
 
-import { createClient } from "@supabase/supabase-js";
-
-const supabaseUrl = "https://fxsqwmflnzdnalkhwnuz.supabase.co";
-const supabaseKey = "sb_publishable_-uI4LEze8IwCUmgK-K6Jkg_bJEDB-wl";
-
-export const supabase = createClient(supabaseUrl, supabaseKey);
+export const supabase = new Proxy({} as import("@supabase/supabase-js").SupabaseClient, {
+  get() {
+    throwNoSupabaseInRenderer();
+  },
+});

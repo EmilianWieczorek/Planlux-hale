@@ -1,6 +1,6 @@
 /**
- * Auth and users sync with Apps Script backend (Google Sheets USERS).
- * POST actions: login, listUsers, upsertUser.
+ * Legacy auth backend (HTTP POST). Used only when Supabase is not configured (e.g. tests).
+ * Prefer auth/authSupabase (Supabase Auth + profiles) when getSupabase is set.
  */
 
 const AUTH_TIMEOUT_MS = 8000;

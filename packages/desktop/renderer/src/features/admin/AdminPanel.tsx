@@ -278,7 +278,7 @@ export function AdminPanel({ api, currentUser }: Props) {
             </div>
           </div>
           <p style={{ color: tokens.color.textMuted, marginBottom: 16 }}>
-            Użytkownicy z arkusza USERS (Google Sheets). Synchronizacja przy starcie i na żądanie.
+            Użytkownicy z Supabase (profiles). Synchronizacja przy starcie i na żądanie.
           </p>
           {loading ? (
             <Typography color="text.secondary">Ładowanie...</Typography>

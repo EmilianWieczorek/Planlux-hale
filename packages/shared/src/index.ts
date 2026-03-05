@@ -2,6 +2,7 @@ export { ApiClient } from "./api/client";
 export type { ApiClientConfig } from "./api/client";
 export type {
   MetaResponse,
+  MetaOnlyResponse,
   BaseResponse,
   CennikRow,
   DodatkiRow,
@@ -9,6 +10,8 @@ export type {
   LogPdfPayload,
   LogEmailPayload,
   HeartbeatPayload,
+  ReserveOfferNumberPayload,
+  ReserveOfferNumberResponse,
   OutboxOperationType,
   OutboxPayloadMap,
 } from "./api/types";

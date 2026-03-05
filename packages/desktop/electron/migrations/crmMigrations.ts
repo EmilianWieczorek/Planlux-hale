@@ -155,6 +155,32 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] offers_crm material_info skipped", e);
   }
 
+  // 3c. offers_crm: offer_number_status, offer_number_reserved_at (TEMP/FINAL numbering)
+  try {
+    const info = database.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>;
+    if (info.length > 0) {
+      if (!info.some((c) => c.name === "offer_number_status")) {
+        database.exec("ALTER TABLE offers_crm ADD COLUMN offer_number_status TEXT DEFAULT 'TEMP'");
+        logger.info("[migration] offers_crm offer_number_status added");
+      }
+      if (!info.some((c) => c.name === "offer_number_reserved_at")) {
+        database.exec("ALTER TABLE offers_crm ADD COLUMN offer_number_reserved_at TEXT DEFAULT NULL");
+        logger.info("[migration] offers_crm offer_number_reserved_at added");
+      }
+      database.prepare(
+        "UPDATE offers_crm SET offer_number_status = 'FINAL' WHERE offer_number IS NOT NULL AND TRIM(offer_number) != '' AND (offer_number_status IS NULL OR offer_number_status = '') AND offer_number NOT LIKE 'TEMP-%'"
+      ).run();
+      database.prepare("UPDATE offers_crm SET offer_number_status = 'TEMP' WHERE offer_number_status IS NULL OR offer_number_status = ''").run();
+      const idxExists = database.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_offers_crm_offer_number_final'").get() as { name?: string } | undefined;
+      if (!idxExists?.name) {
+        database.exec("CREATE UNIQUE INDEX idx_offers_crm_offer_number_final ON offers_crm(offer_number) WHERE offer_number_status = 'FINAL'");
+        logger.info("[migration] offers_crm unique index on FINAL offer_number");
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] offers_crm offer_number_status skipped", e);
+  }
+
   // 4. outbox: dodaj OFFER_SYNC (wymaga recreate table)
   try {
     const rows = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'").all() as Array<{ name: string }>;

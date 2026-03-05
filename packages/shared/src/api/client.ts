@@ -1,6 +1,6 @@
 /**
- * Klient API do Google Apps Script Web App.
- * Wymaga inject fetch (np. node-fetch w Node, global fetch w Electron).
+ * Generic HTTP API client for backend (Supabase or compatible).
+ * No Google Apps Script. Requires baseUrl (e.g. Supabase project URL or Edge Function URL).
  */
 
 import type {
@@ -13,24 +13,20 @@ import type {
   ReserveOfferNumberResponse,
 } from "./types";
 
-const DEFAULT_BASE_URL =
-  "https://script.google.com/macros/s/AKfycbzOCqNNK5c2trwE-Q-w6ti89Q-Img8IxH5axqLZImPLFNF3zyPCtqHE0lOKMYnuwt8H/exec";
-
 export interface ApiClientConfig {
-  baseUrl?: string;
-  /** W Node użyj np. import('node-fetch') lub global fetch (Node 18+) */
+  /** Required. Supabase project URL or backend base URL. */
+  baseUrl: string;
   fetchFn: (url: string, options?: RequestInit) => Promise<Response>;
   appToken?: string;
   timeoutMs?: number;
   retries?: number;
   retryDelayMs?: number;
   retryBackoffMultiplier?: number;
-  /** Opcjonalny logger do diagnostyki (np. przy ERR_SHEETS_BAD_JSON). */
   log?: (level: "error" | "warn", message: string, data?: unknown) => void;
 }
 
-/** Błąd gdy Apps Script zwróci nie-JSON (HTML/redirect). */
-export interface SheetsBadJsonDetails {
+/** Error when backend returns non-JSON (HTML/redirect). Kept code for UI compatibility. */
+export interface BackendBadJsonDetails {
   status: number;
   contentType: string;
   bodySnippet: string;
@@ -40,8 +36,8 @@ export interface SheetsBadJsonDetails {
 
 export class SheetsBadJsonError extends Error {
   code = "ERR_SHEETS_BAD_JSON" as const;
-  details: SheetsBadJsonDetails;
-  constructor(message: string, details: SheetsBadJsonDetails) {
+  details: BackendBadJsonDetails;
+  constructor(message: string, details: BackendBadJsonDetails) {
     super(message);
     this.name = "SheetsBadJsonError";
     this.details = details;
@@ -68,7 +64,7 @@ export class ApiClient {
   private log?: ApiClientConfig["log"];
 
   constructor(config: ApiClientConfig) {
-    this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
+    this.baseUrl = config.baseUrl;
     this.fetchFn = config.fetchFn;
     this.appToken = config.appToken;
     this.timeoutMs = config.timeoutMs ?? 30_000;
@@ -107,7 +103,7 @@ export class ApiClient {
 
         if (!isJsonLike(contentType, bodyTrim)) {
           const bodySnippet = bodyTrim.slice(0, BODY_SNIPPET_MAX);
-          const details: SheetsBadJsonDetails = {
+          const details: BackendBadJsonDetails = {
             status: res.status,
             contentType,
             bodySnippet,
@@ -115,7 +111,7 @@ export class ApiClient {
             method,
           };
           if (this.log) {
-            this.log("error", "[API] Apps Script zwrócił nie-JSON (HISTORIA_EMAIL / logEmail)", {
+            this.log("error", "[API] Backend zwrócił nie-JSON", {
               url,
               method,
               status: res.status,
@@ -123,7 +119,7 @@ export class ApiClient {
               bodySnippet: bodySnippet.slice(0, 500),
             });
           }
-          throw new SheetsBadJsonError("Apps Script zwrócił nieprawidłową odpowiedź (nie JSON).", details);
+          throw new SheetsBadJsonError("Backend zwrócił nieprawidłową odpowiedź (nie JSON).", details);
         }
 
         let data: T & { ok?: boolean; error?: string };
@@ -131,7 +127,7 @@ export class ApiClient {
           data = JSON.parse(rawBody) as T & { ok?: boolean; error?: string };
         } catch (parseErr) {
           const bodySnippet = bodyTrim.slice(0, BODY_SNIPPET_MAX);
-          const details: SheetsBadJsonDetails = {
+          const details: BackendBadJsonDetails = {
             status: res.status,
             contentType,
             bodySnippet,
@@ -139,14 +135,14 @@ export class ApiClient {
             method,
           };
           if (this.log) {
-            this.log("error", "[API] Nieprawidłowa odpowiedź JSON – parse error", {
+            this.log("error", "[API] Nieprawidłowa odpowiedź JSON", {
               url,
               method,
               status: res.status,
               bodySnippet: bodySnippet.slice(0, 500),
             });
           }
-          throw new SheetsBadJsonError("Apps Script zwrócił nieprawidłową odpowiedź (błąd parsowania JSON).", details);
+          throw new SheetsBadJsonError("Backend zwrócił nieprawidłową odpowiedź (błąd parsowania JSON).", details);
         }
 
         if (!res.ok) throw new Error((data?.error as string) ?? `HTTP ${res.status}`);

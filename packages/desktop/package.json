@@ -1,6 +1,6 @@
 {
   "name": "@planlux/desktop",
-  "version": "1.0.1",
+  "version": "1.0.6",
   "description": "Planlux Hale – kalkulator i CRM ofert hal stalowych",
   "author": "Planlux",
   "repository": {
@@ -9,9 +9,13 @@
   },
   "main": "dist/electron/main.js",
   "scripts": {
+    "prepack": "node scripts/create-icon.js",
+    "gen:ico": "node electron/scripts/gen-ico.js",
+    "verify:icon": "node electron/scripts/verify-icon.js",
     "build": "npm run build -w @planlux/shared && vite build && tsc && npm run copy:assets",
     "build:electron": "tsc",
     "dev:electron": "tsc --watch",
+    "postinstall": "electron-builder install-app-deps",
     "test": "vitest run electron/",
     "test:renderer": "vitest run --config vitest.renderer.config.ts",
     "test:all": "npm run test && npm run test:renderer",
@@ -37,32 +41,37 @@
     "productName": "Planlux Hale",
     "electronVersion": "28.3.3",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "assets"
     },
     "files": [
       "dist/**/*",
-      "dist-electron/**/*",
       "node_modules/**/*",
       "package.json"
     ],
+    "asar": true,
+    "asarUnpack": [
+      "**/node_modules/better-sqlite3/**",
+      "**/node_modules/keytar/**"
+    ],
     "extraResources": [
-      {
-        "from": "build/icon.ico",
-        "to": "icon.ico"
-      }
+      { "from": "assets", "to": "assets" }
     ],
     "win": {
       "target": "nsis",
-      "icon": "build/icon.ico",
+      "icon": "assets/icon.ico",
       "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
-    }
+      "createStartMenuShortcut": true,
+      "shortcutName": "Planlux Hale"
+    },
+    "publish": null
   },
   "dependencies": {
     "@emotion/react": "^11.13.5",
@@ -82,6 +91,7 @@
     "recharts": "^3.7.0"
   },
   "devDependencies": {
+    "dotenv": "^16.4.5",
     "@playwright/test": "^1.49.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

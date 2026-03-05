@@ -41,7 +41,7 @@ export interface FlushOutboxDeps {
   isOnline: () => boolean;
 }
 
-/** Błąd zwracany do UI gdy np. logEmail dostanie nie-JSON z Apps Script. */
+/** Błąd zwracany do UI gdy np. logEmail dostanie nie-JSON z backendu. */
 export interface FlushOutboxFirstError {
   code?: string;
   message: string;

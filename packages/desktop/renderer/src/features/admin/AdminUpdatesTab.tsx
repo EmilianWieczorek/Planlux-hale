@@ -1,5 +1,5 @@
 /**
- * Panel admina – zakładka Aktualizacje: wersja, sprawdzanie, historia z Apps Script.
+ * Panel admina – zakładka Aktualizacje: wersja, sprawdzanie aktualizacji (PLANLUX_UPDATES_URL).
  */
 import { useState, useEffect, useCallback } from "react";
 import {

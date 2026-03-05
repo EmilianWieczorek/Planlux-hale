@@ -439,11 +439,11 @@ export function OfferDetailsView({ api, offerId, userId, onBack, onEdit, onOpenP
             ERR_AUTH: "Błąd autoryzacji SMTP. Sprawdź ustawienia konta e-mail w Panelu admina.",
             ERR_TIMEOUT: "Przekroczono limit czasu połączenia. Sprawdź internet i spróbuj ponownie.",
             ERR_HISTORY_WRITE: "E-mail został wysłany, ale nie zapisano go w historii. Sprawdź logi i bazę – nie wysyłaj ponownie.",
-            ERR_SHEETS_BAD_JSON: "Apps Script zwrócił nieprawidłową odpowiedź (nie JSON). Zapis do Google Sheets w kolejce – sprawdź logi (status, content-type, fragment odpowiedzi).",
+            ERR_SHEETS_BAD_JSON: "Backend zwrócił nieprawidłową odpowiedź (nie JSON). Zapis w kolejce – sprawdź logi (status, content-type, fragment odpowiedzi).",
           };
           let friendlyError: string | undefined;
           if (res.ok && res.sent && res.sheetsError) {
-            friendlyError = `E-mail wysłany. Zapis do Google Sheets nie powiódł się: ${res.sheetsError.message} Wpis w kolejce – spróbuję ponownie.`;
+            friendlyError = `E-mail wysłany. Zapis do backendu nie powiódł się: ${res.sheetsError.message} Wpis w kolejce – spróbuję ponownie.`;
           } else if (!res.ok) {
             const baseMsg = (res as { message?: string }).message ?? (res.code && messageByCode[res.code] ? messageByCode[res.code] : res.error);
             const details = (res as { details?: unknown }).details;

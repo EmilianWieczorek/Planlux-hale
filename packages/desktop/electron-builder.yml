@@ -5,7 +5,6 @@ directories:
   output: release
 files:
   - "dist/**/*"
-  - "dist-electron/**/*"
   - "build/icon.ico"
   - "node_modules/**/*"
   - "package.json"
@@ -37,6 +36,8 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  allowElevation: true
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
+  shortcutName: Planlux Hale

@@ -5,6 +5,7 @@ import { planluxTheme } from "../theme/planluxTheme";
 
 const INACTIVITY_MS = 30 * 60 * 1000; // 30 min
 const REMINDER_BEFORE_MS = 2 * 60 * 1000; // przypomnienie 2 min przed wylogowaniem
+import { getErrorMessage } from "../lib/errorMessage";
 import { LoginScreen } from "../features/auth/LoginScreen";
 import { ChangePasswordScreen } from "../features/auth/ChangePasswordScreen";
 import { MainLayout } from "../features/layout/MainLayout";
@@ -55,23 +56,28 @@ export default function App() {
   const reminderTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
   const handleLogin = async (email: string, password: string) => {
-    const r = (await api("planlux:login", email, password)) as {
+    const r = await api("planlux:login", email, password);
+    const res = r as {
       ok: boolean;
       user?: { id: string; email: string; role: string; displayName?: string };
       mustChangePassword?: boolean;
-      error?: string;
+      error?: string | { code: string; message: string };
+      errorMessage?: string;
+      errorCode?: string;
     };
-    if (r.ok && r.user) {
-      setUser(r.user);
-      setMustChangePassword(Boolean(r.mustChangePassword));
+    console.log("LOGIN RESULT:", res);
+    if (res.ok && res.user) {
+      setUser(res.user);
+      setMustChangePassword(Boolean(res.mustChangePassword));
       return true;
     }
-    throw new Error(r.error ?? "Login failed");
+    throw new Error(getErrorMessage(res));
   };
 
   const handleChangePassword = async (newPassword: string) => {
-    const r = (await api("planlux:changePassword", newPassword)) as { ok: boolean; error?: string };
-    if (!r.ok) throw new Error(r.error ?? "Nie udało się zmienić hasła");
+    const r = await api("planlux:changePassword", newPassword);
+    const res = r as { ok: boolean; error?: string | { code: string; message: string }; errorMessage?: string };
+    if (!res.ok) throw new Error(getErrorMessage(res));
     setMustChangePassword(false);
   };
 
