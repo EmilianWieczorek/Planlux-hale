@@ -51,7 +51,7 @@ npm run dist
 
 ## Testing on a clean machine
 
-1. Copy `Planlux Hale Setup 1.0.6.exe` (version from `packages/desktop/package.json`) to a Windows PC without Node/Dev tools.
+1. Copy `Planlux Hale Setup 1.0.8.exe` (version from `packages/desktop/package.json`) to a Windows PC without Node/Dev tools.
 2. Run the installer; choose installation directory if prompted.
 3. Launch “Planlux Hale” from Start Menu or desktop shortcut.
 4. Confirm the app starts and can log in (Supabase configured).

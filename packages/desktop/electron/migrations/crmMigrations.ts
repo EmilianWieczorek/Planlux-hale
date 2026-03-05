@@ -105,6 +105,22 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] email_history skipped", e);
   }
 
+  // 2a. email_history: body_preview, updated_at (for smtp flush / Supabase logEmail)
+  try {
+    if (hasTable(database, "email_history")) {
+      if (!hasColumn(database, "email_history", "body_preview")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN body_preview TEXT DEFAULT NULL");
+        logger.info("[migration] email_history body_preview added");
+      }
+      if (!hasColumn(database, "email_history", "updated_at")) {
+        database.exec("ALTER TABLE email_history ADD COLUMN updated_at TEXT DEFAULT NULL");
+        logger.info("[migration] email_history updated_at added");
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] email_history body_preview/updated_at skipped", e);
+  }
+
   // 2b. offer_audit – audit trail per oferta
   try {
     database.exec(`
@@ -181,43 +197,12 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
     logger.warn("[migration] offers_crm offer_number_status skipped", e);
   }
 
-  // 4. outbox: dodaj OFFER_SYNC (wymaga recreate table)
+  // 4 & 5. outbox: ensure CHECK includes OFFER_SYNC and SEND_GENERIC_EMAIL (single idempotent rebuild)
   try {
-    const rows = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'").all() as Array<{ name: string }>;
-    if (rows.length > 0) {
-      database.exec(`
-        CREATE TABLE outbox_new (
-          id TEXT PRIMARY KEY,
-          operation_type TEXT NOT NULL CHECK (operation_type IN ('SEND_EMAIL', 'LOG_PDF', 'LOG_EMAIL', 'HEARTBEAT', 'OFFER_SYNC')),
-          payload_json TEXT NOT NULL,
-          retry_count INTEGER NOT NULL DEFAULT 0,
-          max_retries INTEGER NOT NULL DEFAULT 5,
-          last_error TEXT,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          processed_at TEXT
-        );
-        INSERT INTO outbox_new SELECT id, operation_type, payload_json, retry_count, max_retries, last_error, created_at, processed_at FROM outbox;
-        DROP TABLE outbox;
-        ALTER TABLE outbox_new RENAME TO outbox;
-        CREATE INDEX IF NOT EXISTS idx_outbox_processed ON outbox(processed_at);
-        CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at);
-        CREATE INDEX IF NOT EXISTS idx_outbox_type ON outbox(operation_type);
-      `);
-      logger.info("[migration] outbox OFFER_SYNC added");
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("duplicate column") || msg.includes("already exists")) {
-      logger.info("[migration] outbox already has OFFER_SYNC");
-    } else {
-      logger.warn("[migration] outbox OFFER_SYNC skipped", e);
-    }
-  }
-
-  // 5. outbox: dodaj SEND_GENERIC_EMAIL (generic email queue)
-  try {
-    const rows = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'").all() as Array<{ name: string }>;
-    if (rows.length > 0) {
+    const outboxRow = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox'").get() as { sql?: string } | undefined;
+    const outboxSql = outboxRow?.sql ?? "";
+    const needsRebuild = outboxSql.length > 0 && (!outboxSql.includes("OFFER_SYNC") || !outboxSql.includes("SEND_GENERIC_EMAIL"));
+    if (needsRebuild) {
       database.exec(`
         CREATE TABLE outbox_new (
           id TEXT PRIMARY KEY,
@@ -236,15 +221,12 @@ export function runCrmMigrations(database: Db, logger: { info: (m: string, d?: u
         CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at);
         CREATE INDEX IF NOT EXISTS idx_outbox_type ON outbox(operation_type);
       `);
-      logger.info("[migration] outbox SEND_GENERIC_EMAIL added");
+      logger.info("[migration] outbox rebuilt with OFFER_SYNC and SEND_GENERIC_EMAIL");
+    } else if (outboxSql.length > 0) {
+      logger.info("[migration] outbox CHECK already up to date");
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("duplicate") || msg.includes("already exists")) {
-      logger.info("[migration] outbox already has SEND_GENERIC_EMAIL");
-    } else {
-      logger.warn("[migration] outbox SEND_GENERIC_EMAIL skipped", e);
-    }
+    logger.warn("[migration] outbox rebuild skipped", e);
   }
 
   // 6. smtp_accounts – konfiguracja SMTP (pełna tabela z user_id). Idempotentna.

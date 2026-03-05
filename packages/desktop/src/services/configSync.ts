@@ -69,13 +69,17 @@ export async function syncConfig(
     return lastSyncResult;
   }
 
-  if (meta.version <= localVersion) {
+  const forceRefresh = process.env.LOG_LEVEL === "debug";
+  if (!forceRefresh && meta.version <= localVersion) {
     log.info("[configSync] unchanged", { version: meta.version });
     lastSyncResult = { status: "unchanged", version: meta.version, lastUpdated: meta.lastUpdated };
     return lastSyncResult;
   }
 
-  log.info("[configSync] fetching base", { remoteVersion: meta.version });
+  if (forceRefresh) {
+    log.info("[configSync] pricing cache version before", { localVersion });
+  }
+  log.info("[configSync] fetching base", { version: meta.version, forceRefresh: forceRefresh || undefined });
   let baseData: { meta: { version: number; lastUpdated: string }; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
   try {
     const res = await api.getBase();
@@ -96,6 +100,32 @@ export async function syncConfig(
     return lastSyncResult;
   }
 
+  log.info("[configSync] payload loaded", {
+    version: baseData.meta.version,
+    cennik: baseData.cennik.length,
+    dodatki: baseData.dodatki.length,
+    standard: baseData.standard.length,
+  });
+
+  const variants = [...new Set((baseData.cennik as Array<{ wariant_hali?: string; variant?: string }>).map((r) => (r.wariant_hali ?? r.variant ?? "").trim()).filter(Boolean))];
+  const variantsCount = variants.length;
+  if (process.env.LOG_LEVEL === "debug") {
+    log.info("[configSync] variants after fetch", { count: variantsCount, first5: variants.slice(0, 5) });
+  }
+  if (variantsCount === 0 && baseData.cennik.length > 0) {
+    const firstRow = baseData.cennik[0] as Record<string, unknown>;
+    const payloadKeys = Object.keys(firstRow);
+    const errMsg = `Pricing sync: zero variants – calculator will not work. Payload keys on first cennik row: ${payloadKeys.join(", ")}. Ensure base_pricing.payload.cennik has wariant_hali (or variant) and cena.`;
+    log.error("[configSync] " + errMsg);
+    lastSyncResult = { status: "error", version: localVersion, error: errMsg };
+    return lastSyncResult;
+  }
+  if (variantsCount === 0 && baseData.cennik.length === 0) {
+    log.warn("[configSync] base has no cennik rows – not overwriting cache");
+    lastSyncResult = { status: "unchanged", version: localVersion, error: "Brak pozycji cennika" };
+    return lastSyncResult;
+  }
+
   const base: CachedBase = {
     version: baseData.meta.version,
     lastUpdated: baseData.meta.lastUpdated ?? new Date().toISOString(),
@@ -107,6 +137,9 @@ export async function syncConfig(
   try {
     saveBase(db, base);
     log.info("[configSync] saved", { version: base.version });
+    if (process.env.LOG_LEVEL === "debug") {
+      log.info("[configSync] pricing cache version after", { version: base.version });
+    }
     lastSyncResult = { status: "synced", version: base.version, lastUpdated: base.lastUpdated };
     return lastSyncResult;
   } catch (e) {

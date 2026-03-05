@@ -259,6 +259,32 @@ export async function registerIpcHandlers(deps: {
   const wrap = (channel: string, handler: (event: unknown, ...args: any[]) => Promise<unknown> | unknown) =>
     wrapIpcHandler(channel, handler as (event: unknown, ...args: unknown[]) => Promise<unknown>, { log: (msg, meta) => logger.error(msg, meta) });
 
+  /** Upsert offer into Supabase public.offers so rpc_finalize_offer_number can find it. No-op if getSupabase missing. */
+  async function syncOfferToSupabase(
+    offerId: string,
+    userId: string,
+    opts: { offerNumber?: string; offerNumberStatus?: string; status?: string } = {}
+  ): Promise<void> {
+    if (!getSupabase) return;
+    try {
+      const supabase = getSupabase();
+      await supabase.from("offers").upsert(
+        {
+          id: offerId,
+          created_by: userId,
+          offer_number: opts.offerNumber ?? null,
+          offer_number_status: opts.offerNumberStatus ?? "TEMP",
+          status: opts.status ?? "DRAFT",
+          payload: {},
+          totals: {},
+        },
+        { onConflict: "id" }
+      );
+    } catch (e) {
+      logger.warn("[crm] syncOfferToSupabase failed (offer will use local numbering if RPC not used)", { offerId, error: e });
+    }
+  }
+
   /** Sync users from Supabase profiles (or legacy backend). Upsert by email; new users get sentinel password until first online login. */
   async function syncUsersFromBackend(): Promise<{ ok: boolean; syncedCount?: number; error?: string }> {
     const db = getDb();
@@ -353,10 +379,15 @@ export async function registerIpcHandlers(deps: {
         if (!verifyPassword(password, row)) {
           return { ok: false, error: "Nieprawidłowy email lub hasło", errorCode: "AUTH_INVALID_CREDENTIALS" };
         }
+        const adminEmail = (getConfig().seed?.adminInitialEmail ?? "").trim().toLowerCase();
+        const role = adminEmail && row.email.trim().toLowerCase() === adminEmail ? "ADMIN" : normalizeRole(row.role);
+        if (adminEmail && row.email.trim().toLowerCase() === adminEmail && role === "ADMIN") {
+          db.prepare("UPDATE users SET role = 'ADMIN' WHERE id = ?").run(row.id);
+        }
         const user: SessionUser = {
           id: row.id,
           email: row.email,
-          role: normalizeRole(row.role),
+          role,
           displayName: row.display_name ?? null,
         };
         const sess = session.createSession(user);
@@ -383,6 +414,11 @@ export async function registerIpcHandlers(deps: {
       });
 
       if (result.ok) {
+        const adminEmail = (getConfig().seed?.adminInitialEmail ?? "").trim().toLowerCase();
+        if (adminEmail && result.user.email.trim().toLowerCase() === adminEmail && result.user.role !== "ADMIN") {
+          db.prepare("UPDATE users SET role = 'ADMIN' WHERE LOWER(TRIM(email)) = ?").run(adminEmail);
+          result.user = { ...result.user, role: "ADMIN" };
+        }
         const sess = session.createSession(result.user);
         currentUser = result.user;
         db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), result.user.id, config.appVersion);
@@ -1227,6 +1263,11 @@ export async function registerIpcHandlers(deps: {
           nowIso,
           nowIso
         );
+        await syncOfferToSupabase(offerId, userId, {
+          offerNumber: p.offerNumber,
+          offerNumberStatus: p.offerNumber?.startsWith("TEMP-") ? "TEMP" : "FINAL",
+          status: "DRAFT",
+        });
         db.prepare("INSERT INTO event_log (id, offer_id, user_id, event_type, details_json) VALUES (?, ?, ?, 'OFFER_CREATED', ?)").run(
           uuid(),
           offerId,
@@ -1650,6 +1691,8 @@ export async function registerIpcHandlers(deps: {
         ).run(offerId, tempNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
       }
 
+      await syncOfferToSupabase(offerId, user.id, { offerNumber: tempNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
+
       const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
       if (auditTables.length > 0) {
         db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'CREATE_OFFER', ?)").run(
@@ -1817,6 +1860,7 @@ export async function registerIpcHandlers(deps: {
                   nowIso,
                   nowIso
                 );
+                await syncOfferToSupabase(offerId, user.id, { offerNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
               } else {
                 db.prepare(
                   `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
@@ -1839,6 +1883,7 @@ export async function registerIpcHandlers(deps: {
                   nowIso,
                   nowIso
                 );
+                await syncOfferToSupabase(offerId, user.id, { offerNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
               }
             }
             const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;

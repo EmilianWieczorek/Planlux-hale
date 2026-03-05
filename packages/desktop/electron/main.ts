@@ -320,7 +320,7 @@ COMMIT;
   const { runEmailHistoryToEmailMigration } = require("./db/migrations/0001_email_history_to_email");
   runEmailHistoryToEmailMigration(database as import("./db/types").DbLike, logger);
 
-  // Diagnostyka: logujemy aktualny kształt tabel users i smtp_accounts po migracjach.
+  // Diagnostyka: logujemy aktualny kształt kluczowych tabel po migracjach.
   try {
     const usersSqlRow = database
       .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
@@ -330,6 +330,11 @@ COMMIT;
       .prepare("PRAGMA table_info(smtp_accounts)")
       .all() as Array<{ name: string; type: string; notnull: number; dflt_value: unknown }>;
     logger.info("[schema] smtp_accounts.columns", smtpInfo);
+
+    const outboxSqlRow = database
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox'")
+      .get() as { sql?: string } | undefined;
+    logger.info("[schema] outbox.sql", { sql: outboxSqlRow?.sql });
   } catch (e) {
     logger.warn("[schema] log failed", e);
   }
@@ -575,6 +580,18 @@ async function runStartup(): Promise<void> {
   logger.info("[app] config", sanitizeConfigForLog(electronCfg));
 
   const database = getDb();
+  const { getLocalVersion } = await import("../src/infra/db");
+  if (getLocalVersion(database) === 0) {
+    const cachePath = path.join(app.getPath("userData"), "pricing_cache.json");
+    try {
+      if (fs.existsSync(cachePath)) {
+        fs.unlinkSync(cachePath);
+        logger.info("[configSync] removed stale pricing_cache.json");
+      }
+    } catch (e) {
+      logger.warn("[configSync] remove pricing_cache.json failed", e);
+    }
+  }
   try {
     const { syncConfig } = await import("../src/services/configSync");
     await syncConfig(database, logger, apiClient);
@@ -590,6 +607,16 @@ async function runStartup(): Promise<void> {
     logger,
   });
   console.log("[IPC] Planlux IPC handlers initialized");
+  // Promote ADMIN_INITIAL_EMAIL to ADMIN so local/Supabase-synced user gets admin role.
+  const adminInitialEmail = (electronCfg.seed?.adminInitialEmail ?? "").trim().toLowerCase();
+  if (adminInitialEmail) {
+    try {
+      const r = database.prepare("UPDATE users SET role = 'ADMIN' WHERE LOWER(TRIM(email)) = ? AND (role IS NULL OR role != 'ADMIN')").run(adminInitialEmail);
+      if (r.changes > 0) logger.info("[seed] Promoted user to ADMIN (ADMIN_INITIAL_EMAIL)", { email: adminInitialEmail });
+    } catch (e) {
+      logger.warn("[seed] Promote ADMIN_INITIAL_EMAIL skipped", e);
+    }
+  }
   // Seed a single admin only if no admin exists. No hardcoded credentials.
   const { hashPassword, validatePassword } = await import("./auth/password");
   const anyAdmin = database.prepare("SELECT id FROM users WHERE role = 'ADMIN' AND active = 1 LIMIT 1").get();
@@ -706,6 +733,33 @@ async function runStartup(): Promise<void> {
             text: payload.text,
             html: payload.html,
           });
+        },
+        offerSync: async (payload) => {
+          const db = getDb() as Db;
+          const offers = Array.isArray(payload?.offers) ? payload.offers : [];
+          for (const o of offers) {
+            const offer = o as { id?: string };
+            if (!offer?.id) continue;
+            try {
+              const result = await apiClient.reserveOfferNumber({
+                id: offer.id,
+                userId: (offer as { userId?: string }).userId ?? "",
+                initial: (offer as { initial?: string }).initial ?? "E",
+                year: (offer as { year?: number }).year ?? new Date().getFullYear(),
+              });
+              if (result.ok && result.offerNumber) {
+                const hasStatus = (db.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>).some((c) => c.name === "offer_number_status");
+                if (hasStatus) {
+                  db.prepare("UPDATE offers_crm SET offer_number = ?, offer_number_status = 'FINAL' WHERE id = ?").run(result.offerNumber, offer.id);
+                } else {
+                  db.prepare("UPDATE offers_crm SET offer_number = ? WHERE id = ?").run(result.offerNumber, offer.id);
+                }
+                if (process.env.LOG_LEVEL === "debug") logger.info("[outbox] offerSync reserved", { offerId: offer.id, offerNumber: result.offerNumber });
+              }
+            } catch (e) {
+              logger.warn("[outbox] offerSync reserveOfferNumber failed", { offerId: offer.id, error: e });
+            }
+          }
         },
       });
       if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush", r);

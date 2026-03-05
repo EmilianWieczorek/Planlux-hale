@@ -95,7 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_emails_created_at ON emails(created_at);
 
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY,
-  operation_type TEXT NOT NULL CHECK (operation_type IN ('SEND_EMAIL', 'LOG_PDF', 'LOG_EMAIL', 'HEARTBEAT')),
+  operation_type TEXT NOT NULL CHECK (operation_type IN ('SEND_EMAIL', 'SEND_GENERIC_EMAIL', 'LOG_PDF', 'LOG_EMAIL', 'HEARTBEAT', 'OFFER_SYNC')),
   payload_json TEXT NOT NULL,
   retry_count INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 5,

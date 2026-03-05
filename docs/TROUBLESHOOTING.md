@@ -57,6 +57,23 @@ npm run build
 
 ---
 
+## Baza danych (SQLite)
+
+### Reset lokalnej bazy (użytkownicy, cennik, oferty)
+Jeśli chcesz zacząć od czystej bazy (np. po zmianie roli admina lub problemach z logowaniem):
+
+1. **Zamknij aplikację** całkowicie.
+2. **Lokalizacja pliku bazy:**
+   - Windows: `%APPDATA%\planlux-hale\planlux-hale.db` (np. `C:\Users\<user>\AppData\Roaming\planlux-hale\planlux-hale.db`)
+   - macOS: `~/Library/Application Support/planlux-hale/planlux-hale.db`
+   - Linux: `~/.config/planlux-hale/planlux-hale.db`
+3. **Usuń plik** `planlux-hale.db` (opcjonalnie: przenieś w inne miejsce jako backup).
+4. **Uruchom aplikację** ponownie – baza zostanie utworzona od zera; jeśli skonfigurowano `ADMIN_INITIAL_EMAIL`, zostanie utworzony użytkownik admin.
+
+W trybie deweloperskim (`npm run dev:desktop`) ścieżka `userData` jest taka sama jak w produkcji (Electron `app.getPath('userData')`).
+
+---
+
 ## Panel admina
 
 ### Błąd przy tworzeniu użytkownika

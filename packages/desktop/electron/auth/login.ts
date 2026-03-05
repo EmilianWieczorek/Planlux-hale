@@ -143,11 +143,18 @@ export async function performLogin(
         const displayName = (backendUser.name ?? "").trim() || null;
         const hashed = hashPassword(password);
         const now = new Date().toISOString();
-        const hasLastSynced = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "last_synced_at");
-        const hasPasswordUnavail = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
-        const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
         const backendUserId = (backendUser as { id?: string }).id;
-        const userId = backendUserId ?? existing?.id ?? deps.uuid();
+        const userId = backendUserId ?? deps.uuid();
+        const colNames = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
+        if (colNames.includes("id") && colNames.includes("email") && colNames.includes("password_hash")) {
+          db.prepare(
+            "INSERT OR IGNORE INTO users (id, email, role, display_name, active, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
+          ).run(userId, emailNorm, role, displayName, hashed.hash, now, now);
+        }
+        const hasLastSynced = colNames.includes("last_synced_at");
+        const hasPasswordUnavail = colNames.includes("password_unavailable");
+        const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
+        const userIdFinal = existing?.id ?? userId;
         if (existing) {
           if (hasPasswordUnavail) {
             if (hasLastSynced) {
@@ -193,8 +200,8 @@ export async function performLogin(
             }
           }
         }
-        const user: SessionUser = { id: userId, email: emailNorm, role, displayName };
-        const row = db.prepare("SELECT must_change_password FROM users WHERE id = ?").get(userId) as { must_change_password?: number };
+        const user: SessionUser = { id: userIdFinal, email: emailNorm, role, displayName };
+        const row = db.prepare("SELECT must_change_password FROM users WHERE id = ?").get(userIdFinal) as { must_change_password?: number };
         return { ok: true, user, mustChangePassword: row?.must_change_password === 1 };
       }
       const backendError = (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło";

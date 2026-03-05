@@ -1,6 +1,7 @@
 /**
  * Supabase-backed API adapter: getMeta, getBase, logPdf, logEmail, heartbeat.
  * Replaces Google Apps Script backend. Uses tables: base_pricing, pdf_history, email_history, sync_log.
+ * Normalizes base_pricing payload from Supabase schema (variant/name/price etc.) to app schema (wariant_hali/Nazwa/cena etc.).
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -12,7 +13,120 @@ import type {
   HeartbeatPayload,
   ReserveOfferNumberPayload,
   ReserveOfferNumberResponse,
+  CennikRow,
+  DodatkiRow,
+  StandardRow,
 } from "@planlux/shared";
+
+type RawRecord = Record<string, unknown>;
+
+/** Normalize one cennik row: Supabase (variant/name/price/unit) or Polish (wariant_hali/Nazwa/cena/stawka_jedn) -> app canonical. */
+function normalizeCennikRow(raw: RawRecord): CennikRow {
+  const n = raw as Record<string, unknown>;
+  const hasPolishKeys = n.wariant_hali != null && n.Nazwa != null && n.cena != null;
+  if (hasPolishKeys) {
+    const row = { ...n } as Record<string, unknown>;
+    row.stawka_jednostka = n.stawka_jednostka ?? n.stawka_jedn;
+    return row as unknown as CennikRow;
+  }
+  return {
+    wariant_hali: String(n.variant ?? n.wariant_hali ?? ""),
+    Nazwa: String(n.name ?? n.Nazwa ?? n.variant ?? ""),
+    Typ_Konstrukcji: n.construction_type != null ? String(n.construction_type) : (n.Typ_Konstrukcji as string | undefined),
+    Typ_Dachu: n.roof_type != null ? String(n.roof_type) : (n.Typ_Dachu as string | undefined),
+    Boki: n.sides != null ? String(n.sides) : (n.Boki as string | undefined),
+    Dach: n.roof != null ? String(n.roof) : (n.Dach as string | undefined),
+    area_min_m2: toNum(n.area_min_m2, 0),
+    area_max_m2: toNum(n.area_max_m2, 0),
+    cena: toNum(n.price ?? n.cena, 0),
+    stawka_jednostka: (n.unit ?? n.stawka_jednostka ?? n.stawka_jedn) != null ? String(n.unit ?? n.stawka_jednostka ?? n.stawka_jedn) : undefined,
+    uwagi: n.notes != null ? String(n.notes) : (n.uwagi as string | undefined),
+  };
+}
+
+/** Normalize one dodatki row: Supabase (variant/hall_name/addon_name/price/unit/condition) -> app. */
+function normalizeDodatkiRow(raw: RawRecord): DodatkiRow {
+  if (raw.wariant_hali != null && raw.nazwa != null && raw.stawka != null) {
+    return raw as unknown as DodatkiRow;
+  }
+  const n = raw as Record<string, unknown>;
+  return {
+    wariant_hali: String(n.variant ?? n.hall_name ?? n.wariant_hali ?? ""),
+    Nazwa: n.hall_name != null ? String(n.hall_name) : (n.Nazwa as string | undefined),
+    nazwa: String(n.addon_name ?? n.nazwa ?? n.name ?? ""),
+    stawka: toNum(n.price ?? n.stawka, 0),
+    jednostka: String(n.unit ?? n.jednostka ?? ""),
+    warunek: n.condition != null ? String(n.condition) : (n.warunek as string | undefined),
+    warunek_type: n.condition_type as string | undefined,
+    warunek_min: (n.condition_min ?? n.warunek_min) as string | number | undefined,
+    warunek_max: (n.condition_max ?? n.warunek_max) as string | number | undefined,
+  };
+}
+
+/** Normalize one standard row: Supabase (variant/qty/ref_value/notes) -> app (wariant_hali/ilosc/wartosc_ref/uwagi). */
+function normalizeStandardRow(raw: RawRecord): StandardRow {
+  if (raw.wariant_hali != null && raw.element != null) {
+    return raw as unknown as StandardRow;
+  }
+  const n = raw as Record<string, unknown>;
+  const refVal = n.ref_value ?? n.wartosc_ref;
+  const wartoscRef: number | string =
+    typeof refVal === "number" || typeof refVal === "string" ? refVal : toNum(refVal, 0);
+  return {
+    wariant_hali: String(n.variant ?? n.wariant_hali ?? ""),
+    element: String(n.element ?? n.name ?? ""),
+    ilosc: toNum(n.qty ?? n.ilosc, 1),
+    wartosc_ref: wartoscRef,
+    jednostka: n.unit != null ? String(n.unit) : (n.jednostka as string | undefined),
+    uwagi: n.notes != null ? String(n.notes) : (n.uwagi as string | undefined),
+  };
+}
+
+function toNum(v: unknown, fallback: number): number {
+  if (v == null) return fallback;
+  if (typeof v === "number" && !Number.isNaN(v)) return v;
+  if (typeof v === "string") {
+    const parsed = parseFloat(v.replace(/\s/g, ""));
+    return Number.isNaN(parsed) ? fallback : parsed;
+  }
+  return fallback;
+}
+
+/** Normalize payload from Supabase base_pricing. Uses payload.cennik, payload.dodatki, payload.standard only (no pricing_surface). */
+function normalizeBasePayload(p: Record<string, unknown>): {
+  meta: BaseResponse["meta"];
+  cennik: CennikRow[];
+  dodatki: DodatkiRow[];
+  standard: StandardRow[];
+} {
+  const rawCennik = Array.isArray(p.cennik) ? p.cennik : [];
+  const rawDodatki = Array.isArray(p.dodatki) ? p.dodatki : [];
+  const rawStandard = Array.isArray(p.standard) ? p.standard : [];
+  const cennik = rawCennik.map((r) => normalizeCennikRow(typeof r === "object" && r != null ? (r as RawRecord) : {}));
+  const dodatki = rawDodatki.map((r) => normalizeDodatkiRow(typeof r === "object" && r != null ? (r as RawRecord) : {}));
+  const standard = rawStandard
+    .map((r) => normalizeStandardRow(typeof r === "object" && r != null ? (r as RawRecord) : {}))
+    .filter((s) => s.wariant_hali && s.element);
+  const meta = (p.meta as BaseResponse["meta"]) ?? { version: 0, lastUpdated: new Date().toISOString() };
+  if (process.env.LOG_LEVEL === "debug") {
+    // eslint-disable-next-line no-console
+    console.debug("[apiAdapter] base_pricing fetched", {
+      version: meta.version,
+      cennik: cennik.length,
+      dodatki: dodatki.length,
+      standard: standard.length,
+      firstCennikKeys: cennik[0] ? Object.keys(cennik[0] as unknown as Record<string, unknown>) : [],
+      firstDodatkiKeys: dodatki[0] ? Object.keys(dodatki[0] as unknown as Record<string, unknown>) : [],
+      firstStandardKeys: standard[0] ? Object.keys(standard[0] as unknown as Record<string, unknown>) : [],
+    });
+  }
+  return {
+    meta,
+    cennik,
+    dodatki,
+    standard,
+  };
+}
 
 export interface SupabaseApiAdapterConfig {
   supabase: SupabaseClient;
@@ -29,56 +143,86 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
 } {
   const { supabase, userId } = config;
 
-  async function getMeta(): Promise<MetaOnlyResponse | BaseResponse> {
-    const { data, error } = await supabase
+  /** Single source: base_pricing. Query: select payload, version from base_pricing order by version desc limit 1 */
+  const basePricingQuery = () =>
+    supabase
       .from("base_pricing")
-      .select("payload, version, created_at")
+      .select("payload, version")
       .order("version", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+  function parsePayload(payload: unknown): Record<string, unknown> {
+    if (payload == null) return {};
+    if (typeof payload === "object" && !Array.isArray(payload)) return payload as Record<string, unknown>;
+    if (typeof payload === "string") {
+      try {
+        return JSON.parse(payload) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  }
+
+  async function getMeta(): Promise<MetaOnlyResponse | BaseResponse> {
+    const { data, error } = await basePricingQuery();
     if (error) throw new Error(error.message);
-    if (!data?.payload) {
+    if (!data) {
       return { ok: true, meta: { version: 0, lastUpdated: new Date().toISOString() } };
     }
-    const p = data.payload as Record<string, unknown>;
-    const meta = p.meta as { version: number; lastUpdated: string } | undefined;
+    const rowVersion = data.version != null ? Number(data.version) : null;
+    const p = parsePayload(data.payload);
+    if (Object.keys(p).length === 0) {
+      return {
+        ok: true,
+        meta: { version: rowVersion ?? 0, lastUpdated: new Date().toISOString() },
+      };
+    }
+    const payloadMeta = p.meta as { version?: number; lastUpdated?: string } | undefined;
     return {
       ok: true,
-      meta: meta ?? { version: (data.version as number) ?? 0, lastUpdated: (data.created_at as string) ?? new Date().toISOString() },
+      meta: {
+        version: rowVersion ?? payloadMeta?.version ?? 0,
+        lastUpdated: (payloadMeta?.lastUpdated as string) ?? new Date().toISOString(),
+      },
     };
   }
 
   async function getBase(): Promise<BaseResponse> {
-    const { data, error } = await supabase
-      .from("base_pricing")
-      .select("payload")
-      .order("version", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data, error } = await basePricingQuery();
     if (error) throw new Error(error.message);
-    if (!data?.payload) {
-      return {
-        ok: true,
-        meta: { version: 0, lastUpdated: new Date().toISOString() },
-        cennik: [],
-        dodatki: [],
-        standard: [],
-      };
+    const rowVersion = data?.version != null ? Number(data.version) : 0;
+    const p = parsePayload(data?.payload);
+    console.info("pricing payload keys", Object.keys(p));
+    console.info("cennik count", (p.cennik as unknown[] | undefined)?.length ?? 0);
+    console.info("dodatki count", (p.dodatki as unknown[] | undefined)?.length ?? 0);
+    console.info("standard count", (p.standard as unknown[] | undefined)?.length ?? 0);
+    if (!Array.isArray(p.cennik) || p.cennik.length === 0) {
+      throw new Error("CONFIG_ERROR: base_pricing payload empty");
     }
-    const p = data.payload as Record<string, unknown>;
+    const normalized = normalizeBasePayload(p);
     return {
       ok: true,
-      meta: (p.meta as BaseResponse["meta"]) ?? { version: 0, lastUpdated: new Date().toISOString() },
-      cennik: (p.cennik as BaseResponse["cennik"]) ?? [],
-      dodatki: (p.dodatki as BaseResponse["dodatki"]) ?? [],
-      standard: (p.standard as BaseResponse["standard"]) ?? [],
+      meta: { ...normalized.meta, version: rowVersion },
+      cennik: normalized.cennik,
+      dodatki: normalized.dodatki,
+      standard: normalized.standard,
+      debug: process.env.LOG_LEVEL === "debug" ? { counts: { cennik: normalized.cennik.length, dodatki: normalized.dodatki.length, standard: normalized.standard.length } } : undefined,
     };
   }
 
   async function logPdf(payload: LogPdfPayload): Promise<{ ok: boolean; message?: string; id?: string }> {
+    if (process.env.LOG_LEVEL === "debug") {
+      // eslint-disable-next-line no-console
+      console.debug("[apiAdapter] logPdf", { id: payload.id, offerId: (payload as { offerId?: string }).offerId });
+    }
+    const pl = payload as unknown as Record<string, unknown>;
+    const offerId = (payload as { offerId?: string }).offerId ?? (pl.offerId as string | undefined);
     const { data, error } = await supabase
       .from("pdf_history")
       .insert({
+        offer_id: offerId ?? null,
         meta: {
           id: payload.id,
           userEmail: payload.userEmail,
@@ -100,6 +244,10 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   }
 
   async function logEmail(payload: LogEmailPayload): Promise<{ ok: boolean; message?: string; id?: string }> {
+    if (process.env.LOG_LEVEL === "debug") {
+      // eslint-disable-next-line no-console
+      console.debug("[apiAdapter] logEmail", { offerId: payload.offerId, toEmail: payload.toEmail });
+    }
     const pl = payload as unknown as Record<string, unknown>;
     const offerId = (payload.offerId ?? pl.offerId) as string | undefined;
     const { data, error } = await supabase
@@ -144,12 +292,20 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   }
 
   async function reserveOfferNumber(payload: ReserveOfferNumberPayload): Promise<ReserveOfferNumberResponse> {
+    if (process.env.LOG_LEVEL === "debug") {
+      // eslint-disable-next-line no-console
+      console.debug("[apiAdapter] reserveOfferNumber", { offerId: payload.id });
+    }
     const { data, error } = await supabase.rpc("rpc_finalize_offer_number", {
       p_offer_id: payload.id,
     });
     if (error) return { ok: false, error: error.message };
     const result = data as { ok?: boolean; offerNumber?: string; error?: string } | null;
     if (!result?.ok || result.error) return { ok: false, error: result?.error ?? "Unknown error" };
+    if (process.env.LOG_LEVEL === "debug") {
+      // eslint-disable-next-line no-console
+      console.debug("[apiAdapter] reserveOfferNumber ok", { offerNumber: result.offerNumber });
+    }
     return { ok: true, offerNumber: result.offerNumber };
   }
 
