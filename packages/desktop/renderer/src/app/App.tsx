@@ -19,6 +19,10 @@ declare global {
       version: string;
       invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
       onUpdateAvailable?: (cb: (info: { version: string }) => void) => void;
+      onUpdateChecking?: (cb: () => void) => void;
+      onUpdateNotAvailable?: (cb: (info: { version?: string | null }) => void) => void;
+      onUpdateDownloadProgress?: (cb: (p: { percent: number | null; bytesPerSecond: number | null; transferred: number | null; total: number | null }) => void) => void;
+      onUpdateError?: (cb: (e: { message: string }) => void) => void;
       onUpdateDownloaded?: (cb: () => void) => void;
       downloadUpdate?: () => Promise<unknown>;
       quitAndInstall?: () => Promise<unknown>;
@@ -113,6 +117,17 @@ export default function App() {
     window.planlux?.onUpdateDownloaded?.(() =>
       setUpdateInfo((p) => (p ? { ...p, downloaded: true } : { version: "?", downloaded: true }))
     );
+  }, []);
+  useEffect(() => {
+    window.planlux?.onUpdateChecking?.(() => {
+      // show lightweight status in console; UI stays minimal (modal triggers on available/downloaded)
+      if (import.meta.env.DEV) console.log("[updates] checking...");
+    });
+  }, []);
+  useEffect(() => {
+    window.planlux?.onUpdateError?.((e) => {
+      if (import.meta.env.DEV) console.warn("[updates] error", e?.message);
+    });
   }, []);
 
   useEffect(() => {

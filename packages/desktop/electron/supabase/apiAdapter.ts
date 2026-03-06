@@ -28,6 +28,66 @@ type BasePricingPayload = {
   [k: string]: unknown;
 };
 
+function asNonEmptyString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  return s.length > 0 ? s : undefined;
+}
+
+function firstNonEmptyString(...vals: unknown[]): string | undefined {
+  for (const v of vals) {
+    const s = asNonEmptyString(v);
+    if (s) return s;
+  }
+  return undefined;
+}
+
+/**
+ * Business variant identity.
+ *
+ * Supabase payloads sometimes contain both:
+ * - a short technical code like "T18" (often under `variant`)
+ * - a full business variant name like "T18_T35_DACH" (often under `wariant_hali` or `Nazwa`/`name`/`hall_name`)
+ *
+ * We must NOT key the UI/engine by the short code when the full business key exists,
+ * otherwise multiple main variants collapse into one and tiers mix incorrectly.
+ */
+type VariantKeyHint = "cennik" | "dodatki" | "standard";
+
+function deriveHallVariantKey(raw: Record<string, unknown>, hint: VariantKeyHint): string {
+  const key = firstNonEmptyString(
+    raw.wariant_hali,
+    raw.wariantHali,
+    raw.hall_variant,
+    raw.hallVariant,
+    raw.hall_key,
+    raw.hallKey
+  );
+  if (key) return key;
+
+  // IMPORTANT: in dodatki/standard, `name` is often the addon/element name (NOT hall variant).
+  // Only use name-like fields that are known to refer to the hall variant.
+  const nameLike =
+    hint === "cennik"
+      ? firstNonEmptyString(raw.Nazwa, raw.name)
+      : hint === "dodatki"
+        ? firstNonEmptyString(raw.hall_name, raw.hallName, raw.Nazwa)
+        : firstNonEmptyString(raw.Nazwa);
+  if (nameLike) return nameLike;
+
+  return firstNonEmptyString(raw.variant, raw.variant_hali) ?? "";
+}
+
+function deriveHallVariantLabel(raw: Record<string, unknown>, hint: VariantKeyHint, fallbackKey: string): string {
+  const label =
+    hint === "cennik"
+      ? firstNonEmptyString(raw.Nazwa, raw.name)
+      : hint === "dodatki"
+        ? firstNonEmptyString(raw.hall_name, raw.hallName, raw.Nazwa)
+        : firstNonEmptyString(raw.Nazwa);
+  return label ?? fallbackKey;
+}
+
 /** Normalize one cennik row: Supabase (variant/name/price/unit) or Polish (wariant_hali/Nazwa/cena/stawka_jedn) -> app canonical. */
 function normalizeCennikRow(raw: RawRecord): CennikRow {
   const n = raw as Record<string, unknown>;
@@ -37,9 +97,10 @@ function normalizeCennikRow(raw: RawRecord): CennikRow {
     row.stawka_jednostka = n.stawka_jednostka ?? n.stawka_jedn;
     return row as unknown as CennikRow;
   }
+  const variantKey = deriveHallVariantKey(n, "cennik");
   return {
-    wariant_hali: String(n.variant ?? n.wariant_hali ?? ""),
-    Nazwa: String(n.name ?? n.Nazwa ?? n.variant ?? ""),
+    wariant_hali: variantKey,
+    Nazwa: deriveHallVariantLabel(n, "cennik", variantKey),
     Typ_Konstrukcji: n.construction_type != null ? String(n.construction_type) : (n.Typ_Konstrukcji as string | undefined),
     Typ_Dachu: n.roof_type != null ? String(n.roof_type) : (n.Typ_Dachu as string | undefined),
     Boki: n.sides != null ? String(n.sides) : (n.Boki as string | undefined),
@@ -58,9 +119,10 @@ function normalizeDodatkiRow(raw: RawRecord): DodatkiRow {
     return raw as unknown as DodatkiRow;
   }
   const n = raw as Record<string, unknown>;
+  const variantKey = deriveHallVariantKey(n, "dodatki");
   return {
-    wariant_hali: String(n.variant ?? n.hall_name ?? n.wariant_hali ?? ""),
-    Nazwa: n.hall_name != null ? String(n.hall_name) : (n.Nazwa as string | undefined),
+    wariant_hali: variantKey,
+    Nazwa: deriveHallVariantLabel(n, "dodatki", variantKey),
     nazwa: String(n.addon_name ?? n.nazwa ?? n.name ?? ""),
     stawka: toNum(n.price ?? n.stawka, 0),
     jednostka: String(n.unit ?? n.jednostka ?? ""),
@@ -80,8 +142,9 @@ function normalizeStandardRow(raw: RawRecord): StandardRow {
   const refVal = n.ref_value ?? n.wartosc_ref;
   const wartoscRef: number | string =
     typeof refVal === "number" || typeof refVal === "string" ? refVal : toNum(refVal, 0);
+  const variantKey = deriveHallVariantKey(n, "standard");
   return {
-    wariant_hali: String(n.variant ?? n.wariant_hali ?? ""),
+    wariant_hali: variantKey,
     element: String(n.element ?? n.name ?? ""),
     ilosc: toNum(n.qty ?? n.ilosc, 1),
     wartosc_ref: wartoscRef,
@@ -117,12 +180,19 @@ function normalizeBasePayload(p: Record<string, unknown>): {
     .filter((s) => s.wariant_hali && s.element);
   const meta = (p.meta as BaseResponse["meta"]) ?? { version: 0, lastUpdated: new Date().toISOString() };
   if (process.env.LOG_LEVEL === "debug") {
+    const byVariant = new Map<string, string>();
+    for (const r of cennik) {
+      if (!r?.wariant_hali) continue;
+      if (!byVariant.has(r.wariant_hali)) byVariant.set(r.wariant_hali, r.Nazwa ?? r.wariant_hali);
+    }
     // eslint-disable-next-line no-console
     console.debug("[apiAdapter] base_pricing fetched", {
       version: meta.version,
       cennik: cennik.length,
       dodatki: dodatki.length,
       standard: standard.length,
+      groupedVariants: byVariant.size,
+      variantLabels: [...byVariant.values()].slice(0, 20),
       firstCennikKeys: cennik[0] ? Object.keys(cennik[0] as unknown as Record<string, unknown>) : [],
       firstDodatkiKeys: dodatki[0] ? Object.keys(dodatki[0] as unknown as Record<string, unknown>) : [],
       firstStandardKeys: standard[0] ? Object.keys(standard[0] as unknown as Record<string, unknown>) : [],
@@ -143,9 +213,19 @@ export interface SupabaseApiAdapterConfig {
   supabaseUrl?: string;
 }
 
+export interface RelationalPricingResult {
+  hallVariants: Array<{ variant: string; name: string; tiers: Array<{ min: number; max: number; price: number; unit?: string }> }>;
+  cennik: CennikRow[];
+  dodatki: DodatkiRow[];
+  standard: StandardRow[];
+  version: number;
+  lastUpdated: string;
+}
+
 export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   getMeta: () => Promise<MetaOnlyResponse | BaseResponse>;
   getBase: () => Promise<BaseResponse>;
+  getRelationalPricing: () => Promise<RelationalPricingResult | null>;
   logPdf: (payload: LogPdfPayload) => Promise<{ ok: boolean; message?: string; id?: string }>;
   logEmail: (payload: LogEmailPayload) => Promise<{ ok: boolean; message?: string; id?: string }>;
   heartbeat: (payload: HeartbeatPayload) => Promise<{ ok: boolean; message?: string; id?: string }>;
@@ -153,7 +233,7 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
 } {
   const { supabase, userId, supabaseUrl } = config;
 
-  /** Single source: base_pricing. Query: select payload, version from base_pricing order by version desc limit 1 */
+  /** Single source: public.base_pricing. RLS: only "authenticated" can read; if anon, query returns 0 rows. */
   const basePricingQuery = () =>
     supabase
       .from("base_pricing")
@@ -161,6 +241,17 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
       .order("version", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+  function logSupabaseError(label: string, error: unknown): void {
+    const e = error as { message?: string; code?: string; details?: string; hint?: string } | null;
+    if (!e) return;
+    console.error("[Supabase]", label, {
+      message: e.message,
+      code: e.code,
+      details: e.details,
+      hint: e.hint,
+    });
+  }
 
   function parsePayload(payload: unknown): Record<string, unknown> {
     if (payload == null) return {};
@@ -177,8 +268,12 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
 
   async function getMeta(): Promise<MetaOnlyResponse | BaseResponse> {
     const { data, error } = await basePricingQuery();
-    if (error) throw new Error(error.message);
+    if (error) {
+      logSupabaseError("base_pricing getMeta error", error);
+      throw new Error(error.message);
+    }
     if (!data) {
+      console.warn("[Supabase] base_pricing getMeta: 0 rows (check RLS – SELECT only for 'authenticated' role; anon returns empty)");
       return { ok: true, meta: { version: 0, lastUpdated: new Date().toISOString() } };
     }
     const rowVersion = data.version != null ? Number(data.version) : null;
@@ -200,44 +295,55 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   }
 
   async function getBase(): Promise<BaseResponse> {
+    const url =
+      supabaseUrl ??
+      (supabase as unknown as { supabaseUrl?: string }).supabaseUrl ??
+      "Supabase";
+    const fullUrl = url + "/rest/v1/base_pricing?select=payload,version&order=version.desc&limit=1";
+    console.log("BASE FETCH URL:", fullUrl);
+
     const { data: row, error } = await basePricingQuery();
-    if (process.env.LOG_LEVEL === "debug") {
-      const url = supabaseUrl ?? (supabase as any).supabaseUrl ?? "Supabase";
-      const fullUrl = url + "/rest/v1/base_pricing?select=payload,version";
-      const responseStatus = error ? (error as any).code ?? 500 : 200;
-      const body =
-        error != null
-          ? JSON.stringify({ error: (error as any).message, code: (error as any).code })
-          : row != null
-            ? JSON.stringify({ version: row.version, payloadKeys: row.payload != null && typeof row.payload === "object" ? Object.keys(row.payload as object) : null })
-            : "null";
-      console.log("BASE FETCH URL:", fullUrl, "STATUS:", responseStatus, "BODY:", body.slice(0, 500));
-    }
+    const errCode = (error as unknown as { code?: string | number })?.code;
+    const status = error && typeof errCode === "string" ? 500 : (typeof errCode === "number" ? errCode : 500);
+    console.log("BASE FETCH STATUS:", status, "rowCount:", row != null ? 1 : 0, "error:", error ? (error as { message?: string }).message : null);
+
     if (error) {
+      logSupabaseError("base_pricing getBase error", error);
+      console.error("BASE_PRICING_EMPTY_SUPABASE", { message: error.message, code: (error as unknown as { code?: string | number }).code, details: (error as { details?: string }).details });
       throw new Error("BASE_PRICING_EMPTY");
     }
+    if (row == null) {
+      console.warn("BASE_PRICING_EMPTY_SUPABASE", {
+        reason: "no row from base_pricing",
+        hint: "RLS on base_pricing allows SELECT only for authenticated. Log in or add policy: CREATE POLICY \"Allow anon read base_pricing\" ON base_pricing FOR SELECT TO anon USING (true);",
+      });
+      throw new Error("BASE_PRICING_EMPTY");
+    }
+
+    const rawPayload = parsePayload(row.payload) as Record<string, unknown>;
+    const p = {
+      cennik: Array.isArray(rawPayload.cennik) ? rawPayload.cennik : [],
+      dodatki: Array.isArray(rawPayload.dodatki) ? rawPayload.dodatki : [],
+      standard: Array.isArray(rawPayload.standard) ? rawPayload.standard : [],
+    };
+
+    console.log("pricing payload keys", Object.keys(rawPayload));
+    console.log("cennik count", p.cennik.length);
+    console.log("dodatki count", p.dodatki.length);
+    console.log("standard count", p.standard.length);
+
+    if (p.cennik.length === 0) {
+      console.error("BASE_PRICING_EMPTY_SUPABASE", { payloadKeys: Object.keys(rawPayload) });
+      throw new Error("BASE_PRICING_EMPTY");
+    }
+
     const rowVersion = row?.version != null ? Number(row.version) : 0;
-    const p = (parsePayload(row?.payload) ?? {}) as BasePricingPayload;
-    const cennikArr = Array.isArray(p.cennik) ? p.cennik : [];
-    const dodatkiArr = Array.isArray(p.dodatki) ? p.dodatki : [];
-    const standardArr = Array.isArray(p.standard) ? p.standard : [];
-    const hasValidStructure =
-      typeof rowVersion === "number" &&
-      Array.isArray(cennikArr) &&
-      Array.isArray(dodatkiArr) &&
-      Array.isArray(standardArr);
-    if (!hasValidStructure || cennikArr.length === 0) {
-      throw new Error("BASE_PRICING_EMPTY");
-    }
-    if (process.env.LOG_LEVEL === "debug") {
-      console.log("pricing payload keys", Object.keys(p), "version", rowVersion, "cennik", cennikArr.length, "dodatki", dodatkiArr.length, "standard", standardArr.length);
-    }
     const normalized = normalizeBasePayload({
-      ...p,
-      cennik: cennikArr,
-      dodatki: dodatkiArr,
-      standard: standardArr,
-    } as Record<string, unknown>);
+      ...rawPayload,
+      cennik: p.cennik,
+      dodatki: p.dodatki,
+      standard: p.standard,
+    });
     return {
       ok: true,
       meta: { ...normalized.meta, version: rowVersion },
@@ -314,7 +420,7 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
   async function heartbeat(payload: HeartbeatPayload): Promise<{ ok: boolean; message?: string; id?: string }> {
     const { error } = await supabase.from("sync_log").insert({
       device_id: payload.id,
-      user_id: userId ?? payload.userId,
+      user_id: userId ?? payload.userId ?? null,
       action: "heartbeat",
       meta: {
         userEmail: payload.userEmail,
@@ -323,8 +429,23 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
         occurredAt: payload.occurredAt,
       },
     });
-    if (error) throw new Error(error.message);
+    if (error) {
+      logSupabaseError("sync_log heartbeat RLS/insert error", error);
+      return { ok: true };
+    }
     return { ok: true };
+  }
+
+  async function getRelationalPricing(): Promise<RelationalPricingResult | null> {
+    try {
+      const { fetchRelationalPricing } = await import("../../src/services/relationalPricingLoader");
+      return fetchRelationalPricing(supabase);
+    } catch (e) {
+      if (process.env.LOG_LEVEL === "debug") {
+        console.debug("[apiAdapter] getRelationalPricing failed", e instanceof Error ? e.message : String(e));
+      }
+      return null;
+    }
   }
 
   async function reserveOfferNumber(payload: ReserveOfferNumberPayload): Promise<ReserveOfferNumberResponse> {
@@ -345,5 +466,5 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
     return { ok: true, offerNumber: result.offerNumber };
   }
 
-  return { getMeta, getBase, logPdf, logEmail, heartbeat, reserveOfferNumber };
+  return { getMeta, getBase, getRelationalPricing, logPdf, logEmail, heartbeat, reserveOfferNumber };
 }

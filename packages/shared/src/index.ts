@@ -24,7 +24,7 @@ export type { FlushOutboxDeps, OutboxApi } from "./sync/outbox";
 
 export { calculatePrice, runPricingSelfTest } from "./pricing/pricingEngine";
 export type { PricingEngineData } from "./pricing/pricingEngine";
-export type { PricingInput, PricingResult, BasePriceResultType, FallbackReason } from "./pricing/types";
+export type { PricingInput, PricingResult, BasePriceResultType, FallbackReason, PricingTier, HallVariant } from "./pricing/types";
 export { toNumber, toInt, normalizeJednostka } from "./pricing/normalize";
 
 export { renderOfferHtml } from "./pdf/template";

@@ -558,13 +558,33 @@ async function runStartup(): Promise<void> {
     return;
   }
 
-  if (!process.env.VITE_DEV_SERVER_URL && process.env.NODE_ENV !== "development") {
+  // Updater IPC is always registered; in dev it returns a friendly error.
+  // Auto-checking is still disabled in dev (see below).
+  {
     const { ipcMain } = require("electron");
     ipcMain.handle("planlux:downloadUpdate", async () => {
-      await autoUpdater.downloadUpdate();
+      const isDev = !!process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
+      if (isDev) return { ok: false, error: "Aktualizacje są wyłączone w trybie dev." };
+      try {
+        await autoUpdater.downloadUpdate();
+        return { ok: true };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        logger.warn("[autoUpdater] downloadUpdate failed", { message: msg });
+        return { ok: false, error: msg };
+      }
     });
     ipcMain.handle("planlux:quitAndInstall", () => {
-      autoUpdater.quitAndInstall(false, true);
+      const isDev = !!process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
+      if (isDev) return { ok: false, error: "Aktualizacje są wyłączone w trybie dev." };
+      try {
+        autoUpdater.quitAndInstall(false, true);
+        return { ok: true };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        logger.warn("[autoUpdater] quitAndInstall failed", { message: msg });
+        return { ok: false, error: msg };
+      }
     });
   }
 
@@ -584,7 +604,7 @@ async function runStartup(): Promise<void> {
   apiClient = createSupabaseApiAdapter({
     supabase,
     supabaseUrl: electronCfg.supabase?.url,
-  }) as ApiClient;
+  }) as unknown as ApiClient;
 
   logger.info("[app] started", {
     version: config.appVersion,
@@ -712,20 +732,77 @@ async function runStartup(): Promise<void> {
   createWindow();
 
   // Auto-update: check on startup (tylko w produkcji, gdy jest opublikowany release)
-  if (!process.env.VITE_DEV_SERVER_URL && process.env.NODE_ENV !== "development") {
-    autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.checkForUpdatesAndNotify().catch((err: unknown) => {
-      logger.warn("[autoUpdater] check failed", err);
-    });
-    autoUpdater.on("update-available", (info: unknown) => {
-      const version = (info != null && typeof info === "object" && "version" in info) ? (info as { version: string }).version : undefined;
-      logger.info("[autoUpdater] update available", version);
-      mainWindow?.webContents.send("planlux:update-available", { version });
-    });
-    autoUpdater.on("update-downloaded", () => {
-      mainWindow?.webContents.send("planlux:update-downloaded");
-    });
+  {
+    const isDev = !!process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
+    if (!isDev) {
+      try {
+        // If updatesUrl is configured and points at a generic provider base, prefer it over build-time publish config.
+        const updatesUrl = (config.updatesUrl ?? "").trim();
+        if (updatesUrl && typeof autoUpdater.setFeedURL === "function") {
+          try {
+            autoUpdater.setFeedURL({ provider: "generic", url: updatesUrl });
+            logger.info("[autoUpdater] feed configured", { provider: "generic", url: updatesUrl });
+          } catch (e) {
+            logger.warn("[autoUpdater] setFeedURL failed (will use build-time publish config)", e);
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      autoUpdater.autoDownload = false; // explicit user action (Pobierz)
+      autoUpdater.autoInstallOnAppQuit = true;
+
+      const send = (channel: string, payload?: unknown) => {
+        try {
+          mainWindow?.webContents.send(channel, payload);
+        } catch {
+          // ignore
+        }
+      };
+
+      autoUpdater.on("checking-for-update", () => {
+        logger.info("[autoUpdater] checking-for-update");
+        send("planlux:update-checking");
+      });
+      autoUpdater.on("update-available", (info: unknown) => {
+        const version = (info != null && typeof info === "object" && "version" in info) ? (info as { version: string }).version : undefined;
+        logger.info("[autoUpdater] update-available", { version });
+        send("planlux:update-available", { version: version ?? "?" });
+      });
+      autoUpdater.on("update-not-available", (info: unknown) => {
+        const version = (info != null && typeof info === "object" && "version" in info) ? (info as { version: string }).version : undefined;
+        logger.info("[autoUpdater] update-not-available", { version });
+        send("planlux:update-not-available", { version: version ?? null });
+      });
+      autoUpdater.on("download-progress", (p: unknown) => {
+        const prog = p as { percent?: number; bytesPerSecond?: number; transferred?: number; total?: number };
+        send("planlux:update-download-progress", {
+          percent: typeof prog.percent === "number" ? prog.percent : null,
+          bytesPerSecond: typeof prog.bytesPerSecond === "number" ? prog.bytesPerSecond : null,
+          transferred: typeof prog.transferred === "number" ? prog.transferred : null,
+          total: typeof prog.total === "number" ? prog.total : null,
+        });
+      });
+      autoUpdater.on("update-downloaded", (info: unknown) => {
+        const version = (info != null && typeof info === "object" && "version" in info) ? (info as { version: string }).version : undefined;
+        logger.info("[autoUpdater] update-downloaded", { version });
+        send("planlux:update-downloaded", { version: version ?? "?" });
+      });
+      autoUpdater.on("error", (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn("[autoUpdater] error", { message: msg });
+        send("planlux:update-error", { message: msg });
+      });
+
+      // Single startup check (no loops).
+      const check = typeof autoUpdater.checkForUpdates === "function"
+        ? autoUpdater.checkForUpdates.bind(autoUpdater)
+        : autoUpdater.checkForUpdatesAndNotify.bind(autoUpdater);
+      check().catch((err: unknown) => {
+        logger.warn("[autoUpdater] update check failed", err);
+      });
+    }
   }
 
   // Flush outbox periodically; isOnline = real Internet check (not just LAN)

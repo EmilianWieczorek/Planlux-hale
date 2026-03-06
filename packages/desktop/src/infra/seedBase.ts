@@ -58,12 +58,10 @@ const DEFAULT_STANDARD: Array<Record<string, unknown>> = [
 
 /**
  * If pricing_surface, addons_surcharges and standard_included are all empty,
- * insert default seed data. Only runs when FORCE_SEED_BASE=true (dev/fallback).
- * Idempotent: only runs when all three are empty.
- * Returns true if seed was performed.
+ * insert default seed data (10 rows each). Idempotent: only runs when all three are empty.
+ * Returns true if seed was performed, false if data already exists.
  */
 export function seedBaseIfEmpty(db: Db): boolean {
-  if (process.env.FORCE_SEED_BASE !== "true") return false;
   try {
     const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
     const hasAddons = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='addons_surcharges'").get() as { name?: string } | undefined;

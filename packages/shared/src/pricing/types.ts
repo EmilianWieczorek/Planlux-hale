@@ -124,3 +124,25 @@ export interface PricingCacheNormalized {
   dodatki: DodatkiRowNormalized[];
   standard: StandardRowNormalized[];
 }
+
+/** Single area tier for a hall variant (from pricing_surface). */
+export interface PricingTier {
+  min: number;
+  max: number;
+  price: number;
+  unit?: string;
+  sourceRow?: Record<string, unknown>;
+}
+
+/** Hall variant with grouped tiers (from relational pricing_surface). */
+export interface HallVariant {
+  variant: string;
+  name: string;
+  tiers: PricingTier[];
+  meta?: {
+    typKonstrukcji?: string;
+    typDachu?: string;
+    boki?: string;
+    dach?: string;
+  };
+}

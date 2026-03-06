@@ -28,6 +28,7 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:disableUser",
   "planlux:getOffers",
   "planlux:saveOffer",
+  "planlux:saveOfferToSupabase",
   "planlux:createOffer",
   "planlux:getNextOfferNumber",
   "planlux:loadOfferDraft",
@@ -120,6 +121,18 @@ const planlux = {
   },
   onUpdateAvailable: (cb: (info: { version: string }) => void) => {
     ipcRenderer.on("planlux:update-available", (_: unknown, info: { version: string }) => cb(info));
+  },
+  onUpdateChecking: (cb: () => void) => {
+    ipcRenderer.on("planlux:update-checking", () => cb());
+  },
+  onUpdateNotAvailable: (cb: (info: { version?: string | null }) => void) => {
+    ipcRenderer.on("planlux:update-not-available", (_: unknown, info: { version?: string | null }) => cb(info));
+  },
+  onUpdateDownloadProgress: (cb: (p: { percent: number | null; bytesPerSecond: number | null; transferred: number | null; total: number | null }) => void) => {
+    ipcRenderer.on("planlux:update-download-progress", (_: unknown, p: { percent: number | null; bytesPerSecond: number | null; transferred: number | null; total: number | null }) => cb(p));
+  },
+  onUpdateError: (cb: (e: { message: string }) => void) => {
+    ipcRenderer.on("planlux:update-error", (_: unknown, e: { message: string }) => cb(e));
   },
   onUpdateDownloaded: (cb: () => void) => {
     ipcRenderer.on("planlux:update-downloaded", () => cb());

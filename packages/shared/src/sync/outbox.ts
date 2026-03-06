@@ -46,6 +46,8 @@ export interface FlushOutboxFirstError {
   code?: string;
   message: string;
   details?: unknown;
+  /** Operation type that failed (HEARTBEAT, LOG_PDF, SEND_EMAIL, etc.). */
+  operationType?: string;
 }
 
 /**
@@ -115,11 +117,12 @@ export async function flushOutbox(deps: FlushOutboxDeps): Promise<{
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const errWithCode = err as { code?: string; details?: unknown };
-      if (!firstError && errWithCode.code === "ERR_SHEETS_BAD_JSON") {
+      if (!firstError) {
         firstError = {
           code: errWithCode.code,
           message: msg,
           details: errWithCode.details,
+          operationType: record.operation_type,
         };
       }
       const backoff = BACKOFF_MS[Math.min(record.retry_count, BACKOFF_MS.length - 1)];

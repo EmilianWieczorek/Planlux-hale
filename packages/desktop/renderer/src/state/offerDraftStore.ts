@@ -156,9 +156,16 @@ function setSyncingOfferNumber(v: boolean) {
 function saveToBackend(): Promise<void> {
   const invoke = (window as unknown as { planlux?: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).planlux?.invoke;
   if (!invoke) return Promise.resolve();
-  return invoke("planlux:saveOfferDraft", state)
+  return invoke("planlux:session")
+    .then((sessionRes: unknown) => {
+      const s = sessionRes as { session?: { userId?: string } };
+      if (!s?.session?.userId) return Promise.resolve(undefined);
+      return invoke("planlux:saveOfferDraft", state);
+    })
     .then(async (res: unknown) => {
-      const r = res as { ok?: boolean };
+      if (res === undefined) return;
+      const r = res as { ok?: boolean; code?: string };
+      if (r?.code === "AUTH_SESSION_EXPIRED") return;
       if (!r?.ok) return;
       const offerNum = state.offerNumber ?? "";
       if (!offerNum.startsWith("TEMP-")) return;

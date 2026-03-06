@@ -23,6 +23,7 @@ supabase db push       # lub: supabase migration up
 
 Migracje w `supabase/migrations/`:
 - `20250227000001_initial_schema.sql` – tabele (profiles, clients, offers, offer_counters, email_history, pdf_history, base_pricing, sync_log), RLS, trigger, RPC `rpc_finalize_offer_number`.
+- `20260227000000_base_pricing_anon_read.sql` – polityka **Allow anon read base_pricing**, żeby aplikacja desktop mogła pobrać cennik przy starcie (przed logowaniem). Bez tej migracji RLS zwraca 0 wierszy dla anon i aplikacja używa tylko fallbacku SQLite.
 - `20250227000002_finalized_at_triggers_storage.sql` – kolumna `finalized_at`, triggery `updated_at`, bucket `offer-pdfs` i polityki Storage.
 - `20260305000000_create_profiles.sql` – bezpieczna migracja uzupełniająca: upewnia się, że istnieje `public.profiles` (uuid → auth.users), RLS i trigger `handle_new_user`.
 

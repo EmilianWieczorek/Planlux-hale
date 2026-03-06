@@ -519,8 +519,20 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getPricingCache", async () => {
     try {
-      const { getCachedBase } = await import("../src/infra/db");
-      const base = getCachedBase(getDb());
+      const { getCachedBase, loadBaseFromLocalTables, saveBase } = await import("../src/infra/db");
+      const db = getDb();
+      let base = getCachedBase(db);
+      if (!base || !base.cennik?.length) {
+        const local = loadBaseFromLocalTables(db);
+        if (local && local.cennik.length > 0) {
+          try {
+            saveBase(db, local);
+          } catch {
+            // ignore
+          }
+          base = local;
+        }
+      }
       if (!base) return { ok: true, data: null };
       return { ok: true, data: base };
     } catch (e) {
@@ -671,8 +683,9 @@ export async function registerIpcHandlers(deps: {
           isOnline: () => true,
           sendEmail: createSendEmailForFlush(getDb),
         }).then((r) => {
-          if (r.processed > 0 || r.failed > 0) logger.info("[outbox] flush after sync", r);
-        }).catch((e) => logger.error("[outbox] flush after sync failed", e));
+          if (r.processed > 0) logger.info("[outbox] flush after sync", { processed: r.processed });
+          if (r.failed > 0) logger.warn("[outbox] flush had failures", { failed: r.failed, operationType: r.firstError?.operationType, reason: r.firstError?.message ?? r.firstError?.code ?? "see outbox.last_error" });
+        }).catch((e) => logger.error("[outbox] flush after sync failed", e instanceof Error ? e.message : String(e)));
       }
       return {
         ok: result.status !== "error",
@@ -865,6 +878,7 @@ export async function registerIpcHandlers(deps: {
       requireRole(["ADMIN"]);
       const email = (payload.email ?? "").trim().toLowerCase();
       if (!email) return { ok: false, error: "Email jest wymagany" };
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { ok: false, error: "Nieprawidłowy email" };
       const tempPassword = payload.password ?? "";
       const validation = validatePassword(tempPassword);
       if (!validation.ok) return { ok: false, error: validation.reason };
@@ -872,15 +886,64 @@ export async function registerIpcHandlers(deps: {
       const displayName = (payload.displayName ?? "").trim() || undefined;
 
       if (getSupabase) {
-        const { data, error } = await getSupabase().functions.invoke("create-user", {
-          body: { email, password: tempPassword, displayName, role },
+        const supabase = getSupabase();
+
+        const toSupabaseRole = (r: string): "ADMIN" | "MANAGER" | "SALES" => {
+          const rr = (r ?? "").trim().toUpperCase();
+          if (rr === "ADMIN") return "ADMIN";
+          if (rr === "SZEF" || rr === "BOSS" || rr === "MANAGER") return "MANAGER";
+          return "SALES";
+        };
+
+        const parseInvokeError = (err: unknown, data: unknown): { message: string; status?: number; body?: unknown } => {
+          const e = err as { message?: string; name?: string; context?: { status?: number; body?: unknown } } | null;
+          const status = e?.context?.status;
+          const bodyRaw = e?.context?.body;
+          const bodyParsed = (() => {
+            if (typeof bodyRaw === "string") {
+              try { return JSON.parse(bodyRaw) as unknown; } catch { return bodyRaw; }
+            }
+            return bodyRaw;
+          })();
+          const dataErr = (data as { error?: unknown } | null)?.error;
+          const bodyErr = (bodyParsed as { error?: unknown } | null)?.error;
+          const msg =
+            (typeof bodyErr === "string" && bodyErr.trim()) ||
+            (typeof dataErr === "string" && dataErr.trim()) ||
+            (typeof e?.message === "string" && e.message.trim()) ||
+            "Błąd tworzenia użytkownika (Edge Function create-user)";
+          return { message: msg, status, body: bodyParsed };
+        };
+
+        const { data, error } = await supabase.functions.invoke("create-user", {
+          body: { email, password: tempPassword, displayName, role: toSupabaseRole(role) },
         });
+
+        // When Edge Function returns non-2xx, supabase-js sets `error` with generic message.
         if (error) {
-          const msg = (data as { error?: string })?.error ?? error.message ?? "Błąd tworzenia użytkownika. Użyj Supabase Dashboard → Authentication → Users lub wdróż Edge Function create-user.";
-          return { ok: false, error: msg };
+          const parsed = parseInvokeError(error, data);
+          logger.error("[admin] createUser invoke(create-user) failed", {
+            email,
+            status: parsed.status,
+            message: parsed.message,
+            body: parsed.body,
+          });
+          const msgLower = parsed.message.toLowerCase();
+          if (parsed.status === 401 || msgLower.includes("missing authorization") || msgLower.includes("invalid token")) {
+            return { ok: false, error: "Brak sesji Supabase. Zaloguj się online jako ADMIN i spróbuj ponownie." };
+          }
+          if (parsed.status === 403 || msgLower.includes("forbidden")) {
+            return { ok: false, error: "Brak uprawnień w Supabase (wymagane: profil roli ADMIN)." };
+          }
+          if (msgLower.includes("already registered") || msgLower.includes("already exists") || msgLower.includes("duplicate")) {
+            return { ok: false, error: "Użytkownik z tym adresem email już istnieje." };
+          }
+          return { ok: false, error: parsed.message };
         }
         if ((data as { ok?: boolean })?.ok !== true) {
-          return { ok: false, error: (data as { error?: string })?.error ?? "Błąd tworzenia użytkownika" };
+          const msg = (data as { error?: string })?.error ?? "Błąd tworzenia użytkownika";
+          logger.error("[admin] createUser create-user returned ok=false", { email, data });
+          return { ok: false, error: msg };
         }
       } else {
         const appConfig = getConfig();
@@ -1106,6 +1169,63 @@ export async function registerIpcHandlers(deps: {
       logger.error("saveOffer failed", e);
       if (e instanceof Error && (e.message.includes("SQLITE_CONSTRAINT") || e.message.includes("constraint"))) throw dbErrors.constraint();
       throw AppError.fromUnknown(e);
+    }
+  }));
+
+  /** Save offer to Supabase `public.offers` (cloud CRM). Blocks PDF generation on failure. */
+  ipcMain.handle("planlux:saveOfferToSupabase", wrap("planlux:saveOfferToSupabase", async (_, input: unknown) => {
+    try {
+      const user = requireAuth();
+      if (!getSupabase) return { ok: false, error: "Supabase nie jest skonfigurowany" };
+      const supabase = getSupabase();
+
+      const i = input as {
+        userId?: string;
+        clientName?: string;
+        clientEmail?: string;
+        clientPhone?: string;
+        clientCompany?: string;
+        clientAddress?: string;
+        variant?: string;
+        width?: number;
+        length?: number;
+        height?: number;
+        area?: number;
+        totalPrice?: number;
+      };
+
+      const clientName = (i.clientName ?? "").trim();
+      const variant = (i.variant ?? "").trim();
+      const width = Number(i.width ?? 0);
+      const length = Number(i.length ?? 0);
+      const area = Number(i.area ?? width * length);
+      const totalPrice = Number(i.totalPrice ?? 0);
+      const height = i.height != null ? Number(i.height) : undefined;
+
+      if (!clientName) return { ok: false, error: "Brak danych klienta" };
+      if (!variant) return { ok: false, error: "Brak wariantu hali" };
+      if (!(width > 0) || !(length > 0) || !(area > 0)) return { ok: false, error: "Nieprawidłowe wymiary hali" };
+      if (!(totalPrice > 0)) return { ok: false, error: "Nieprawidłowa cena (brak wyceny)" };
+
+      const { saveOffer } = await import("@planlux/core");
+      const saved = await saveOffer(supabase, {
+        userId: user.id,
+        clientName,
+        clientEmail: i.clientEmail,
+        clientPhone: i.clientPhone,
+        clientCompany: i.clientCompany,
+        clientAddress: i.clientAddress,
+        variant,
+        width,
+        length,
+        height,
+        area,
+        totalPrice,
+      });
+      return { ok: true, offer: saved };
+    } catch (e) {
+      logger.error("[offers] saveOfferToSupabase failed", e);
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }));
 
@@ -1785,7 +1905,15 @@ export async function registerIpcHandlers(deps: {
   });
   ipcMain.handle("planlux:saveOfferDraft", async (_, draft: unknown) => {
     try {
-      const user = requireAuth();
+      let user: SessionUser;
+      try {
+        user = requireAuth();
+      } catch (e) {
+        if (e instanceof Error && e.message === "AUTH_SESSION_EXPIRED") {
+          return { ok: false, code: "AUTH_SESSION_EXPIRED", message: "Zaloguj się, aby zapisać szkic." };
+        }
+        throw e;
+      }
       fs.mkdirSync(path.dirname(OFFER_DRAFT_PATH), { recursive: true });
       fs.writeFileSync(OFFER_DRAFT_PATH, JSON.stringify(draft, null, 0), "utf-8");
 
@@ -1929,6 +2057,9 @@ export async function registerIpcHandlers(deps: {
 
       return { ok: true };
     } catch (e) {
+      if (e instanceof Error && e.message === "AUTH_SESSION_EXPIRED") {
+        return { ok: false, code: "AUTH_SESSION_EXPIRED", message: "Zaloguj się, aby zapisać szkic." };
+      }
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
       }

@@ -58,8 +58,13 @@ function matchBaseRow(
   areaM2: number
 ): BasePriceResult | BasePriceNoMatch {
   const rows = cennik.filter((r) => r.wariant_hali === variantHali);
+  const debug = process.env.LOG_LEVEL === "debug";
 
   if (rows.length === 0) {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.debug("[pricing] no base rows for variant", { variantHali, areaM2 });
+    }
     return {
       matched: false,
       reason: "Brak ceny – brak wariantu w cenniku",
@@ -86,6 +91,16 @@ function matchBaseRow(
     });
     const row = sorted[0];
     const totalBase = row.cena * areaM2;
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.debug("[pricing] base tier matched", {
+        variantHali,
+        areaM2,
+        tier: { areaMin: row.area_min_m2, areaMax: row.area_max_m2, cenaPerM2: row.cena, unit: row.stawka_jednostka },
+        label: row.Nazwa ?? variantHali,
+        sourceRowKeys: Object.keys(row as unknown as Record<string, unknown>).slice(0, 30),
+      });
+    }
     return {
       matched: true,
       row,
@@ -133,6 +148,17 @@ function matchBaseRow(
   }
 
   const totalBase = chosenRow.cena * areaM2;
+  if (debug) {
+    // eslint-disable-next-line no-console
+    console.debug("[pricing] base tier fallback matched", {
+      variantHali,
+      areaM2,
+      fallbackReason,
+      tier: { areaMin: chosenRow.area_min_m2, areaMax: chosenRow.area_max_m2, cenaPerM2: chosenRow.cena, unit: chosenRow.stawka_jednostka },
+      label: chosenRow.Nazwa ?? variantHali,
+      sourceRowKeys: Object.keys(chosenRow as unknown as Record<string, unknown>).slice(0, 30),
+    });
+  }
   return {
     matched: true,
     row: chosenRow,
@@ -335,6 +361,16 @@ export function calculatePrice(
   const dodatki = normalizeDodatki(data.dodatki);
   const standard = normalizeStandard(data.standard);
 
+  if (process.env.LOG_LEVEL === "debug") {
+    const uniqueVariants = new Set(cennik.map((r) => r.wariant_hali).filter(Boolean));
+    // eslint-disable-next-line no-console
+    console.debug("[pricing] input", {
+      variantHali: input.variantHali,
+      areaM2: input.areaM2,
+      cennikRows: cennik.length,
+      groupedVariants: uniqueVariants.size,
+    });
+  }
   const base = matchBaseRow(cennik, input.variantHali, input.areaM2);
 
   if (!base.matched) {

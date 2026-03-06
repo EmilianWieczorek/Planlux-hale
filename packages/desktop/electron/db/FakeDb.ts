@@ -51,7 +51,7 @@ export class FakeDb implements DbLike {
     this.execCalls.push(sql);
   }
 
-  transaction<T>(fn: () => T): T {
-    return fn();
+  transaction<T>(fn: () => T): () => T {
+    return () => fn();
   }
 }

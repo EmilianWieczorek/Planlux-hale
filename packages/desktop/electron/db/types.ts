@@ -13,7 +13,8 @@ export interface StatementLike {
 export interface DbLike {
   prepare(sql: string): StatementLike;
   exec(sql: string): void;
-  transaction<T>(fn: () => T): T;
+  /** better-sqlite3: returns a callable transaction wrapper */
+  transaction<T>(fn: () => T): () => T;
 }
 
 /** Allowed ORDER BY keys for offer/list queries – map user input to safe column expression. */

@@ -513,6 +513,32 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       if (!offerNumber) throw new Error("Nie udało się wygenerować numeru oferty. Użyj IPC (main). Spróbuj ponownie.");
       actions.setOfferNumber(offerNumber);
     }
+
+    // Save offer to Supabase before generating PDF (cloud CRM requirement).
+    if (!userId) {
+      throw new Error("Zaloguj się, aby zapisać ofertę w chmurze.");
+    }
+    const saveRes = (await api("planlux:saveOfferToSupabase", {
+      userId,
+      clientName: clientName || "Klient",
+      clientEmail: clientEmail || undefined,
+      clientPhone: clientPhone || undefined,
+      clientCompany: companyName || undefined,
+      clientAddress: clientAddress || undefined,
+      variant: variantHali,
+      width: w,
+      length: l,
+      height: h,
+      area: areaM2,
+      totalPrice: r.result.totalPln ?? 0,
+    })) as { ok: boolean; offer?: { id: string }; error?: string };
+    if (!saveRes?.ok || !saveRes.offer?.id) {
+      const msg = saveRes?.error ? String(saveRes.error) : "Nie udało się zapisać oferty w Supabase.";
+      throw new Error(msg.length > 160 ? msg.slice(0, 157) + "…" : msg);
+    }
+    if (process.env.LOG_LEVEL === "debug") {
+      console.debug("[offers] offer saved (from calculator)", { id: saveRes.offer.id });
+    }
     const payload = {
       userId,
       sellerName: userDisplayName?.trim() || "Planlux",

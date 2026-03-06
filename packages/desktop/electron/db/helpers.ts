@@ -25,5 +25,6 @@ export function qRun(db: DbLike, sql: string, params?: SqlParams): { changes: nu
 }
 
 export function withTx<T>(db: DbLike, fn: () => T): T {
-  return db.transaction(fn);
+  const tx = db.transaction(fn);
+  return tx();
 }
