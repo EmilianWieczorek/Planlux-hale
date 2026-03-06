@@ -58,11 +58,15 @@ Deno.serve(async (req) => {
     const allowedRoles = ["ADMIN", "MANAGER", "SALES"];
     const profileRole = allowedRoles.includes(newRole) ? newRole : "SALES";
 
-    await supabaseAuth.from("profiles").update({
+    // Update profile (trigger already inserted row with id, email). Do not set updated_at – profiles table may not have that column (e.g. 20260305 migration).
+    const { error: updateError } = await supabaseAuth.from("profiles").update({
       display_name: (body.displayName ?? "").trim() || null,
       role: profileRole,
-      updated_at: new Date().toISOString(),
     }).eq("id", newUser.user.id);
+
+    if (updateError) {
+      return new Response(JSON.stringify({ ok: false, error: `Profile update failed: ${updateError.message}` }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
 
     return new Response(
       JSON.stringify({ ok: true, id: newUser.user.id, email: newUser.user.email }),

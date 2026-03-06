@@ -3,6 +3,7 @@
  * Returns normalized { ok, data?, error?: { code, message } } and keeps legacy { user, mustChangePassword } for UI.
  */
 
+import { normalizeRoleRbac } from "@planlux/shared";
 import { getOnlineState } from "../net/online";
 import { hashPassword, verifyPassword, isLegacyHash } from "./password";
 import type { SessionUser } from "./session";
@@ -63,13 +64,6 @@ type SupabaseLogin = (email: string, password: string) => Promise<
   | { ok: true; user: { id: string; email: string; role: string; name?: string } }
   | { ok: false; error?: string }
 >;
-
-function normalizeRole(r: string): string {
-  const s = (r ?? "").trim().toUpperCase();
-  if (s === "ADMIN") return "ADMIN";
-  if (s === "SZEF" || s === "BOSS" || s === "MANAGER") return "SZEF";
-  return "HANDLOWIEC";
-}
 
 /** Map normalized role (ADMIN/SZEF/HANDLOWIEC) to DB enum. Tables may use (ADMIN,BOSS,SALESPERSON) or (HANDLOWIEC,SZEF,ADMIN). */
 function roleForDb(db: DbLike, normalizedRole: string): string {
@@ -157,10 +151,14 @@ export async function performLogin(
       const hasPua = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
       db.prepare("UPDATE users SET password_hash = ?, password_salt = ?, password_algo_version = ? WHERE id = ?").run(upgraded.hash, upgraded.salt, upgraded.version, row.id);
     }
+    const role = normalizeRoleRbac(row.role);
+    if (process.env.LOG_LEVEL === "debug" || process.env.NODE_ENV !== "production") {
+      console.log("[auth] role from local DB (offline fallback)", { email: emailNorm, rowRole: row.role, effectiveRole: role });
+    }
     const user: SessionUser = {
       id: row.id,
       email: row.email,
-      role: normalizeRole(row.role),
+      role,
       displayName: row.display_name ?? null,
     };
     return {
@@ -177,7 +175,10 @@ export async function performLogin(
         : await deps.backendLogin(deps.backendUrl, emailNorm, password);
       if (loginResult.ok && loginResult.user) {
         const backendUser = loginResult.user;
-        const role = normalizeRole(backendUser.role ?? "HANDLOWIEC");
+        const role = normalizeRoleRbac(backendUser.role ?? "HANDLOWIEC");
+        if (process.env.LOG_LEVEL === "debug" || process.env.NODE_ENV !== "production") {
+          console.log("[auth] role from backend (online)", { email: emailNorm, backendRole: backendUser.role, effectiveRole: role });
+        }
         const displayName = (backendUser.name ?? "").trim() || null;
         const hashed = hashPassword(password);
         const now = new Date().toISOString();

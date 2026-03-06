@@ -256,6 +256,12 @@ export async function generatePdfFromTemplate(
     logger.info("[pdf] template source", fromDist ? "dist/assets" : "packages/desktop/assets (dev)");
   }
   if (!templateDir) {
+    logger.error("[pdf] DIAGNOSTYKA: templateDir is null", {
+      appPath: app.getAppPath(),
+      resourcesPath: process.resourcesPath ?? "",
+      cwd: process.cwd(),
+      isPackaged: app.isPackaged,
+    });
     return { ok: false, error: "Szablon Planlux-PDF nie został znaleziony (brak index.html w assets/pdf-template/Planlux-PDF).", stage: "TEMPLATE_MISSING" };
   }
 

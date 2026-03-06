@@ -72,6 +72,19 @@ export function getPdfTemplateDir(): string | null {
   return null;
 }
 
+/** Returns the list of candidate paths tried for template resolution (for DIAGNOSTYKA when template not found). */
+export function getPdfTemplateDirCandidates(): string[] {
+  const appPath = app.getAppPath();
+  const resourcesPath = process.resourcesPath || "";
+  return [
+    path.join(appPath, TEMPLATE_SUBDIR),
+    path.join(resourcesPath, "app.asar", TEMPLATE_SUBDIR),
+    path.join(resourcesPath, TEMPLATE_SUBDIR),
+    path.join(process.cwd(), TEMPLATE_SUBDIR),
+    path.join(__dirname, "..", "..", TEMPLATE_SUBDIR),
+  ].map((dir) => path.normalize(dir));
+}
+
 /**
  * Zwraca URL file:// dla assetu względem katalogu template (np. logo, fonty).
  * Użyj w HTML/CSS gdy template ładuje assety z zewnątrz (np. <img src="...">).

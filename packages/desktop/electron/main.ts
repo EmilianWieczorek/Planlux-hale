@@ -607,7 +607,7 @@ async function runStartup(): Promise<void> {
   }) as unknown as ApiClient;
 
   logger.info("[app] started", {
-    version: config.appVersion,
+    version: app.getVersion(),
     platform: process.platform,
     env: process.env.VITE_DEV_SERVER_URL ? "dev" : "production",
   });
@@ -639,8 +639,15 @@ async function runStartup(): Promise<void> {
     getDbPath: () => dbPath,
     apiClient,
     getSupabase: () => supabase,
-    config: { appVersion: config.appVersion, updatesUrl: config.updatesUrl },
+    config: { appVersion: app.getVersion(), updatesUrl: config.updatesUrl },
     logger,
+    sendToRenderer: (channel: string, payload?: unknown) => {
+      try {
+        mainWindow?.webContents?.send(channel, payload);
+      } catch {
+        // ignore
+      }
+    },
   });
   console.log("[IPC] Planlux IPC handlers initialized");
   // Promote ADMIN_INITIAL_EMAIL to ADMIN so local/Supabase-synced user gets admin role.
@@ -731,12 +738,34 @@ async function runStartup(): Promise<void> {
 
   createWindow();
 
-  // Auto-update: check on startup (tylko w produkcji, gdy jest opublikowany release)
+  // Auto-update: custom Supabase-based when Supabase configured; otherwise electron-updater
   {
     const isDev = !!process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
-    if (!isDev) {
+    if (!isDev && supabase) {
+      // Custom updater: check Supabase app_releases (do not block startup)
+      (async () => {
+        try {
+          const { checkForUpdates } = await import("./updates/updateService");
+          const { setStatus } = await import("./updates/updateState");
+          const result = await checkForUpdates({
+            getVersion: () => app.getVersion(),
+            getSupabase: () => supabase,
+            logger,
+          });
+          if (result.updateAvailable && result.release) {
+            setStatus("available", result.release);
+          } else {
+            setStatus("idle");
+          }
+        } catch (e) {
+          logger.warn("[updates] startup check failed", e);
+          const { setStatus } = await import("./updates/updateState");
+          setStatus("idle");
+        }
+      })();
+    } else if (!isDev) {
+      // Fallback: electron-updater when Supabase not configured
       try {
-        // If updatesUrl is configured and points at a generic provider base, prefer it over build-time publish config.
         const updatesUrl = (config.updatesUrl ?? "").trim();
         if (updatesUrl && typeof autoUpdater.setFeedURL === "function") {
           try {
@@ -750,12 +779,12 @@ async function runStartup(): Promise<void> {
         // ignore
       }
 
-      autoUpdater.autoDownload = false; // explicit user action (Pobierz)
+      autoUpdater.autoDownload = false;
       autoUpdater.autoInstallOnAppQuit = true;
 
       const send = (channel: string, payload?: unknown) => {
         try {
-          mainWindow?.webContents.send(channel, payload);
+          mainWindow?.webContents?.send(channel, payload);
         } catch {
           // ignore
         }
@@ -795,7 +824,6 @@ async function runStartup(): Promise<void> {
         send("planlux:update-error", { message: msg });
       });
 
-      // Single startup check (no loops).
       const check = typeof autoUpdater.checkForUpdates === "function"
         ? autoUpdater.checkForUpdates.bind(autoUpdater)
         : autoUpdater.checkForUpdatesAndNotify.bind(autoUpdater);

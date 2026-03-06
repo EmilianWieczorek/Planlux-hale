@@ -63,6 +63,16 @@ export function setCurrentToken(token: string | null): void {
   currentToken = token;
 }
 
+/** Update the current session's role and/or displayName in place (e.g. after role repair from Supabase). */
+export function updateCurrentSessionUser(updates: { role?: string; displayName?: string | null }): void {
+  const t = currentToken;
+  if (!t) return;
+  const s = sessions.get(t);
+  if (!s) return;
+  if (updates.role !== undefined) (s as Session).role = updates.role;
+  if (updates.displayName !== undefined) (s as Session).displayName = updates.displayName ?? null;
+}
+
 export function revokeSession(token?: string | null): void {
   const t = token ?? currentToken;
   if (t) sessions.delete(t);

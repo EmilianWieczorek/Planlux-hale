@@ -4,6 +4,7 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { normalizeRoleRbac } from "@planlux/shared";
 import { logger } from "../logger";
 import { AppError } from "../errors/AppError";
 
@@ -11,11 +12,9 @@ export type SupabaseAuthUser = { id: string; email: string; role: string; name?:
 export type LoginResponse = { ok: true; user: SupabaseAuthUser } | { ok: false; error?: string };
 export type ListUsersResponse = { ok: true; users: Array<{ email: string; role: string; name?: string; active?: boolean }> } | { ok: false; error?: string };
 
-function normalizeRole(r: string): string {
-  const s = (r ?? "").trim().toUpperCase();
-  if (s === "ADMIN") return "ADMIN";
-  if (s === "SZEF" || s === "BOSS" || s === "MANAGER") return "SZEF";
-  return "HANDLOWIEC";
+/** Normalize raw role to app role (uses shared rbac). */
+function normalizeRoleFromProfile(r: string): string {
+  return normalizeRoleRbac(r);
 }
 
 /**
@@ -110,9 +109,10 @@ export async function loginViaSupabase(
         { expose: true, details: { hint: "Run: supabase db push" } }
       );
     }
-    logger.child("auth").warn("Supabase profile fetch failed – continuing with defaults", {
+    logger.child("auth").warn("[auth] role from Supabase: profile fetch failed – fallback to HANDLOWIEC", {
       userId,
       errorMessage: msg,
+      defaultRole,
     });
     return {
       ok: true,
@@ -126,7 +126,7 @@ export async function loginViaSupabase(
   }
 
   if (!profile) {
-    logger.child("auth").warn("Profile missing for user after login – continuing with defaults", { userId, email: emailNorm });
+    logger.child("auth").warn("[auth] role from Supabase: profile null – fallback to HANDLOWIEC (profile returned null)", { userId, email: emailNorm, defaultRole });
     try {
       const { error: insertErr } = await supabase.from("profiles").insert({
         id: userId,
@@ -155,8 +155,10 @@ export async function loginViaSupabase(
     };
   }
 
-  const role = normalizeRole((profile.role as string) ?? defaultRole);
+  const profileRoleRaw = (profile.role as string) ?? defaultRole;
+  const role = normalizeRoleFromProfile(profileRoleRaw);
   const displayName = (profile.display_name as string)?.trim() || displayNameFromEmail;
+  logger.child("auth").info("[auth] role from Supabase profile", { userId, profileRoleRaw, effectiveRole: role });
   return {
     ok: true,
     user: {
@@ -183,12 +185,33 @@ export async function listProfilesFromSupabase(supabase: SupabaseClient): Promis
 
   const users = (data ?? []).map((row) => ({
     email: (row.email as string) ?? "",
-    role: normalizeRole((row.role as string) ?? "SALES"),
+    role: normalizeRoleFromProfile((row.role as string) ?? "SALES"),
     name: (row.display_name as string) ?? undefined,
     active: true,
   }));
 
   return { ok: true, users };
+}
+
+/**
+ * Fetch profile role for a user by Supabase auth id (for role repair / hydrate). Returns normalized role or null if fetch fails.
+ */
+export async function getProfileRoleByUserId(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<string | null> {
+  const { data: profile, error } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (error) {
+    logger.child("auth").warn("[auth] getProfileRoleByUserId failed", { userId, errorMessage: error.message });
+    return null;
+  }
+  if (!profile || profile.role == null) return null;
+  return normalizeRoleFromProfile(String(profile.role));
 }
 
 /**

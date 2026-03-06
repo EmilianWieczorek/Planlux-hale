@@ -34,10 +34,11 @@ export function canUseSalesFeatures(role: string | null | undefined): boolean {
   return r === "HANDLOWIEC" || r === "SZEF" || r === "ADMIN";
 }
 
-/** Zwraca rolę znormalizowaną do HANDLOWIEC | SZEF | ADMIN. */
+/** Zwraca rolę znormalizowaną do HANDLOWIEC | SZEF | ADMIN. Central mapping: SALES→HANDLOWIEC, MANAGER→SZEF, ADMIN→ADMIN. */
 export function normalizeRole(role: string | null | undefined): Role {
   const r = (role ?? "").trim().toUpperCase();
   if (r === "ADMIN") return "ADMIN";
   if (r === "SZEF" || r === "BOSS" || r === "MANAGER") return "SZEF";
+  if (r === "SALES" || r === "HANDLOWIEC") return "HANDLOWIEC";
   return "HANDLOWIEC";
 }

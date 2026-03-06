@@ -72,6 +72,7 @@ export type { SmtpTransport, SendMailParams } from "./email/smtpSender";
 export { SCHEMA_SQL } from "./db/schema";
 
 export type { OfferCrm, OfferStatus, EmailHistoryRecord, EmailHistoryStatus, EventLogEntry, UserRole } from "./crm/types";
+export type { AppRelease } from "./types/appRelease";
 
 export {
   OFFER_STATUSES,

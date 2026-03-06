@@ -10,6 +10,8 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:syncUsers",
   "planlux:logout",
   "planlux:session",
+  "planlux:auth:debugCurrentUser",
+  "planlux:auth:repairCurrentUserRole",
   "planlux:changePassword",
   "planlux:endSession",
   "planlux:getPricingCache",
@@ -94,6 +96,11 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:updates:getCurrentVersion",
   "planlux:updates:openExternal",
   "planlux:updates:getUpdatesUrl",
+  "planlux:updates:check",
+  "planlux:updates:getState",
+  "planlux:updates:download",
+  "planlux:updates:install",
+  "planlux:updates:dismiss",
   "shell:openPath",
   "shell:showItemInFolder",
 ]);
@@ -118,6 +125,27 @@ const planlux = {
     getCurrentVersion: () => safeInvoke("planlux:updates:getCurrentVersion"),
     openExternal: (url: string) => safeInvoke("planlux:updates:openExternal", url),
     getUpdatesUrl: () => safeInvoke("planlux:updates:getUpdatesUrl"),
+    check: () => safeInvoke("planlux:updates:check"),
+    getState: () => safeInvoke("planlux:updates:getState"),
+    download: () => safeInvoke("planlux:updates:download"),
+    install: () => safeInvoke("planlux:updates:install"),
+    dismiss: () => safeInvoke("planlux:updates:dismiss"),
+  },
+  /** Custom updater events (Supabase-based; use when planlux.updates.check is used). */
+  onUpdateCheckingCustom: (cb: () => void) => {
+    ipcRenderer.on("planlux:update:checking", () => cb());
+  },
+  onUpdateAvailableCustom: (cb: (info: { release: { version: string; title: string; changelog: string; download_url: string; sha256: string; mandatory: boolean }; version: string }) => void) => {
+    ipcRenderer.on("planlux:update:available", (_: unknown, info: { release: unknown; version: string }) => cb(info as { release: { version: string; title: string; changelog: string; download_url: string; sha256: string; mandatory: boolean }; version: string }));
+  },
+  onUpdateProgress: (cb: (p: { percent: number; bytesPerSecond: number | null; transferred: number; total: number | null }) => void) => {
+    ipcRenderer.on("planlux:update:progress", (_: unknown, p: { percent: number; bytesPerSecond: number | null; transferred: number; total: number | null }) => cb(p));
+  },
+  onUpdateDownloadedCustom: (cb: (info: { version: string }) => void) => {
+    ipcRenderer.on("planlux:update:downloaded", (_: unknown, info: { version: string }) => cb(info));
+  },
+  onUpdateErrorCustom: (cb: (e: { message: string }) => void) => {
+    ipcRenderer.on("planlux:update:error", (_: unknown, e: { message: string }) => cb(e));
   },
   onUpdateAvailable: (cb: (info: { version: string }) => void) => {
     ipcRenderer.on("planlux:update-available", (_: unknown, info: { version: string }) => cb(info));
@@ -189,3 +217,12 @@ const api = {
 
 contextBridge.exposeInMainWorld("planlux", planlux);
 contextBridge.exposeInMainWorld("api", api);
+
+/** DEV ONLY: auth role debug – inspect session/local/Supabase role and run repair. Not exposed in production. */
+const isDev = typeof process !== "undefined" && process.env?.NODE_ENV !== "production";
+if (isDev) {
+  contextBridge.exposeInMainWorld("__planluxAuthDebug", {
+    debugCurrentUser: () => safeInvoke("planlux:auth:debugCurrentUser"),
+    repairCurrentUserRole: () => safeInvoke("planlux:auth:repairCurrentUserRole"),
+  });
+}

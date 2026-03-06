@@ -122,7 +122,7 @@ export function MainLayout({ user, onLogout, api }: Props) {
   const [emailSnackbar, setEmailSnackbar] = useState<{ message: string; severity: "success" | "info" | "error" } | null>(null);
 
   const canAccessAdmin = canAccessAdminPanel(user.role);
-  const isBossOrAdmin = user.role === "ADMIN" || user.role === "SZEF"; // widok wszystkich ofert
+  const isBossOrAdmin = canAccessAdmin; // single source: ADMIN/SZEF see admin panel and all offers
 
   const handleClearGlobal = () => {
     offerDraftStore.resetGlobal();

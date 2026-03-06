@@ -11,10 +11,11 @@ import { hashPassword, verifyPassword, validatePassword, isLegacyHash, LEGACY_SA
 import * as session from "./auth/session";
 import { performLogin } from "./auth/login";
 import type { GeneratePdfPayload } from "@planlux/shared";
+import { normalizeRoleRbac } from "@planlux/shared";
 import { generatePdfPipeline, getTestPdfFileName, getE2EPlaceholderPdfBuffer } from "./pdf/generatePdf";
 import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTemplateOptions } from "./pdf/generatePdfFromTemplate";
 import { getPdfOutputDir } from "./pdf/generatePdf";
-import { getPdfTemplateDir } from "./pdf/pdfPaths";
+import { getPdfTemplateDir, getPdfTemplateDirCandidates } from "./pdf/pdfPaths";
 import { getE2EConfig } from "./e2eEnv";
 
 import { createSendEmailForFlush } from "./smtpSend";
@@ -94,11 +95,9 @@ function serializeError(err: unknown): { message: string; code: string | null; r
 const ALLOWED_ROLES = ["ADMIN", "SZEF", "HANDLOWIEC"] as const;
 type AllowedRole = (typeof ALLOWED_ROLES)[number];
 
+/** Use shared RBAC role normalization (SALES→HANDLOWIEC, MANAGER→SZEF, ADMIN→ADMIN). */
 function normalizeRole(input: string): AllowedRole {
-  const r = (input ?? "").trim().toUpperCase();
-  if (r === "ADMIN") return "ADMIN";
-  if (r === "SZEF" || r === "BOSS" || r === "MANAGER") return "SZEF";
-  return "HANDLOWIEC";
+  return normalizeRoleRbac(input) as AllowedRole;
 }
 
 function uuid(): string {
@@ -255,8 +254,14 @@ export async function registerIpcHandlers(deps: {
   getSupabase?: () => import("@supabase/supabase-js").SupabaseClient;
   config: { appVersion: string; updatesUrl?: string };
   logger: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void };
+  /** Send event to renderer (for custom updater: planlux:update:*). */
+  sendToRenderer?: (channel: string, payload?: unknown) => void;
 }) {
-  const { getDb, getDbPath, config, apiClient, getSupabase, logger } = deps;
+  const { getDb, getDbPath, config, apiClient, getSupabase, logger, sendToRenderer } = deps;
+
+  // Custom updater: wire state notifications to renderer
+  const { setNotifySend } = await import("./updates/updateState");
+  setNotifySend(sendToRenderer ?? null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const wrap = (channel: string, handler: (event: unknown, ...args: any[]) => Promise<unknown> | unknown) =>
     wrapIpcHandler(channel, handler as (event: unknown, ...args: unknown[]) => Promise<unknown>, { log: (msg, meta) => logger.error(msg, meta) });
@@ -353,6 +358,49 @@ export async function registerIpcHandlers(deps: {
     }
   }
 
+  /**
+   * Resolve effective role for current user: compare Supabase profile vs local SQLite, repair local if mismatch, return final user + role.
+   * Used after login and on planlux:session to self-heal role drift.
+   */
+  async function hydrateEffectiveCurrentUser(userId: string, email: string): Promise<{
+    user: SessionUser;
+    effectiveRole: string;
+    repaired: boolean;
+    roleFromSupabase: string | null;
+    roleFromLocalBefore: string | null;
+  }> {
+    const db = getDb();
+    const localRow = db.prepare("SELECT id, email, role, display_name FROM users WHERE email = ?").get(email.trim().toLowerCase()) as
+      | { id: string; email: string; role: string; display_name: string | null }
+      | undefined;
+    const roleFromLocalBefore = localRow ? normalizeRole(localRow.role) : null;
+    let roleFromSupabase: string | null = null;
+    if (getSupabase) {
+      const { getProfileRoleByUserId } = await import("./auth/authSupabase");
+      roleFromSupabase = await getProfileRoleByUserId(getSupabase(), userId);
+    }
+    let effectiveRole: string = roleFromLocalBefore ?? "HANDLOWIEC";
+    let repaired = false;
+    if (roleFromSupabase != null && localRow && roleFromSupabase !== roleFromLocalBefore) {
+      logger.info("[auth] repairing local role from X to Y", {
+        email,
+        from: localRow.role,
+        to: roleFromSupabase,
+      });
+      db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").run(roleFromSupabase, new Date().toISOString(), email.trim().toLowerCase());
+      effectiveRole = roleFromSupabase;
+      repaired = true;
+    }
+    const displayName = localRow?.display_name ?? null;
+    const user: SessionUser = {
+      id: localRow?.id ?? userId,
+      email: email.trim().toLowerCase(),
+      role: effectiveRole,
+      displayName: displayName ?? null,
+    };
+    return { user, effectiveRole, repaired, roleFromSupabase, roleFromLocalBefore };
+  }
+
   ipcMain.handle("planlux:syncUsers", wrap("planlux:syncUsers", async () => {
     const result = await syncUsersFromBackend();
     if (!result.ok) throw new AppError("SYNC_USERS_ERROR", result.error ?? "Błąd synchronizacji użytkowników.", { expose: true });
@@ -421,12 +469,34 @@ export async function registerIpcHandlers(deps: {
           db.prepare("UPDATE users SET role = 'ADMIN' WHERE LOWER(TRIM(email)) = ?").run(adminEmail);
           result.user = { ...result.user, role: "ADMIN" };
         }
-        const sess = session.createSession(result.user);
-        currentUser = result.user;
-        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), result.user.id, config.appVersion);
+        // After Supabase login: sync users, then resolve effective role (self-heal if Supabase ADMIN vs stale local)
+        let roleForSession = result.user.role;
+        if (getSupabase) {
+          const syncResult = await syncUsersFromBackend();
+          if (syncResult.ok) {
+            const localRow = db.prepare("SELECT role FROM users WHERE email = ?").get(emailNorm) as { role: string } | undefined;
+            logger.info("[auth] role from local DB before repair", { email: emailNorm, localRole: localRow?.role ?? null });
+            const supabaseRole = result.user.role;
+            if (supabaseRole === "ADMIN" && localRow && normalizeRole(localRow.role) !== "ADMIN") {
+              db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").run("ADMIN", new Date().toISOString(), emailNorm);
+              logger.info("[auth] repairing local role from X to Y", { email: emailNorm, from: localRow.role, to: "ADMIN" });
+              const afterRow = db.prepare("SELECT role FROM users WHERE email = ?").get(emailNorm) as { role: string };
+              roleForSession = normalizeRole(afterRow.role);
+              logger.info("[auth] role from local DB after repair", { email: emailNorm, localRole: afterRow.role, effectiveRole: roleForSession });
+            } else if (localRow) {
+              roleForSession = normalizeRole(localRow.role);
+              logger.info("[auth] role from local DB after sync", { email: emailNorm, localRole: localRow.role, effectiveRole: roleForSession });
+            }
+          }
+        }
+        const userForSession: SessionUser = { id: result.user.id, email: result.user.email, role: roleForSession, displayName: result.user.displayName ?? null };
+        const sess = session.createSession(userForSession);
+        currentUser = userForSession;
+        logger.info("[auth] loaded current user (session)", { id: userForSession.id, email: userForSession.email, role: userForSession.role });
+        db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), userForSession.id, config.appVersion);
         return {
           ok: true,
-          user: { id: result.user.id, email: result.user.email, role: result.user.role, displayName: result.user.displayName },
+          user: { id: userForSession.id, email: userForSession.email, role: userForSession.role, displayName: userForSession.displayName },
           mustChangePassword: result.mustChangePassword,
           token: sess.token,
         };
@@ -478,6 +548,46 @@ export async function registerIpcHandlers(deps: {
     }
   }));
 
+  ipcMain.handle("planlux:auth:debugCurrentUser", wrap("planlux:auth:debugCurrentUser", async () => {
+    const s = session.getCurrentSession();
+    if (!s || !session.isSessionValid(s)) {
+      return { ok: false, session: null, roleFromSession: null, roleFromLocal: null, roleFromSupabase: null, effectiveRole: null, mismatch: false };
+    }
+    const db = getDb();
+    const localRow = db.prepare("SELECT role FROM users WHERE email = ?").get(s.email) as { role: string } | undefined;
+    const roleFromLocal = localRow ? normalizeRole(localRow.role) : null;
+    let roleFromSupabase: string | null = null;
+    if (getSupabase) {
+      const { getProfileRoleByUserId } = await import("./auth/authSupabase");
+      roleFromSupabase = await getProfileRoleByUserId(getSupabase(), s.userId);
+    }
+    const effectiveRole = roleFromSupabase ?? roleFromLocal ?? s.role;
+    const mismatch = (roleFromSupabase != null && roleFromLocal != null && roleFromSupabase !== roleFromLocal) ||
+      (roleFromLocal != null && roleFromLocal !== s.role);
+    return {
+      ok: true,
+      session: { userId: s.userId, email: s.email, role: s.role, displayName: s.displayName },
+      roleFromSession: s.role,
+      roleFromLocal,
+      roleFromSupabase,
+      effectiveRole,
+      mismatch,
+    };
+  }));
+
+  ipcMain.handle("planlux:auth:repairCurrentUserRole", wrap("planlux:auth:repairCurrentUserRole", async () => {
+    const s = session.getCurrentSession();
+    if (!s || !session.isSessionValid(s)) {
+      throw new AppError("AUTH_UNAUTHORIZED", "Brak aktywnej sesji.", { expose: true });
+    }
+    const hydrated = await hydrateEffectiveCurrentUser(s.userId, s.email);
+    if (hydrated.repaired || hydrated.effectiveRole !== s.role) {
+      session.updateCurrentSessionUser({ role: hydrated.effectiveRole });
+      currentUser = hydrated.user;
+    }
+    return { ok: true, effectiveRole: hydrated.effectiveRole, repaired: hydrated.repaired };
+  }));
+
   ipcMain.handle("planlux:logout", wrap("planlux:logout", async () => {
     try {
       session.revokeSession();
@@ -508,12 +618,28 @@ export async function registerIpcHandlers(deps: {
     }
   }));
 
-  ipcMain.handle("planlux:session", wrap("planlux:session", () => {
-    const s = session.getCurrentSession();
+  ipcMain.handle("planlux:session", wrap("planlux:session", async () => {
+    let s = session.getCurrentSession();
     if (!s || !session.isSessionValid(s)) return { ok: false, session: null };
+    if (getSupabase) {
+      try {
+        const hydrated = await hydrateEffectiveCurrentUser(s.userId, s.email);
+        if (hydrated.repaired || hydrated.effectiveRole !== s.role) {
+          session.updateCurrentSessionUser({ role: hydrated.effectiveRole });
+          currentUser = hydrated.user;
+          const updated = session.getCurrentSession();
+          s = updated ?? s;
+        }
+      } catch (e) {
+        logger.warn("[auth] planlux:session role refresh failed", { userId: s.userId, error: e });
+      }
+    }
+    const sessionToReturn = session.getCurrentSession();
+    if (!sessionToReturn || !session.isSessionValid(sessionToReturn)) return { ok: false, session: null };
+    logger.info("[auth] planlux:session – effective role in renderer", { userId: sessionToReturn.userId, email: sessionToReturn.email, role: sessionToReturn.role });
     return {
       ok: true,
-      session: { userId: s.userId, email: s.email, role: s.role, displayName: s.displayName, expiresAt: s.expiresAt },
+      session: { userId: sessionToReturn.userId, email: sessionToReturn.email, role: sessionToReturn.role, displayName: sessionToReturn.displayName, expiresAt: sessionToReturn.expiresAt },
     };
   }));
 
@@ -874,9 +1000,19 @@ export async function registerIpcHandlers(deps: {
 
   /** Admin: utwórz użytkownika w Supabase (Edge Function create-user) lub legacy backend; potem sync + zapisz hasło lokalnie. */
   ipcMain.handle("planlux:createUser", async (_, payload: { email: string; password: string; displayName?: string; role?: string }) => {
+    const email = (payload.email ?? "").trim().toLowerCase();
+    const roleInput = payload.role ?? "HANDLOWIEC";
+    logger.info("[admin] createUser start", { email: email || "(empty)", role: roleInput });
     try {
       requireRole(["ADMIN"]);
-      const email = (payload.email ?? "").trim().toLowerCase();
+    } catch (e) {
+      if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
+        logger.warn("[admin] createUser rejected: missing ADMIN role");
+        return { ok: false, error: "Brak uprawnień. Tylko administrator może tworzyć użytkowników." };
+      }
+      throw e;
+    }
+    try {
       if (!email) return { ok: false, error: "Email jest wymagany" };
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { ok: false, error: "Nieprawidłowy email" };
       const tempPassword = payload.password ?? "";
@@ -915,8 +1051,16 @@ export async function registerIpcHandlers(deps: {
           return { message: msg, status, body: bodyParsed };
         };
 
+        logger.info("[admin] createUser invoking create-user", { email, role, toSupabaseRole: toSupabaseRole(role) });
         const { data, error } = await supabase.functions.invoke("create-user", {
           body: { email, password: tempPassword, displayName, role: toSupabaseRole(role) },
+        });
+
+        logger.info("[admin] createUser invoke status", {
+          email,
+          hasError: !!error,
+          ok: (data as { ok?: boolean })?.ok,
+          errorFromData: (data as { error?: string })?.error ?? null,
         });
 
         // When Edge Function returns non-2xx, supabase-js sets `error` with generic message.
@@ -937,6 +1081,9 @@ export async function registerIpcHandlers(deps: {
           }
           if (msgLower.includes("already registered") || msgLower.includes("already exists") || msgLower.includes("duplicate")) {
             return { ok: false, error: "Użytkownik z tym adresem email już istnieje." };
+          }
+          if (parsed.message.includes("Profile update failed")) {
+            return { ok: false, error: "Użytkownik utworzony w Auth, ale aktualizacja profilu nie powiodła się. Sprawdź logi Supabase." };
           }
           return { ok: false, error: parsed.message };
         }
@@ -959,7 +1106,12 @@ export async function registerIpcHandlers(deps: {
           return { ok: false, error: upsertResult.error ?? "Błąd zapisu użytkownika w systemie" };
         }
       }
-      await syncUsersFromBackend();
+      const syncResult = await syncUsersFromBackend();
+      if (!syncResult.ok) {
+        logger.error("[admin] createUser syncUsersFromBackend failed", { email, error: syncResult.error });
+        return { ok: false, error: syncResult.error ?? "Synchronizacja użytkowników nie powiodła się. Sprawdź połączenie z Supabase." };
+      }
+      logger.info("[admin] createUser sync done", { email, syncedCount: syncResult.syncedCount });
       const db = getDb();
       const hashed = hashPassword(tempPassword);
       const now = new Date().toISOString();
@@ -977,10 +1129,11 @@ export async function registerIpcHandlers(deps: {
             "UPDATE users SET password_hash = ?, must_change_password = 1, password_set_at = NULL, updated_at = ? WHERE email = ?"
           ).run(hashed.hash, now, email);
         }
-        logger.info("[admin] createUser (backend + local password)", { email, role });
+        logger.info("[admin] createUser (backend + local password)", { email, role, id: existing.id });
         return { ok: true, id: existing.id, temporaryPassword: tempPassword };
       }
       const id = uuid();
+      logger.info("[admin] createUser (new user not in sync list – inserting locally)", { email, role });
       if (hasPasswordUnavail) {
         const createUserInsertSql = "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, role, display_name, active, must_change_password, created_by_user_id, created_at, updated_at" +
           (hasLastSynced ? ", last_synced_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, ?, ?, ?, ?)" : ") VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, ?, ?, ?)");
@@ -998,11 +1151,11 @@ export async function registerIpcHandlers(deps: {
           db.prepare(createUserInsertSql).run(id, email, hashed.hash, role, displayName ?? null, creatorId, now, now);
         }
       }
-      logger.info("[admin] createUser (backend + local insert)", { email, role });
+      logger.info("[admin] createUser (backend + local insert)", { email, role, id });
       return { ok: true, id, temporaryPassword: tempPassword };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
-        return { ok: false, error: e.message };
+        return { ok: false, error: "Brak uprawnień. Tylko administrator może tworzyć użytkowników." };
       }
       logger.error("[admin] createUser failed", e);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -1230,7 +1383,9 @@ export async function registerIpcHandlers(deps: {
   }));
 
   const PDF_HANDLER_TIMEOUT_MS = 20_000;
-  type PdfHandlerResult = { ok: true; pdfId: string; filePath: string; fileName: string } | { ok: false; error: string; details?: string; stage?: string };
+  type PdfHandlerResult =
+    | { ok: true; pdfId: string; filePath: string; fileName: string; stage?: string; persistenceError?: string }
+    | { ok: false; error: string; details?: string; stage?: string; missingFields?: string[] };
 
   async function handlePdfGenerate(
     offerData: unknown,
@@ -1240,8 +1395,17 @@ export async function registerIpcHandlers(deps: {
   ): Promise<PdfHandlerResult> {
     const { insertPdf } = await import("../src/infra/db");
     const p = offerData as import("@planlux/shared").GeneratePdfPayload;
-    if (!p?.offer || !p?.pricing || !p?.offerNumber) {
-      return { ok: false, error: "Nieprawidłowe dane do generowania PDF (wymagane: offer, pricing, offerNumber)." };
+    const hasOffer = !!p?.offer;
+    const hasPricing = !!p?.pricing;
+    const hasOfferNumber = !!p?.offerNumber;
+    logger.info("[pdf] payload validation", { hasOffer, hasPricing, hasOfferNumber, clientName: p?.offer?.clientName ?? null });
+    if (!hasOffer || !hasPricing || !hasOfferNumber) {
+      const missing: string[] = [];
+      if (!hasOffer) missing.push("offer");
+      if (!hasPricing) missing.push("pricing");
+      if (!hasOfferNumber) missing.push("offerNumber");
+      logger.warn("[pdf] payload validation failed – missing fields", { missing });
+      return { ok: false, error: `Nieprawidłowe dane do generowania PDF (brak: ${missing.join(", ")}).`, missingFields: missing };
     }
     const desktopRootFromIpc = path.join(__dirname, "..", "..");
     if (fs.existsSync(path.join(desktopRootFromIpc, ".e2e-run-dir"))) {
@@ -1293,7 +1457,7 @@ export async function registerIpcHandlers(deps: {
     logger.info("[pdf] start", { client: p.offer.clientName });
     const now = new Date();
 
-    let result: { ok: true; filePath: string; fileName: string } | { ok: false; error: string; details?: string };
+    let result: { ok: true; filePath: string; fileName: string } | { ok: false; error: string; details?: string; stage?: string };
 
     if (isE2E && e2eOutputDir) {
       try {
@@ -1310,35 +1474,78 @@ export async function registerIpcHandlers(deps: {
         return { ok: false, error: msg, details: e2eErr instanceof Error ? e2eErr.stack : undefined };
       }
     } else {
-      const templateResult = await generatePdfFromTemplate(
-      {
-        userId: p.userId,
-        offer: p.offer,
-        pricing: p.pricing,
-        offerNumber: p.offerNumber,
-        sellerName: p.sellerName,
-        sellerEmail: p.sellerEmail,
-        sellerPhone: p.sellerPhone,
-        clientAddressOrInstall: p.clientAddressOrInstall,
-      },
-      logger,
-      (templateConfig as Partial<import("@planlux/shared").PdfTemplateConfig> | null | undefined) ?? undefined,
-      options ?? undefined,
-      (pdfOverrides as import("./pdf/generatePdfFromTemplate").PdfOverridesForGenerator | null | undefined) ?? undefined
-    );
-
-      if (templateResult.ok) {
-        result = templateResult;
+      const templateDir = getPdfTemplateDir();
+      const attemptedPaths = getPdfTemplateDirCandidates();
+      logger.info("[pdf] templateDir", templateDir ? path.resolve(templateDir) : "(brak)");
+      logger.info("[pdf] attempted template paths", attemptedPaths);
+      if (!templateDir) {
+        logger.error("[pdf] DIAGNOSTYKA: szablon PDF nie znaleziony", {
+          appPath: app.getAppPath(),
+          resourcesPath: process.resourcesPath ?? "",
+          cwd: process.cwd(),
+          isPackaged: app.isPackaged,
+          attemptedTemplatePaths: attemptedPaths,
+        });
+        result = {
+          ok: false,
+          error: "Nie znaleziono szablonu PDF (assets/pdf-template/Planlux-PDF/index.html). W dev: sprawdź packages/desktop/assets. W produkcji: sprawdź, czy katalog assets jest kopiowany do build.",
+          stage: "TEMPLATE_MISSING",
+        };
       } else {
-        logger.error("[pdf] Planlux template failed – brak fallbacku, używamy tylko naszego layoutu", templateResult.error);
-        result = { ok: false, error: templateResult.error ?? "Błąd generowania PDF z szablonu Planlux" };
+        const templateResult = await generatePdfFromTemplate(
+          {
+            userId: p.userId,
+            offer: p.offer,
+            pricing: p.pricing,
+            offerNumber: p.offerNumber,
+            sellerName: p.sellerName,
+            sellerEmail: p.sellerEmail,
+            sellerPhone: p.sellerPhone,
+            clientAddressOrInstall: p.clientAddressOrInstall,
+          },
+          logger,
+          (templateConfig as Partial<import("@planlux/shared").PdfTemplateConfig> | null | undefined) ?? undefined,
+          options ?? undefined,
+          (pdfOverrides as import("./pdf/generatePdfFromTemplate").PdfOverridesForGenerator | null | undefined) ?? undefined
+        );
+
+        if (templateResult.ok) {
+          result = templateResult;
+          const outPath = (result as { filePath: string }).filePath;
+          logger.info("[pdf] outputPath", outPath);
+          if (!fs.existsSync(outPath)) {
+            logger.error("[pdf] DIAGNOSTYKA: plik PDF nie istnieje po wygenerowaniu", { outputPath: outPath });
+            result = {
+              ok: false,
+              error: "Wygenerowany plik PDF nie został zapisany (brak pliku pod ścieżką).",
+              stage: "WRITE_FAILED",
+            };
+          } else {
+            logger.info("[pdf] generation success", { filePath: outPath });
+          }
+        } else {
+          logger.error("[pdf] Planlux template failed", {
+            error: templateResult.error,
+            stage: (templateResult as { stage?: string }).stage,
+          });
+          result = {
+            ok: false,
+            error: templateResult.error ?? "Błąd generowania PDF z szablonu Planlux",
+            details: templateResult.details,
+            stage: (templateResult as { stage?: string }).stage,
+          };
+        }
       }
     }
 
     if (!result.ok) {
-      return { ok: false, error: result.error, details: result.details, stage: (result as { stage?: string }).stage };
+      return { ok: false, error: result.error, details: result.details, stage: (result as { stage?: string }).stage, missingFields: (result as { missingFields?: string[] }).missingFields };
     }
 
+    const generatedFilePath = result.filePath;
+    const generatedFileName = result.fileName;
+
+    try {
     const pdfId = uuid();
     const offerId = uuid();
     const userId = p.userId ?? "";
@@ -1437,8 +1644,8 @@ export async function registerIpcHandlers(deps: {
       offerId,
       userId,
       clientName: clientName || p.offer.clientName || "Klient",
-      fileName: result.fileName,
-      filePath: result.filePath,
+      fileName: generatedFileName,
+      filePath: generatedFilePath,
       status: "PDF_CREATED",
       totalPln: p.pricing.totalPln,
       widthM: p.offer.widthM,
@@ -1460,7 +1667,7 @@ export async function registerIpcHandlers(deps: {
       heightM: p.offer.heightM,
       areaM2: p.offer.areaM2,
       totalPln: p.pricing.totalPln,
-      fileName: result.fileName,
+      fileName: generatedFileName,
       createdAt: now.toISOString(),
     };
     apiClient.logPdf(logPdfPayload).then(() => {
@@ -1479,7 +1686,19 @@ export async function registerIpcHandlers(deps: {
     });
 
     logger.info("[pdf] done");
-    return { ok: true, pdfId, filePath: result.filePath, fileName: result.fileName };
+    return { ok: true, pdfId, filePath: generatedFilePath, fileName: generatedFileName };
+    } catch (persistErr) {
+      const msg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      logger.warn("[pdf] persistence failed after generation", { error: msg, filePath: generatedFilePath });
+      return {
+        ok: true,
+        pdfId: "",
+        filePath: generatedFilePath,
+        fileName: generatedFileName,
+        stage: "PERSISTENCE_FAILED",
+        persistenceError: msg,
+      };
+    }
   }
 
   /** Log failed PDF only when we have a valid offerId (pdfs.offer_id FK). Skip insert otherwise. */
@@ -1706,8 +1925,14 @@ export async function registerIpcHandlers(deps: {
         undefined
       );
       if (!result.ok) {
-        logger.warn("[pdf] ensureOfferPdf generate failed", { offerId, error: result.error });
-        return { ok: false, error: result.error ?? "Generowanie PDF nie powiodło się", filePath: null, fileName: null };
+        logger.warn("[pdf] ensureOfferPdf generate failed", { offerId, error: result.error, stage: (result as { stage?: string }).stage });
+        return {
+          ok: false,
+          error: result.error ?? "Generowanie PDF nie powiodło się",
+          details: (result as { details?: string }).details,
+          filePath: null,
+          fileName: null,
+        };
       }
       const pdfId = uuid();
       const { insertPdf } = await import("../src/infra/db");
@@ -4213,6 +4438,74 @@ console.log("[IPC] handler registered: planlux:checkInternet");
   /** Updates checker: URL for version/history fetch (main + renderer; fallback w config). */
   ipcMain.handle("planlux:updates:getUpdatesUrl", async () => {
     return { ok: true, updatesUrl: config.updatesUrl ?? "" };
+  });
+
+  // ----- Custom updater (Supabase app_releases + Storage installer) -----
+  const { checkForUpdates } = await import("./updates/updateService");
+  const { getState, setStatus } = await import("./updates/updateState");
+  const { downloadUpdate } = await import("./updates/updateDownloader");
+  const { runInstaller } = await import("./updates/updateInstaller");
+
+  ipcMain.handle("planlux:updates:check", wrap("planlux:updates:check", async () => {
+    if (!getSupabase) return { ok: false, error: "Supabase not configured" };
+    setStatus("checking");
+    const result = await checkForUpdates({
+      getVersion: () => app.getVersion(),
+      getSupabase,
+      logger,
+    });
+    if (result.error) {
+      setStatus("error", result.release ?? null, result.error);
+      return { ok: false, error: result.error, updateAvailable: false, currentVersion: result.currentVersion };
+    }
+    if (result.updateAvailable && result.release) {
+      setStatus("available", result.release);
+      return { ok: true, updateAvailable: true, release: result.release, currentVersion: result.currentVersion };
+    }
+    setStatus("idle");
+    return { ok: true, updateAvailable: false, release: null, currentVersion: result.currentVersion };
+  }));
+
+  ipcMain.handle("planlux:updates:getState", async () => {
+    return { ok: true, state: getState() };
+  });
+
+  ipcMain.handle("planlux:updates:download", wrap("planlux:updates:download", async () => {
+    const state = getState();
+    if (!state.release) return { ok: false, error: "No update available" };
+    const userDataPath = app.getPath("userData");
+    try {
+      const installerPath = await downloadUpdate(state.release, { userDataPath, logger });
+      return { ok: true, installerPath };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: message };
+    }
+  }));
+
+  ipcMain.handle("planlux:updates:install", wrap("planlux:updates:install", async () => {
+    const state = getState();
+    if (!state.release) return { ok: false, error: "No update downloaded" };
+    const userDataPath = app.getPath("userData");
+    const installerPath = path.join(userDataPath, "updates", `planlux-update-${state.release.version}.exe`);
+    try {
+      await runInstaller(installerPath, state.release, {
+        getDbPath: getDbPath ?? (() => app.getPath("userData") + "/planlux-hale.db"),
+        userDataPath,
+        getBusyReasons: () => [], // TODO: wire to PDF/email/sync busy flags
+        quitApp: () => app.quit(),
+        logger,
+      });
+      return { ok: true };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: message };
+    }
+  }));
+
+  ipcMain.handle("planlux:updates:dismiss", async () => {
+    setStatus("idle");
+    return { ok: true };
   });
 
   /** Debug: PRAGMA table_info + last 20 rows dla email_history i email_outbox + schema version flags (diagnostyka użytkowników). */
