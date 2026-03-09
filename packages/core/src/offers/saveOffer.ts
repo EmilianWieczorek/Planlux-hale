@@ -33,28 +33,37 @@ export interface SavedOffer {
   updated_at?: string;
 }
 
+/** Row shape for Supabase public.offers insert (explicit columns + optional payload_json). */
+export interface OffersInsertRow {
+  user_id: string;
+  client_name: string;
+  client_email: string | null;
+  client_phone: string | null;
+  client_company: string | null;
+  client_address: string | null;
+  variant: string;
+  width_m: number;
+  length_m: number;
+  height_m: number | null;
+  area_m2: number;
+  total_pln: number;
+  payload_json?: Record<string, unknown>;
+}
+
 function cleanOpt(v: string | undefined): string | null {
   const s = (v ?? "").trim();
   return s.length ? s : null;
 }
 
+const TARGET_TABLE = "public.offers";
+
 /**
  * Save an offer to Supabase `public.offers`.
- * Designed to be called from the Electron main process (via IPC), using the existing Supabase client.
+ * Table requires explicit columns: variant, client_name, width_m, length_m, height_m, area_m2, total_pln, user_id.
+ * Optional payload_json for debugging.
  */
 export async function saveOffer(supabase: SupabaseClient, input: SaveOfferInput): Promise<SavedOffer> {
-  if (process.env.LOG_LEVEL === "debug") {
-    // eslint-disable-next-line no-console
-    console.debug("[offers] saving offer", {
-      userId: input.userId,
-      clientName: input.clientName,
-      variant: input.variant,
-      area: input.area,
-      totalPrice: input.totalPrice,
-    });
-  }
-
-  const row = {
+  const payload = {
     user_id: input.userId,
     client_name: input.clientName,
     client_email: cleanOpt(input.clientEmail),
@@ -69,22 +78,82 @@ export async function saveOffer(supabase: SupabaseClient, input: SaveOfferInput)
     total_pln: input.totalPrice,
   };
 
-  const { data, error } = await supabase.from("offers").insert(row).select("*").single();
-  if (error) {
-    const details = (error as unknown as { details?: string; hint?: string; code?: string }).details;
-    const hint = (error as unknown as { hint?: string }).hint;
-    const code = (error as unknown as { code?: string }).code;
-    throw new Error(`[offers] Supabase insert failed: ${error.message}${code ? ` (${code})` : ""}${details ? ` – ${details}` : ""}${hint ? ` – ${hint}` : ""}`);
+  if (!payload.variant_hali) {
+    throw new Error("[offers] variant_hali missing");
   }
+
+  const row: OffersInsertRow = {
+    user_id: payload.user_id,
+    client_name: payload.client_name,
+    client_email: payload.client_email,
+    client_phone: payload.client_phone,
+    client_company: payload.client_company,
+    client_address: payload.client_address,
+    variant: payload.variant_hali,
+    width_m: payload.width_m,
+    length_m: payload.length_m,
+    height_m: payload.height_m,
+    area_m2: payload.area_m2,
+    total_pln: payload.total_pln,
+    payload_json: payload,
+  };
+
+  const insertRowKeys = Object.keys(row) as (keyof OffersInsertRow)[];
+
+  // eslint-disable-next-line no-console
+  console.info("[offers] saveOffer insert", {
+    targetTable: TARGET_TABLE,
+    insertRowKeys,
+  });
+
+  const { data, error } = await supabase.from("offers").insert(row).select("id").single();
+
+  if (error) {
+    const code = (error as unknown as { code?: string }).code;
+    const details = (error as unknown as { details?: string }).details;
+    const hint = (error as unknown as { hint?: string }).hint;
+    // eslint-disable-next-line no-console
+    console.error("[offers] saveOffer error", {
+      targetTable: TARGET_TABLE,
+      insertRowKeys,
+      errorMessage: error.message,
+      code,
+      details,
+      hint,
+    });
+    const enriched = new Error(
+      `[offers] Supabase insert failed: ${error.message}${code ? ` (${code})` : ""}${details ? ` – ${details}` : ""}${hint ? ` – ${hint}` : ""}`
+    ) as Error & { code?: string; details?: string; hint?: string };
+    enriched.code = code;
+    enriched.details = details;
+    enriched.hint = hint;
+    throw enriched;
+  }
+
   if (!data || typeof (data as { id?: unknown }).id !== "string") {
     throw new Error("[offers] Supabase insert returned no row/id");
   }
 
-  const saved = data as unknown as SavedOffer;
-  if (process.env.LOG_LEVEL === "debug") {
-    // eslint-disable-next-line no-console
-    console.debug("[offers] offer saved", { id: saved.id });
-  }
+  const rowData = data as { id: string };
+  const saved: SavedOffer = {
+    id: rowData.id,
+    user_id: payload.user_id,
+    client_name: payload.client_name,
+    client_email: payload.client_email,
+    client_phone: payload.client_phone,
+    client_company: payload.client_company,
+    client_address: payload.client_address,
+    variant_hali: payload.variant_hali,
+    width_m: payload.width_m,
+    length_m: payload.length_m,
+    height_m: payload.height_m,
+    area_m2: payload.area_m2,
+    total_pln: payload.total_pln,
+    created_at: undefined,
+    updated_at: undefined,
+  };
+
+  // eslint-disable-next-line no-console
+  console.info("[offers] saveOffer success", { targetTable: TARGET_TABLE, id: saved.id });
   return saved;
 }
-

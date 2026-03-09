@@ -36,4 +36,4 @@ npm run build
 npm run dist
 ```
 
-The installer is generated in `packages/desktop/release/` (e.g. `Planlux-Hale-1.0.0.exe`).
+The installer is generated in `packages/desktop/release/` as `Planlux Hale Setup <version>.exe` (e.g. `Planlux Hale Setup 1.0.11.exe`). For a portable build without installer: `npm run dist:portable -w @planlux/desktop`.

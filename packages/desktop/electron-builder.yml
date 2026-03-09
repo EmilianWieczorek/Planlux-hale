@@ -5,7 +5,6 @@ directories:
   output: release
 files:
   - "dist/**/*"
-  - "build/icon.ico"
   - "node_modules/**/*"
   - "package.json"
 
@@ -28,16 +27,17 @@ win:
     - target: nsis
       arch:
         - x64
-  icon: build/icon.ico
-  signingHashAlgorithms:
-    - sha256
-  # Opcjonalne: certyfikat .pfx (CSC_LINK, CSC_KEY_PASSWORD)
+  icon: assets/icon.ico
+  signAndEditExecutable: false
 
 nsis:
   oneClick: false
   perMachine: false
-  allowElevation: true
+  allowElevation: false
   allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Planlux Hale
+  unicode: true

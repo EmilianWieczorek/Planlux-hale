@@ -21,6 +21,8 @@ export type Session = {
   issuedAt: number;
   expiresAt: number;
   token: string;
+  /** Supabase JWT (access_token) when user logged in online; needed for Edge Functions (e.g. create-user). */
+  supabaseAccessToken?: string | null;
 };
 
 function getTtlMs(): number {
@@ -32,7 +34,12 @@ const sessions = new Map<string, Session>();
 /** Current session token for this process (single-user). */
 let currentToken: string | null = null;
 
-export function createSession(user: SessionUser): Session {
+export type CreateSessionOptions = {
+  /** Set when user logged in via Supabase (online); used for Edge Function calls (e.g. create-user). */
+  supabaseAccessToken?: string | null;
+};
+
+export function createSession(user: SessionUser, options?: CreateSessionOptions): Session {
   const now = Date.now();
   const token = crypto.randomBytes(24).toString("base64url");
   const session: Session = {
@@ -43,6 +50,7 @@ export function createSession(user: SessionUser): Session {
     issuedAt: now,
     expiresAt: now + getTtlMs(),
     token,
+    supabaseAccessToken: options?.supabaseAccessToken ?? null,
   };
   sessions.set(token, session);
   currentToken = token;

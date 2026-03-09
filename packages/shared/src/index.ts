@@ -100,4 +100,5 @@ export {
 } from "./utils/pdfFileName";
 export type { BuildPdfFileNameParams } from "./utils/pdfFileName";
 export { escapeHtml, formatCurrency } from "./utils/format";
+export { normalizeErrorMessage } from "./utils/errorMessage";
 export { compareSemver, isUpdateAvailable, isBelowMinSupported } from "./utils/semver";

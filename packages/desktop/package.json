@@ -1,6 +1,6 @@
 {
   "name": "@planlux/desktop",
-  "version": "1.0.9",
+  "version": "1.0.11",
   "description": "Planlux Hale – kalkulator i CRM ofert hal stalowych",
   "author": "Planlux",
   "repository": {
@@ -31,7 +31,8 @@
     "dev": "vite",
     "clean": "rimraf dist",
     "pdf:rebuild:test": "npm run clean && npm run build",
-    "dist": "electron-builder --win nsis",
+    "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win nsis",
+    "dist:portable": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win portable",
     "build:win": "npm run build && electron-builder --win",
     "dist:win": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --publish never --projectDir .",
     "rebuild": "electron-rebuild -f -w keytar"
@@ -55,7 +56,10 @@
       "**/node_modules/keytar/**"
     ],
     "extraResources": [
-      { "from": "assets", "to": "assets" }
+      {
+        "from": "assets",
+        "to": "assets"
+      }
     ],
     "win": {
       "target": "nsis",
@@ -65,11 +69,14 @@
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowElevation": true,
+      "allowElevation": false,
       "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Planlux Hale"
+      "shortcutName": "Planlux Hale",
+      "unicode": true
     },
     "publish": null
   },
@@ -92,6 +99,7 @@
     "recharts": "^3.7.0"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "dotenv": "^16.4.5",
     "@playwright/test": "^1.49.0",
     "@testing-library/jest-dom": "^6.9.1",

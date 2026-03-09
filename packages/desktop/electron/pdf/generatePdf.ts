@@ -258,7 +258,7 @@ export async function runPrintToPdfFromFile(
     await new Promise<void>((resolve, reject) => {
       win.webContents.once("did-finish-load", () => resolve());
       win.webContents.once("did-fail-load", (_, code, msg) =>
-        reject(new Error(`Błąd ładowania dokumentu (kod ${code}): ${msg}`))
+        reject(new Error(`LOADFILE_FAILED: Błąd ładowania dokumentu (kod ${code}): ${msg}`))
       );
       win.loadFile(tempHtmlPath).catch(reject);
     });
@@ -292,17 +292,28 @@ export async function runPrintToPdfFromFile(
       .catch(() => {});
     await new Promise((r) => setTimeout(r, 150));
 
-    /* Diagnostyka renderera: .hero backgroundImage i ewentualny .hero__bg */
+    /* Diagnostyka renderera: .hero backgroundImage, overflow, wymiary */
     const rendererDiag = await win.webContents
       .executeJavaScript(
         `(function(){
           var hero = document.querySelector('.hero');
           var bgEl = document.querySelector('.hero__bg');
+          var wrap = document.querySelector('.wrap');
+          var page = document.querySelector('.page');
+          var body = document.body;
+          var docEl = document.documentElement;
           return {
             heroBackgroundImage: hero ? getComputedStyle(hero).backgroundImage : null,
             heroBgSrc: bgEl ? bgEl.getAttribute('src') : null,
             heroBgNaturalWidth: bgEl && bgEl.naturalWidth != null ? bgEl.naturalWidth : null,
-            heroBgNaturalHeight: bgEl && bgEl.naturalHeight != null ? bgEl.naturalHeight : null
+            heroBgNaturalHeight: bgEl && bgEl.naturalHeight != null ? bgEl.naturalHeight : null,
+            wrapScrollWidth: wrap ? wrap.scrollWidth : null,
+            wrapClientWidth: wrap ? wrap.clientWidth : null,
+            pageScrollWidth: page ? page.scrollWidth : null,
+            pageClientWidth: page ? page.clientWidth : null,
+            bodyScrollWidth: body ? body.scrollWidth : null,
+            docElClientWidth: docEl ? docEl.clientWidth : null,
+            overflowX: body ? (body.scrollWidth > body.clientWidth) : false
           };
         })()`
       )
@@ -313,6 +324,18 @@ export async function runPrintToPdfFromFile(
       naturalWidth: rendererDiag.heroBgNaturalWidth,
       naturalHeight: rendererDiag.heroBgNaturalHeight,
     });
+    logger.info("[pdf] diagnostyka: wymiary wrappera i overflow", {
+      wrapScrollWidth: rendererDiag.wrapScrollWidth,
+      wrapClientWidth: rendererDiag.wrapClientWidth,
+      pageScrollWidth: rendererDiag.pageScrollWidth,
+      pageClientWidth: rendererDiag.pageClientWidth,
+      bodyScrollWidth: rendererDiag.bodyScrollWidth,
+      docElClientWidth: rendererDiag.docElClientWidth,
+      overflowX: rendererDiag.overflowX,
+    });
+    if (rendererDiag.overflowX) {
+      logger.warn("[pdf] overflow X wykryty – możliwy biały pasek po prawej; sprawdź .wrap/.page width i padding");
+    }
 
     let pdfBuf: Buffer;
     try {

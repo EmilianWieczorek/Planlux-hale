@@ -1,0 +1,4 @@
+# Edge Functions: create-user wykonuje własną weryfikację JWT (getUser) i sprawdzenie roli ADMIN.
+# Wyłączenie verify_jwt na poziomie platformy pozwala na precyzyjne błędy 401/403 z naszej funkcji.
+[functions.create-user]
+verify_jwt = false

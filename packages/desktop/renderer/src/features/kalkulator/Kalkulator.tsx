@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useOfferDraft } from "../../state/useOfferDraft";
 import { buildPayloadFromDraft, offerDraftStore, requestSyncTempNumbers, type OfferStatus } from "../../state/offerDraftStore";
-import { buildPdfFileName as buildPdfFileNameFromShared } from "@planlux/shared";
+import { buildPdfFileName as buildPdfFileNameFromShared, normalizeErrorMessage as normalizeErrorMessageFromShared } from "@planlux/shared";
 
 /** Bezpieczne wywołanie – fallback gdy import nie zadziała (np. cache Vite). */
 const buildPdfFileName =
@@ -9,6 +9,26 @@ const buildPdfFileName =
     ? buildPdfFileNameFromShared
     : (params: { sellerName?: string; clientCompany?: string; offerNumber: string }) =>
         `PLANLUX-Oferta-${params.clientCompany || params.sellerName || "Handlowiec"}-${(params.offerNumber || "—").replace(/\//g, "-")}.pdf`;
+
+/** W rendererze (Vite) nie ma globalnego process – używamy import.meta.env. */
+const isDebugLog = typeof import.meta !== "undefined" && !!import.meta.env?.DEV;
+
+/** Normalizacja błędu do tekstu; fallback gdy import z @planlux/shared nie jest funkcją (runtime/bundling). */
+function safeNormalizeError(error: unknown): string {
+  if (typeof normalizeErrorMessageFromShared === "function") return normalizeErrorMessageFromShared(error);
+  if (error == null) return "Nieznany błąd";
+  if (typeof error === "string") return error.trim() || "Nieznany błąd";
+  if (error instanceof Error) return error.message.trim() || "Nieznany błąd";
+  if (typeof error === "object") {
+    const o = error as Record<string, unknown>;
+    if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
+    if (typeof o.error === "string" && o.error.trim()) return o.error.trim();
+    if (typeof o.details === "string" && o.details.trim()) return o.details.trim();
+    if (typeof o.code === "string" && o.code.trim()) return `Błąd: ${o.code}`;
+  }
+  const s = String(error);
+  return s === "[object Object]" ? "Nieznany błąd" : s;
+}
 import { mergePdfOverrides } from "../../state/pdfOverrides";
 import { tokens } from "../../theme/tokens";
 import { KalkulatorPdfPreview } from "./KalkulatorPdfPreview";
@@ -518,6 +538,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     if (!userId) {
       throw new Error("Zaloguj się, aby zapisać ofertę w chmurze.");
     }
+    if (isDebugLog) console.debug("[Kalkulator] saveOffer start");
     const saveRes = (await api("planlux:saveOfferToSupabase", {
       userId,
       clientName: clientName || "Klient",
@@ -531,14 +552,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       height: h,
       area: areaM2,
       totalPrice: r.result.totalPln ?? 0,
-    })) as { ok: boolean; offer?: { id: string }; error?: string };
+    })) as { ok: boolean; offer?: { id: string }; error?: unknown };
     if (!saveRes?.ok || !saveRes.offer?.id) {
-      const msg = saveRes?.error ? String(saveRes.error) : "Nie udało się zapisać oferty w Supabase.";
-      throw new Error(msg.length > 160 ? msg.slice(0, 157) + "…" : msg);
+      if (isDebugLog) console.debug("[Kalkulator] saveOffer fail");
+      const msg = safeNormalizeError(saveRes?.error) || "Nie udało się zapisać oferty w Supabase.";
+      const short = msg.length > 160 ? msg.slice(0, 157) + "…" : msg;
+      setPdfStatusMessage(`Zapis oferty nie powiódł się: ${short}`);
+      showToast(short);
+      return;
     }
-    if (process.env.LOG_LEVEL === "debug") {
-      console.debug("[offers] offer saved (from calculator)", { id: saveRes.offer.id });
-    }
+    if (isDebugLog) console.debug("[Kalkulator] saveOffer success", { id: saveRes.offer.id });
     const payload = {
       userId,
       sellerName: userDisplayName?.trim() || "Planlux",
@@ -560,12 +583,28 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       pricing: r.result,
       offerNumber,
     };
-    const pdfRes = (await api("pdf:generate", payload, undefined, undefined, draft.pdfOverrides && Object.keys(draft.pdfOverrides).length > 0 ? draft.pdfOverrides : undefined)) as { ok: boolean; pdfId?: string; filePath?: string; fileName?: string; error?: string };
+    if (isDebugLog) console.debug("[Kalkulator] pdf:generate start");
+    const pdfRes = (await api("pdf:generate", payload, undefined, undefined, draft.pdfOverrides && Object.keys(draft.pdfOverrides).length > 0 ? draft.pdfOverrides : undefined)) as {
+      ok: boolean;
+      pdfId?: string;
+      filePath?: string;
+      fileName?: string;
+      error?: unknown;
+      stage?: string;
+      persistenceError?: string;
+    };
     if (pdfRes.ok) {
-      setPdfStatusMessage(null);
+      if (isDebugLog) console.debug("[Kalkulator] pdf:generate success", { fileName: pdfRes.fileName });
+      if (pdfRes.stage === "PERSISTENCE_FAILED") {
+        const persistMsg = safeNormalizeError(pdfRes.persistenceError) || "Nie udało się zapisać wpisu w historii PDF.";
+        setPdfStatusMessage(null);
+        showToast(`PDF zapisany: ${pdfRes.fileName ?? ""}. Uwaga: ${persistMsg}`);
+      } else {
+        setPdfStatusMessage(null);
+        showToast(`PDF zapisany: ${pdfRes.fileName ?? ""}`);
+      }
       if (pdfRes.filePath) setLastPdfPath(pdfRes.filePath);
       if (pdfRes.fileName) setLastPdfFileName(pdfRes.fileName);
-      showToast(`PDF zapisany: ${pdfRes.fileName ?? ""}`);
       actions.addPdfHistory(pdfRes.fileName ?? "oferta.pdf");
       actions.lockOfferNumber();
       actions.saveVersion(payload, draft.pdfOverrides ?? {});
@@ -576,10 +615,11 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         console.error("[Kalkulator] flushSave po generowaniu PDF", e);
       }
     } else {
-      const err = (pdfRes as { error?: string }).error;
-      const msg = err && err.length > 0 ? (err.length > 120 ? err.slice(0, 117) + "…" : err) : "Nie udało się wygenerować PDF. Spróbuj ponownie.";
-      setPdfStatusMessage(`Błąd PDF: ${msg}`);
-      showToast(msg);
+      if (isDebugLog) console.debug("[Kalkulator] pdf:generate fail", { error: pdfRes.error });
+      const msg = safeNormalizeError(pdfRes.error) || "Nie udało się wygenerować PDF. Spróbuj ponownie.";
+      const short = msg.length > 120 ? msg.slice(0, 117) + "…" : msg;
+      setPdfStatusMessage(`Błąd PDF: ${short}`);
+      showToast(short);
     }
   };
 
@@ -588,6 +628,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       showToast("Uzupełnij klienta i upewnij się, że wycena jest poprawna");
       return;
     }
+    if (isDebugLog) console.debug("[Kalkulator] generatePdf start, generating=true");
     setGenerating(true);
     setPdfStatusMessage("Generowanie...");
     try {
@@ -610,11 +651,12 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       }
       await doGeneratePdf();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Błąd generowania PDF";
+      const msg = safeNormalizeError(e) || "Błąd generowania oferty lub PDF.";
       const short = msg.length > 120 ? msg.slice(0, 117) + "…" : msg;
-      setPdfStatusMessage(`Błąd PDF: ${short}`);
+      setPdfStatusMessage(short);
       showToast(short);
     } finally {
+      if (isDebugLog) console.debug("[Kalkulator] generatePdf end, generating=false");
       setGenerating(false);
     }
   };

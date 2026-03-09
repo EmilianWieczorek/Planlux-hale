@@ -30,7 +30,8 @@ function shouldLogPdfPaths(): boolean {
 /**
  * Zwraca katalog szablonu Planlux-PDF (tam gdzie leży index.html).
  * Działa w DEV (run from repo) i PROD (packaged app / app.asar).
- * W production (app.isPackaged) pomija ścieżki zawierające packages/desktop.
+ * W production (app.isPackaged) najpierw sprawdzany jest resourcesPath (extraResources),
+ * potem pomijane są ścieżki zawierające packages/desktop.
  */
 export function getPdfTemplateDir(): string | null {
   if (process.env.PLANLUX_E2E === "1" && process.env.PLANLUX_E2E_TEMPLATE_DIR) {
@@ -43,23 +44,27 @@ export function getPdfTemplateDir(): string | null {
   }
   const appPath = app.getAppPath();
   const resourcesPath = process.resourcesPath || "";
-  const candidates = [
+  const baseCandidates = [
     path.join(appPath, TEMPLATE_SUBDIR),
     path.join(resourcesPath, "app.asar", TEMPLATE_SUBDIR),
     path.join(resourcesPath, TEMPLATE_SUBDIR),
     path.join(process.cwd(), TEMPLATE_SUBDIR),
     path.join(__dirname, "..", "..", TEMPLATE_SUBDIR),
   ];
+  const candidates = app.isPackaged
+    ? [path.join(resourcesPath, TEMPLATE_SUBDIR), ...baseCandidates.filter((d) => !isRepoRelativePath(path.normalize(d)))]
+    : baseCandidates;
+  const diag = candidates.map((dir) => {
+    const n = path.normalize(dir);
+    const idx = path.join(n, "index.html");
+    return { dir: n, indexExists: fs.existsSync(idx) };
+  });
   if (shouldLogPdfPaths()) {
-    const diag = candidates.map((dir) => {
-      const n = path.normalize(dir);
-      const idx = path.join(n, "index.html");
-      return { dir: n, indexExists: fs.existsSync(idx) };
-    });
     console.log("[E2E/pdf] getPdfTemplateDir candidates", JSON.stringify(diag, null, 2));
     console.log("[E2E/pdf] process.cwd()", process.cwd(), "PLANLUX_E2E_DIR", process.env.PLANLUX_E2E_DIR);
   }
-  for (const dir of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const dir = candidates[i];
     const normalized = path.normalize(dir);
     if (app.isPackaged && isRepoRelativePath(normalized)) continue;
     const indexPath = path.join(normalized, "index.html");
@@ -72,17 +77,29 @@ export function getPdfTemplateDir(): string | null {
   return null;
 }
 
-/** Returns the list of candidate paths tried for template resolution (for DIAGNOSTYKA when template not found). */
-export function getPdfTemplateDirCandidates(): string[] {
+/** Zwraca listę kandydatów z wynikiem exists (do logowania przy TEMPLATE_MISSING). */
+export function getPdfTemplateDirCandidatesWithExists(): Array<{ dir: string; indexExists: boolean }> {
   const appPath = app.getAppPath();
   const resourcesPath = process.resourcesPath || "";
-  return [
+  const baseCandidates = [
     path.join(appPath, TEMPLATE_SUBDIR),
     path.join(resourcesPath, "app.asar", TEMPLATE_SUBDIR),
     path.join(resourcesPath, TEMPLATE_SUBDIR),
     path.join(process.cwd(), TEMPLATE_SUBDIR),
     path.join(__dirname, "..", "..", TEMPLATE_SUBDIR),
-  ].map((dir) => path.normalize(dir));
+  ];
+  const candidates = app.isPackaged
+    ? [path.join(resourcesPath, TEMPLATE_SUBDIR), ...baseCandidates.filter((d) => !isRepoRelativePath(path.normalize(d)))]
+    : baseCandidates;
+  return candidates.map((dir) => {
+    const n = path.normalize(dir);
+    return { dir: n, indexExists: fs.existsSync(path.join(n, "index.html")) };
+  });
+}
+
+/** Returns the list of candidate paths tried for template resolution (same order as getPdfTemplateDir). */
+export function getPdfTemplateDirCandidates(): string[] {
+  return getPdfTemplateDirCandidatesWithExists().map((x) => x.dir);
 }
 
 /**

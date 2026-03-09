@@ -430,7 +430,11 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
       },
     });
     if (error) {
-      logSupabaseError("sync_log heartbeat RLS/insert error", error);
+      // RLS może blokować insert (np. brak sesji Supabase, offline). Nie blokujemy działania aplikacji.
+      if (process.env.LOG_LEVEL === "debug") {
+        const e = error as { message?: string; code?: string };
+        console.warn("[Supabase] sync_log heartbeat skipped (RLS or offline)", e?.message ?? e?.code);
+      }
       return { ok: true };
     }
     return { ok: true };

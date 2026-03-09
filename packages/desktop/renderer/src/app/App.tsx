@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ThemeProvider } from "@mui/material/styles";
-import { CssBaseline, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button, Snackbar, Alert, Box } from "@mui/material";
+import { CssBaseline, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button, Snackbar, Alert } from "@mui/material";
 import { planluxTheme } from "../theme/planluxTheme";
 
 const INACTIVITY_MS = 30 * 60 * 1000; // 30 min
@@ -305,73 +305,6 @@ export default function App() {
           )}
         </DialogActions>
       </Dialog>
-      {/* DEV ONLY: auth role debug – call preload APIs directly (do not mutate __planluxAuthDebug). */}
-      {import.meta.env.DEV && window.__planluxAuthDebug && (
-        <Box
-          sx={{
-            position: "fixed",
-            bottom: 16,
-            left: 16,
-            zIndex: 9999,
-            display: "flex",
-            gap: 1,
-            bgcolor: "background.paper",
-            border: "1px solid",
-            borderColor: "divider",
-            borderRadius: 1,
-            p: 0.5,
-            boxShadow: 2,
-          }}
-        >
-          <Button
-            size="small"
-            variant="outlined"
-            onClick={async () => {
-              try {
-                const result = await window.__planluxAuthDebug!.debugCurrentUser();
-                const r = result as {
-                  roleFromSession?: string | null;
-                  roleFromLocal?: string | null;
-                  roleFromSupabase?: string | null;
-                  effectiveRole?: string | null;
-                  mismatch?: boolean;
-                  session?: { userId?: string; email?: string; role?: string };
-                } | null;
-                const out = {
-                  sessionRole: r?.roleFromSession ?? null,
-                  localSqliteRole: r?.roleFromLocal ?? null,
-                  supabaseRole: r?.roleFromSupabase ?? null,
-                  effectiveRole: r?.effectiveRole ?? null,
-                  mismatch: r?.mismatch ?? false,
-                  ...(r?.session ? { sessionUser: r.session } : {}),
-                };
-                console.log("[Auth role debug]", out);
-              } catch (e) {
-                console.warn("[Auth role debug]", e);
-              }
-            }}
-            sx={{ textTransform: "none", fontSize: "0.75rem" }}
-          >
-            Auth: log role state
-          </Button>
-          <Button
-            size="small"
-            variant="outlined"
-            color="secondary"
-            onClick={async () => {
-              try {
-                const result = await window.__planluxAuthDebug!.repairCurrentUserRole();
-                console.log("[Auth repair]", result);
-              } catch (e) {
-                console.warn("[Auth repair]", e);
-              }
-            }}
-            sx={{ textTransform: "none", fontSize: "0.75rem" }}
-          >
-            Auth: repair role
-          </Button>
-        </Box>
-      )}
       <Snackbar
         open={!!syncError}
         autoHideDuration={5000}

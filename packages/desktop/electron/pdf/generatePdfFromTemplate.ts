@@ -16,7 +16,7 @@ import { app } from "electron";
 import type { GeneratePdfPayload } from "@planlux/shared";
 import { buildPdfFileName, escapeHtml, formatCurrency } from "@planlux/shared";
 import type { PdfTemplateConfig, PdfEditorContent } from "@planlux/shared";
-import { getPdfTemplateDir } from "./pdfPaths";
+import { getPdfTemplateDir, getPdfTemplateDirCandidatesWithExists } from "./pdfPaths";
 import { renderPdfTemplateHtml, type OfferPdfPayload } from "./renderTemplate";
 import {
   getPdfOutputDir,
@@ -31,43 +31,53 @@ function isDev(): boolean {
   return typeof process !== "undefined" && process.env.NODE_ENV !== "production";
 }
 
-/** Zbiera unikalne ścieżki assets/ z HTML (src i url() w CSS) */
+/** Zbiera unikalne ścieżki assets/ z HTML (src i url() w CSS, w tym ./assets/) */
 function collectAssetPaths(html: string): string[] {
   const seen = new Set<string>();
-  const srcRegex = /src=["']assets\/([^"']+)["']/gi;
+  const srcRegex = /src=["'](?:\.\/)?assets\/([^"']+)["']/gi;
   let m: RegExpExecArray | null;
   while ((m = srcRegex.exec(html)) !== null) seen.add("assets/" + m[1]);
-  const urlRegex = /url\s*\(\s*["']?assets\/([^"')]+)["']?\s*\)/gi;
+  const urlRegex = /url\s*\(\s*["']?(?:\.\/)?assets\/([^"')]+)["']?\s*\)/gi;
   while ((m = urlRegex.exec(html)) !== null) seen.add("assets/" + m[1]);
   return Array.from(seen);
 }
 
+const REQUIRED_PDF_ASSETS: string[] = [];
+
 /**
  * Diagnostyka assetów: sprawdza istnienie plików w offerDir (po skopiowaniu assets).
- * Loguje templateDir, offerDir, listę assetów i pełne ścieżki brakujących.
- * Nie zmienia HTML – w pipeline używane są względne ścieżki (assets/...) dla loadFile().
+ * Loguje listę wymaganych/rekomendowanych i brakujących; nie zmienia HTML.
  */
-function diagnoseAssets(html: string, templateDir: string, offerDir: string, logger: Logger): void {
+function diagnoseAssets(html: string, templateDir: string, offerDir: string, logger: Logger): { allPresent: boolean; missingRequired: string[] } {
   const paths = collectAssetPaths(html);
-  /* Logo jest wstrzykiwane przez {{logoUrl}} – i tak sprawdzamy, czy plik istnieje */
   if (!paths.includes("assets/logo-bez-tla.svg")) paths.push("assets/logo-bez-tla.svg");
-  if (paths.length === 0) {
-    logger.info("[pdf] diagnostyka: brak odwołań do assets/ w HTML");
-    return;
-  }
-  logger.info("[pdf] templateDir", templateDir);
-  logger.info("[pdf] offerDir (base dla loadFile)", offerDir);
+  if (!paths.includes("assets/hero-bg-print-safe.png")) paths.push("assets/hero-bg-print-safe.png");
   const missing: string[] = [];
+  const missingRequired: string[] = [];
   for (const assetPath of paths) {
     const absoluteInOffer = path.join(offerDir, assetPath);
     const exists = fs.existsSync(absoluteInOffer);
-    if (!exists) missing.push(absoluteInOffer);
+    if (!exists) {
+      missing.push(absoluteInOffer);
+      if (REQUIRED_PDF_ASSETS.includes(assetPath)) missingRequired.push(assetPath);
+    }
   }
+  logger.info("[pdf] assets check", {
+    templateDir: path.resolve(templateDir),
+    offerDir: path.resolve(offerDir),
+    totalReferenced: paths.length,
+    missingCount: missing.length,
+    missingRequired: missingRequired.length > 0 ? missingRequired : undefined,
+  });
   if (missing.length > 0) {
-    logger.warn("[pdf] brakujące assety (ikony/logo nie załadują się) – pełne ścieżki:", missing);
+    logger.warn("[pdf] missing assets (full paths)", missing);
+    if (missing.some((m) => m.includes("hero-bg-print-safe.png"))) {
+      logger.warn("[pdf] hero background missing – dodaj assets/hero-bg-print-safe.png do szablonu, aby tło headera się wyświetlało");
+    }
   } else {
-    logger.info("[pdf] wszystkie assety obecne w offerDir", paths.length);
+    logger.info("[pdf] all referenced assets present in offerDir");
   }
+  return { allPresent: missing.length === 0, missingRequired };
 }
 
 /** Price override z pdfOverrides (manual override w PDF). */
@@ -180,9 +190,17 @@ export function mapOfferDataToPayload(
   };
 }
 
+export type PdfFailureStage =
+  | "TEMPLATE_MISSING"
+  | "RENDER_FAILED"
+  | "ASSET_COPY_FAILED"
+  | "HTML_WRITE_FAILED"
+  | "PRINT_FAILED"
+  | "WRITE_FAILED";
+
 export type GeneratePdfFromTemplateResult =
   | { ok: true; filePath: string; fileName: string }
-  | { ok: false; error: string; details?: string; stage?: "TEMPLATE_MISSING" | "RENDER_FAILED" | "PRINT_FAILED" | "WRITE_FAILED" };
+  | { ok: false; error: string; details?: string; stage?: PdfFailureStage };
 
 /**
  * Resolve template dir, render HTML, write to userData/tmp, loadFile, printToPDF, save to Documents/Planlux Hale/output.
@@ -256,14 +274,23 @@ export async function generatePdfFromTemplate(
     logger.info("[pdf] template source", fromDist ? "dist/assets" : "packages/desktop/assets (dev)");
   }
   if (!templateDir) {
-    logger.error("[pdf] DIAGNOSTYKA: templateDir is null", {
+    const candidatesWithExists = getPdfTemplateDirCandidatesWithExists();
+    logger.error("[pdf] TEMPLATE_MISSING", {
       appPath: app.getAppPath(),
       resourcesPath: process.resourcesPath ?? "",
       cwd: process.cwd(),
       isPackaged: app.isPackaged,
+      candidates: candidatesWithExists,
     });
     return { ok: false, error: "Szablon Planlux-PDF nie został znaleziony (brak index.html w assets/pdf-template/Planlux-PDF).", stage: "TEMPLATE_MISSING" };
   }
+  logger.info("[pdf] templateDir resolved", path.resolve(templateDir));
+
+  logger.info("[pdf] payload summary", {
+    offerNumber: offerData.offerNumber,
+    clientName: offerData.offer?.clientName ?? offerData.offer?.companyName ?? "(brak)",
+    previewMode: options?.previewMode ?? false,
+  });
 
   const now = new Date();
   const offerDate = now.toLocaleDateString("pl-PL", { day: "2-digit", month: "2-digit", year: "numeric" });
@@ -299,24 +326,82 @@ export async function generatePdfFromTemplate(
   try {
     await fs.promises.mkdir(offerDir, { recursive: true });
     const assetsSrc = path.join(templateDir, "assets");
+    const assetsDest = path.join(offerDir, "assets");
     if (fs.existsSync(assetsSrc)) {
-      const assetsDest = path.join(offerDir, "assets");
       fs.cpSync(assetsSrc, assetsDest, { recursive: true });
-      logger.info("[pdf] assets copied to tmp", assetsDest);
+      logger.info("[pdf] assets copied to tmp", { dest: path.resolve(assetsDest), source: path.resolve(assetsSrc) });
+    } else {
+      logger.warn("[pdf] template has no assets directory", path.resolve(assetsSrc));
     }
-    /* Diagnostyka: log templateDir, offerDir, brakujące assety (pełne ścieżki). */
     diagnoseAssets(html, templateDir, offerDir, logger);
-    /* Logo: wstrzykuj file:// URL z offerDir, żeby img ładował się w Electron printToPDF. */
-    const logoPath = path.join(offerDir, "assets", "logo-bez-tla.svg");
-    const logoUrl =
-      fs.existsSync(logoPath) ? pathToFileURL(logoPath).href : "assets/logo-bez-tla.svg";
-    html = html.replace(/\{\{\s*logoUrl\s*\}\}/g, logoUrl);
-    fs.writeFileSync(tempHtmlPath, html, "utf-8");
-    logger.info("[pdf] temp HTML written (relative asset paths)", tempHtmlPath);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    logger.error("[pdf] write temp HTML/assets failed", e);
-    return { ok: false, error: `Zapis tymczasowy: ${msg}`, stage: "RENDER_FAILED" };
+    logger.error("[pdf] mkdir or copy assets failed", e);
+    return { ok: false, error: `Kopiowanie assetów: ${msg}`, stage: "ASSET_COPY_FAILED" };
+  }
+
+  const assetsOfferDir = path.join(offerDir, "assets");
+  const logoPngPath = path.join(assetsOfferDir, "logo-bez-tla.png");
+  const logoSvgPath = path.join(assetsOfferDir, "logo-bez-tla.svg");
+  const logoPngInTemplate = fs.existsSync(path.join(templateDir, "assets", "logo-bez-tla.png"));
+  const logoSvgInTemplate = fs.existsSync(path.join(templateDir, "assets", "logo-bez-tla.svg"));
+  const logoPngCopied = fs.existsSync(logoPngPath);
+  const logoSvgCopied = fs.existsSync(logoSvgPath);
+  const chosenLogoFile = logoPngCopied ? "logo-bez-tla.png" : logoSvgCopied ? "logo-bez-tla.svg" : null;
+  const logoSrcInHtml = chosenLogoFile ? `assets/${chosenLogoFile}` : null;
+
+  logger.info("[pdf] logo diagnostics", {
+    templateDir: path.resolve(templateDir),
+    offerDir: path.resolve(offerDir),
+    logoPngInTemplate,
+    logoSvgInTemplate,
+    logoPngCopied,
+    logoSvgCopied,
+    chosenLogoFile: chosenLogoFile ?? "(brak – użyto fallback tekstowy)",
+    finalPathInHtml: logoSrcInHtml ?? "(fallback)",
+  });
+
+  if (chosenLogoFile) {
+    html = html.replace(/src="assets\/logo-bez-tla\.(svg|png)"/gi, `src="assets/${chosenLogoFile}"`);
+  } else {
+    logger.warn("[pdf] logo missing in offerDir – wstawiono fallback tekstowy Planlux");
+    const fallbackHtml = '<span class="brand__logoFallback" aria-hidden="true">Planlux</span>';
+    html = html.replace(
+      /<img\s+class="brand__logoImg"\s+src="assets\/logo-bez-tla\.(svg|png)"\s+alt="Planlux"\s*\/>/gi,
+      fallbackHtml
+    );
+  }
+  html = html.replace(/\{\{\s*logoUrl\s*\}\}/g, logoSrcInHtml ?? "assets/logo-bez-tla.svg");
+
+  html = html.replace(/<body(\s|>)/, "<body class=\"pdf-export\"$1");
+
+  const heroBgPath = path.join(offerDir, "assets", "hero-bg-print-safe.png");
+  if (!fs.existsSync(heroBgPath)) {
+    const heroFallbackStyle =
+      "<style>/* fallback gdy brak hero-bg-print-safe.png */ .hero,.plx-offer .hero,.plx-spec .hero,.page--spec .hero,.xd-terrain .hero{background-image:linear-gradient(165deg,#6b0d14 0%,#8b0f1b 25%,#c8102e 60%,#a80f0f 100%)!important;background-color:#8b0f1b!important}</style>";
+    html = html.replace("</head>", heroFallbackStyle + "</head>");
+    logger.info("[pdf] hero background missing – zastosowano fallback (gradient)");
+  }
+  const diagramPath = path.join(offerDir, "assets", "diagram-techniczny.png");
+  if (!fs.existsSync(diagramPath)) {
+    const diagramPanelBlock = html.includes("diagram-techniczny.png")
+      ? html.replace(
+          /<div class="diagramPanel">\s*<img\s[^>]*?src="assets\/diagram-techniczny\.png"[^>]*?\/>\s*<span class="diagram-placeholder"[^>]*>[\s\S]*?<\/span>\s*<\/div>/,
+          '<div class="diagramPanel diagram-panel-no-image"><span class="diagram-placeholder diagram-placeholder-visible">Rysunek techniczny w przygotowaniu</span></div>'
+        )
+      : html;
+    if (diagramPanelBlock !== html) {
+      html = diagramPanelBlock;
+      logger.info("[pdf] diagram-techniczny.png missing – wyświetlono placeholder");
+    }
+  }
+  try {
+    fs.writeFileSync(tempHtmlPath, html, "utf-8");
+    logger.info("[pdf] temp HTML written", { path: tempHtmlPath, sizeBytes: Buffer.byteLength(html, "utf-8") });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.error("[pdf] write temp HTML failed", e);
+    return { ok: false, error: `Zapis HTML: ${msg}`, stage: "HTML_WRITE_FAILED" };
   }
 
   const printResult = await runPrintToPdfFromFile(tempHtmlPath, logger);
@@ -348,9 +433,9 @@ export async function generatePdfFromTemplate(
       logger.info("[E2E/pdf] file written", { filePath: path.resolve(filePath), size: stat.size, fileName });
     }
     if (isDev()) {
-      logger.info("[pdf] final PDF", { filePath, fileName });
+      logger.info("[pdf] final PDF", { filePath, fileName, sizeBytes: stat.size });
     } else {
-      logger.info("[pdf] saved path", filePath);
+      logger.info("[pdf] saved path", { filePath, sizeBytes: stat.size });
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

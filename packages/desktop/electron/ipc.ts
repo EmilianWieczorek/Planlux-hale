@@ -11,11 +11,11 @@ import { hashPassword, verifyPassword, validatePassword, isLegacyHash, LEGACY_SA
 import * as session from "./auth/session";
 import { performLogin } from "./auth/login";
 import type { GeneratePdfPayload } from "@planlux/shared";
-import { normalizeRoleRbac } from "@planlux/shared";
+import { normalizeErrorMessage, normalizeRoleRbac } from "@planlux/shared";
 import { generatePdfPipeline, getTestPdfFileName, getE2EPlaceholderPdfBuffer } from "./pdf/generatePdf";
 import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTemplateOptions } from "./pdf/generatePdfFromTemplate";
 import { getPdfOutputDir } from "./pdf/generatePdf";
-import { getPdfTemplateDir, getPdfTemplateDirCandidates } from "./pdf/pdfPaths";
+import { getPdfTemplateDir, getPdfTemplateDirCandidates, getPdfTemplateDirCandidatesWithExists } from "./pdf/pdfPaths";
 import { getE2EConfig } from "./e2eEnv";
 
 import { createSendEmailForFlush } from "./smtpSend";
@@ -490,7 +490,12 @@ export async function registerIpcHandlers(deps: {
           }
         }
         const userForSession: SessionUser = { id: result.user.id, email: result.user.email, role: roleForSession, displayName: result.user.displayName ?? null };
-        const sess = session.createSession(userForSession);
+        let supabaseAccessToken: string | null = null;
+        if (getSupabase) {
+          const { data: authData } = await getSupabase().auth.getSession();
+          supabaseAccessToken = authData?.session?.access_token ?? null;
+        }
+        const sess = session.createSession(userForSession, { supabaseAccessToken });
         currentUser = userForSession;
         logger.info("[auth] loaded current user (session)", { id: userForSession.id, email: userForSession.email, role: userForSession.role });
         db.prepare("INSERT INTO sessions (id, user_id, device_type, app_version) VALUES (?, ?, 'desktop', ?)").run(uuid(), userForSession.id, config.appVersion);
@@ -1024,14 +1029,36 @@ export async function registerIpcHandlers(deps: {
       if (getSupabase) {
         const supabase = getSupabase();
 
+        // KROK 1: Pobierz JWT z sesji aplikacji (ustawione przy logowaniu online).
+        const currentSession = session.getCurrentSession();
+        let jwt: string | null = currentSession?.supabaseAccessToken ?? null;
+
+        // KROK 2: Jeśli brak JWT w sesji, spróbuj z klienta Supabase.
+        if (!jwt) {
+          try {
+            await supabase.auth.refreshSession();
+          } catch {
+            // brak sesji (np. logowanie offline)
+          }
+          const { data: sessionData } = await supabase.auth.getSession();
+          jwt = sessionData?.session?.access_token ?? null;
+        }
+
+        // KROK 3: Brak JWT → czytelny błąd (bez wywołania Edge Function).
+        if (!jwt || typeof jwt !== "string") {
+          logger.warn("[admin] createUser: no Supabase JWT (user may have logged in offline)");
+          return { ok: false, error: "Brak sesji Supabase. Zaloguj się online jako ADMIN i spróbuj ponownie." };
+        }
+
         const toSupabaseRole = (r: string): "ADMIN" | "MANAGER" | "SALES" => {
           const rr = (r ?? "").trim().toUpperCase();
           if (rr === "ADMIN") return "ADMIN";
           if (rr === "SZEF" || rr === "BOSS" || rr === "MANAGER") return "MANAGER";
           return "SALES";
         };
+        const toSupabaseRoleValue = toSupabaseRole(role);
 
-        const parseInvokeError = (err: unknown, data: unknown): { message: string; status?: number; body?: unknown } => {
+        const parseInvokeError = (err: unknown, fnData: unknown): { message: string; status?: number; body?: unknown } => {
           const e = err as { message?: string; name?: string; context?: { status?: number; body?: unknown } } | null;
           const status = e?.context?.status;
           const bodyRaw = e?.context?.body;
@@ -1041,7 +1068,7 @@ export async function registerIpcHandlers(deps: {
             }
             return bodyRaw;
           })();
-          const dataErr = (data as { error?: unknown } | null)?.error;
+          const dataErr = (fnData as { error?: unknown } | null)?.error;
           const bodyErr = (bodyParsed as { error?: unknown } | null)?.error;
           const msg =
             (typeof bodyErr === "string" && bodyErr.trim()) ||
@@ -1051,47 +1078,71 @@ export async function registerIpcHandlers(deps: {
           return { message: msg, status, body: bodyParsed };
         };
 
-        logger.info("[admin] createUser invoking create-user", { email, role, toSupabaseRole: toSupabaseRole(role) });
-        const { data, error } = await supabase.functions.invoke("create-user", {
-          body: { email, password: tempPassword, displayName, role: toSupabaseRole(role) },
+        // Logi diagnostyczne (bez pełnego tokena): długość, prefix, czy header jest budowany.
+        logger.info("[admin] createUser jwt debug", {
+          hasJwt: !!jwt,
+          jwtLength: jwt ? jwt.length : 0,
+          jwtPrefix: jwt ? jwt.slice(0, 12) + "…" : null,
+          authHeaderBuilt: !!jwt,
+        });
+        logger.info("[admin] createUser invoking create-user", { email, role: toSupabaseRoleValue });
+
+        // Wywołanie Edge Function z nagłówkiem Authorization.
+        const { data: invokeData, error: invokeError } = await supabase.functions.invoke("create-user", {
+          body: {
+            email,
+            password: tempPassword,
+            displayName,
+            role: toSupabaseRoleValue,
+          },
+          headers: {
+            Authorization: `Bearer ${jwt}`,
+          },
         });
 
         logger.info("[admin] createUser invoke status", {
           email,
-          hasError: !!error,
-          ok: (data as { ok?: boolean })?.ok,
-          errorFromData: (data as { error?: string })?.error ?? null,
+          hasError: !!invokeError,
+          ok: (invokeData as { ok?: boolean })?.ok,
+          errorFromData: (invokeData as { error?: string })?.error ?? null,
         });
 
-        // When Edge Function returns non-2xx, supabase-js sets `error` with generic message.
-        if (error) {
-          const parsed = parseInvokeError(error, data);
+        // Obsługa błędów: odczyt body z Edge Function (ok, error, details) i mapowanie na komunikaty.
+        if (invokeError) {
+          const parsed = parseInvokeError(invokeError, invokeData);
+          const status = parsed.status;
+          const bodyObj = parsed.body as { ok?: boolean; error?: string; details?: string } | null;
+          const edgeError = bodyObj?.error ?? parsed.message;
+          const edgeDetails = bodyObj?.details ?? "";
           logger.error("[admin] createUser invoke(create-user) failed", {
             email,
-            status: parsed.status,
+            status,
             message: parsed.message,
+            edgeError,
+            edgeDetails,
             body: parsed.body,
           });
-          const msgLower = parsed.message.toLowerCase();
-          if (parsed.status === 401 || msgLower.includes("missing authorization") || msgLower.includes("invalid token")) {
-            return { ok: false, error: "Brak sesji Supabase. Zaloguj się online jako ADMIN i spróbuj ponownie." };
+          if (status === 401) {
+            return { ok: false, error: "Sesja Supabase wygasła. Zaloguj się ponownie." };
           }
-          if (parsed.status === 403 || msgLower.includes("forbidden")) {
-            return { ok: false, error: "Brak uprawnień w Supabase (wymagane: profil roli ADMIN)." };
+          if (status === 403) {
+            return { ok: false, error: "Tylko ADMIN może dodawać użytkowników." };
           }
-          if (msgLower.includes("already registered") || msgLower.includes("already exists") || msgLower.includes("duplicate")) {
-            return { ok: false, error: "Użytkownik z tym adresem email już istnieje." };
+          if (status === 409) {
+            return { ok: false, error: "Użytkownik o tym emailu już istnieje." };
           }
-          if (parsed.message.includes("Profile update failed")) {
-            return { ok: false, error: "Użytkownik utworzony w Auth, ale aktualizacja profilu nie powiodła się. Sprawdź logi Supabase." };
-          }
-          return { ok: false, error: parsed.message };
+          const invokeMessage = (invokeError as { message?: string }).message;
+          const details = edgeDetails || invokeMessage || parsed.message;
+          return { ok: false, error: "Błąd tworzenia użytkownika", details };
         }
-        if ((data as { ok?: boolean })?.ok !== true) {
-          const msg = (data as { error?: string })?.error ?? "Błąd tworzenia użytkownika";
-          logger.error("[admin] createUser create-user returned ok=false", { email, data });
+        if ((invokeData as { ok?: boolean })?.ok !== true) {
+          const msg = (invokeData as { error?: string })?.error ?? "Błąd tworzenia użytkownika";
+          logger.error("[admin] createUser create-user returned ok=false", { email, invokeData });
           return { ok: false, error: msg };
         }
+
+        // KROK 8: Log sukcesu (sync w KROK 7 jest poniżej, po bloku getSupabase).
+        logger.info("[admin] createUser success", { email, id: (invokeData as { id?: string })?.id });
       } else {
         const appConfig = getConfig();
         const { upsertUserViaBackend } = await import("./authBackend");
@@ -1360,6 +1411,7 @@ export async function registerIpcHandlers(deps: {
       if (!(width > 0) || !(length > 0) || !(area > 0)) return { ok: false, error: "Nieprawidłowe wymiary hali" };
       if (!(totalPrice > 0)) return { ok: false, error: "Nieprawidłowa cena (brak wyceny)" };
 
+      logger.info("[offers] saveOfferToSupabase start", { targetTable: "public.offers", clientName: clientName.slice(0, 40), variant, area, totalPrice });
       const { saveOffer } = await import("@planlux/core");
       const saved = await saveOffer(supabase, {
         userId: user.id,
@@ -1375,10 +1427,21 @@ export async function registerIpcHandlers(deps: {
         area,
         totalPrice,
       });
+      logger.info("[offers] saveOfferToSupabase success", { offerId: saved?.id });
       return { ok: true, offer: saved };
     } catch (e) {
-      logger.error("[offers] saveOfferToSupabase failed", e);
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const msg = normalizeErrorMessage(e);
+      const errObj = e && typeof e === "object" ? (e as Record<string, unknown>) : {};
+      logger.error("[offers] saveOfferToSupabase failed", {
+        targetTable: "public.offers",
+        insertRowKeys: ["user_id", "client_name", "client_email", "client_phone", "client_company", "client_address", "variant", "width_m", "length_m", "height_m", "area_m2", "total_pln", "payload_json"],
+        message: msg,
+        code: errObj.code,
+        details: errObj.details,
+        hint: errObj.hint,
+        errorMessage: errObj.message,
+      });
+      return { ok: false, error: msg };
     }
   }));
 
@@ -1479,12 +1542,13 @@ export async function registerIpcHandlers(deps: {
       logger.info("[pdf] templateDir", templateDir ? path.resolve(templateDir) : "(brak)");
       logger.info("[pdf] attempted template paths", attemptedPaths);
       if (!templateDir) {
-        logger.error("[pdf] DIAGNOSTYKA: szablon PDF nie znaleziony", {
+        const candidatesWithExists = getPdfTemplateDirCandidatesWithExists();
+        logger.error("[pdf] TEMPLATE_MISSING", {
           appPath: app.getAppPath(),
           resourcesPath: process.resourcesPath ?? "",
           cwd: process.cwd(),
           isPackaged: app.isPackaged,
-          attemptedTemplatePaths: attemptedPaths,
+          candidates: candidatesWithExists,
         });
         result = {
           ok: false,
@@ -1688,7 +1752,7 @@ export async function registerIpcHandlers(deps: {
     logger.info("[pdf] done");
     return { ok: true, pdfId, filePath: generatedFilePath, fileName: generatedFileName };
     } catch (persistErr) {
-      const msg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      const msg = normalizeErrorMessage(persistErr);
       logger.warn("[pdf] persistence failed after generation", { error: msg, filePath: generatedFilePath });
       return {
         ok: true,

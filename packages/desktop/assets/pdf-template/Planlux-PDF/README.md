@@ -3,7 +3,7 @@
 ## Entrypoint
 - **index.html** – główny dokument (3 strony: Oferta, Specyfikacja, Przygotowanie terenu)
 - **styles.css** – wstrzykiwany do HTML przez renderer (offline, bez zewnętrznych @import)
-- **assets/** – logo (`logo-bez-tla.svg`), ikony SVG (ciezarowka, teren-budowy, droga-dojazdowa, media, diagram-techniczny, wykrzyknik, blue-wykrzyknik), opcjonalnie **assets/fonts/** (Inter.woff2)
+- **assets/** – logo (`logo-bez-tla.svg`), tło headera (`hero-bg-print-safe.png` – wymagane dla poprawnego tła hero na stronach), ikony SVG (ciezarowka, teren-budowy, droga-dojazdowa, media, wykrzyknik, blue-wykrzyknik). Opcjonalnie: `diagram-techniczny.png` (strona 3), **assets/fonts/** (Inter.woff2).
 
 ## Placeholdery dynamiczne (obsługiwane przez renderTemplate)
 - `{{offerNumber}}`, `{{offerDate}}`, `{{sellerName}}`
