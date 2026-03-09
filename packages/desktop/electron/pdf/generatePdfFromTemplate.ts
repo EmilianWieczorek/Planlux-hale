@@ -362,7 +362,21 @@ export async function generatePdfFromTemplate(
   });
 
   if (chosenLogoFile) {
-    html = html.replace(/src="assets\/logo-bez-tla\.(svg|png)"/gi, `src="assets/${chosenLogoFile}"`);
+    let logoSrc: string;
+    if (chosenLogoFile === "logo-bez-tla.svg") {
+      try {
+        const svgContent = fs.readFileSync(logoSvgPath, "utf-8");
+        const base64 = Buffer.from(svgContent, "utf-8").toString("base64");
+        logoSrc = `data:image/svg+xml;base64,${base64}`;
+        logger.info("[pdf] logo: SVG wstrzyknięty jako data URI (stabilne w printToPDF)");
+      } catch (e) {
+        logger.warn("[pdf] logo: nie udało się wczytać SVG, używam ścieżki względnej", e);
+        logoSrc = "assets/logo-bez-tla.svg";
+      }
+    } else {
+      logoSrc = `assets/${chosenLogoFile}`;
+    }
+    html = html.replace(/src="assets\/logo-bez-tla\.(svg|png)"/gi, `src="${logoSrc}"`);
   } else {
     logger.warn("[pdf] logo missing in offerDir – wstawiono fallback tekstowy Planlux");
     const fallbackHtml = '<span class="brand__logoFallback" aria-hidden="true">Planlux</span>';

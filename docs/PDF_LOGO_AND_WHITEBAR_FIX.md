@@ -10,11 +10,12 @@
 - **Objaw:** W PDF widać tylko napis „Planlux” (tekst z `alt`) zamiast grafiki logo.
 - **Przyczyny:** (1) Szablon na stałe używał `src="assets/logo-bez-tla.svg"`. W niektórych wersjach Chromium/Electron SVG w `printToPDF` bywa niestabilny. (2) Brak fallbacku na PNG. (3) Brak diagnostyki – nie było wiadomo, który plik jest używany i czy istnieje po skopiowaniu.
 - **Naprawa:**
-  - Po skopiowaniu `assets` do `offerDir` wybierany jest plik logo: jeśli istnieje `logo-bez-tla.png` → używany PNG (stabilniejszy przy druku), w przeciwnym razie `logo-bez-tla.svg`.
-  - Wszystkie `<img class="brand__logoImg" src="assets/logo-bez-tla.(svg|png)" ...>` w HTML są zamieniane na wybrany plik.
-  - Jeśli w `offerDir` nie ma ani PNG, ani SVG, zamiast przerywać generowanie wstawiany jest fallback tekstowy: `<span class="brand__logoFallback">Planlux</span>` (bez rzucania błędu).
-  - Dodane logowanie: `[pdf] logo diagnostics` z polami: templateDir, offerDir, logoPngInTemplate, logoSvgInTemplate, logoPngCopied, logoSvgCopied, chosenLogoFile, finalPathInHtml.
-  - Z listy wymaganych assetów usunięto logo (REQUIRED_PDF_ASSETS = []), żeby brak logo nie blokował PDF przy użyciu fallbacku.
+  - Po skopiowaniu `assets` do `offerDir` wybierany jest plik logo: jeśli istnieje `logo-bez-tla.png` → używany PNG (ścieżka `assets/...`), w przeciwnym razie `logo-bez-tla.svg`.
+  - **SVG wstrzykiwane jako data URI:** gdy wybrany jest SVG, plik jest wczytywany i wstawiany w atrybucie `src` jako `data:image/svg+xml;base64,...`, żeby printToPDF nie polegał na osobnym ładowaniu pliku i pewnie renderował logo.
+  - Wszystkie `<img ... src="assets/logo-bez-tla.(svg|png)" ...>` w HTML są zamieniane na wybrany src (data URI lub `assets/logo-bez-tla.png`).
+  - Jeśli w `offerDir` nie ma ani PNG, ani SVG, wstawiany jest fallback tekstowy: `<span class="brand__logoFallback">Planlux</span>` (bez rzucania błędu).
+  - Logowanie: `[pdf] logo diagnostics` oraz przy SVG: `[pdf] logo: SVG wstrzyknięty jako data URI (stabilne w printToPDF)`.
+  - REQUIRED_PDF_ASSETS = [] – brak logo nie blokuje PDF.
 
 ---
 
@@ -25,7 +26,7 @@
 - **Naprawa:**
   - Przy generowaniu PDF do `<body>` dodawana jest klasa `pdf-export` (inject w generatePdfFromTemplate).
   - W CSS dodane reguły dla `.pdf-export`: `.wrap` bez paddingu, stała szerokość 794 px, wycentrowany; `.page` i `.hero` z `overflow-x: hidden` i `box-sizing: border-box`, `width: 100%` / `max-width: 100%`, żeby hero się nie wylewał i nie było poziomego overflowu.
-  - W `@media print` wzmocnione: `html, body` i `.page` z `overflow-x: hidden`, `.wrap` z `width: 100%`, `.hero` z `width: 100%` / `max-width: 100%`, żeby w druku też nie było białego paska.
+  - W `@media print` wzmocnione: `html, body` i `.page` z `overflow-x: hidden`, `.wrap` z `width: 100%`, `.hero` z `width: 100%` / `max-width: 100%`. Dla `.page` zmienione `overflow: visible` na `overflow-x: hidden` i `overflow-y: visible`, żeby w druku nie było poziomego overflowu i białego paska.
 
 ---
 

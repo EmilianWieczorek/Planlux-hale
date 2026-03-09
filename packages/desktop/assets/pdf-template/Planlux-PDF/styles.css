@@ -641,7 +641,8 @@ body.pdf-export{
     margin: 0 !important;
     border-radius: 0 !important;
     box-shadow: none !important;
-    overflow: visible !important;
+    overflow-x: hidden !important;
+    overflow-y: visible !important;
     page-break-after: always;
     break-after: page;
     page-break-inside: avoid;
