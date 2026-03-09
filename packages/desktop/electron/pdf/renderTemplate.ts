@@ -36,6 +36,8 @@ export interface OfferPdfPayload {
   constructionType?: string;
   roofType?: string;
   wallsType?: string;
+  /** SPECYFIKACJA TECHNICZNA (Konstrukcja, Dach, Ściany) – aliasy dla template {{konstrukcja}}/{{dach}}/{{sciany}}. */
+  technicalSpec?: { konstrukcja?: string; dach?: string; sciany?: string };
   priceNet: number;
   priceGross: number;
   /** Table rows HTML (base + addons) */
@@ -77,9 +79,12 @@ function buildReplacements(p: OfferPdfPayload): Record<string, string> {
     "{{lengthM}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.lengthM),
     "{{heightM}}": p.heightM != null ? `${new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.heightM)} m` : "–",
     "{{areaM2}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.areaM2),
-    "{{constructionType}}": escapeHtml(p.constructionType ?? "–"),
-    "{{roofType}}": escapeHtml(p.roofType ?? "–"),
-    "{{wallsType}}": escapeHtml(p.wallsType ?? "–"),
+    "{{constructionType}}": escapeHtml((p.constructionType?.trim() || undefined) ?? "Brak danych"),
+    "{{roofType}}": escapeHtml((p.roofType?.trim() || undefined) ?? "Brak danych"),
+    "{{wallsType}}": escapeHtml((p.wallsType?.trim() || undefined) ?? "Brak danych"),
+    "{{konstrukcja}}": escapeHtml((p.technicalSpec?.konstrukcja?.trim() || p.constructionType?.trim() || undefined) ?? "Brak danych"),
+    "{{dach}}": escapeHtml((p.technicalSpec?.dach?.trim() || p.roofType?.trim() || undefined) ?? "Brak danych"),
+    "{{sciany}}": escapeHtml((p.technicalSpec?.sciany?.trim() || p.wallsType?.trim() || undefined) ?? "Brak danych"),
     "{{priceNet}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.priceNet),
     "{{priceGross}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.priceGross),
     "{{breakdownRowsHtml}}": p.breakdownRowsHtml,

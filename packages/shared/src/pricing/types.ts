@@ -144,5 +144,11 @@ export interface HallVariant {
     typDachu?: string;
     boki?: string;
     dach?: string;
+    /** Alias dla typKonstrukcji (źródło: pricing_surface.construction_type). */
+    construction_type?: string;
+    /** Alias dla typDachu (źródło: pricing_surface.roof_type). */
+    roof_type?: string;
+    /** Alias dla boki (źródło: pricing_surface.walls). */
+    walls?: string;
   };
 }

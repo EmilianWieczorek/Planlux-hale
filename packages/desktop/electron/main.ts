@@ -294,6 +294,28 @@ COMMIT;
   } catch (e) {
     logger.warn("[migration] Supabase config tables skipped", e);
   }
+  // pricing_surface: add technical spec columns for PDF (Konstrukcja, Dach, Ściany).
+  try {
+    const hasSurface = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
+    if (hasSurface?.name) {
+      const surfaceCols = database.prepare("PRAGMA table_info(pricing_surface)").all() as Array<{ name: string }>;
+      const surfaceColSet = new Set(surfaceCols.map((c) => c.name));
+      const adds = [
+        { col: "construction_type", sql: "ALTER TABLE pricing_surface ADD COLUMN construction_type TEXT" },
+        { col: "roof_type", sql: "ALTER TABLE pricing_surface ADD COLUMN roof_type TEXT" },
+        { col: "walls", sql: "ALTER TABLE pricing_surface ADD COLUMN walls TEXT" },
+      ];
+      for (const { col, sql } of adds) {
+        if (!surfaceColSet.has(col)) {
+          database.exec(sql);
+          surfaceColSet.add(col);
+          logger.info("[migration] pricing_surface." + col + " added");
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn("[migration] pricing_surface technical spec columns skipped", e);
+  }
   // Password auth v1: per-user salt, algo version, password_unavailable, last_online_login_at
   try {
     const usersCols = database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;

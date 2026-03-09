@@ -292,7 +292,7 @@ export async function runPrintToPdfFromFile(
       .catch(() => {});
     await new Promise((r) => setTimeout(r, 150));
 
-    /* Diagnostyka renderera: .hero backgroundImage, overflow, wymiary */
+    /* Diagnostyka renderera: overflow, wymiary document/body/wrap/page/hero */
     const rendererDiag = await win.webContents
       .executeJavaScript(
         `(function(){
@@ -302,39 +302,61 @@ export async function runPrintToPdfFromFile(
           var page = document.querySelector('.page');
           var body = document.body;
           var docEl = document.documentElement;
+          var wrapStyle = wrap ? getComputedStyle(wrap) : null;
+          var pageStyle = page ? getComputedStyle(page) : null;
+          var heroStyle = hero ? getComputedStyle(hero) : null;
+          var docScrollW = docEl ? docEl.scrollWidth : 0;
+          var docClientW = docEl ? docEl.clientWidth : 0;
+          var bodyScrollW = body ? body.scrollWidth : 0;
+          var bodyClientW = body ? body.clientWidth : 0;
+          var overflowDoc = docScrollW > docClientW;
+          var overflowBody = bodyScrollW > bodyClientW;
           return {
             heroBackgroundImage: hero ? getComputedStyle(hero).backgroundImage : null,
             heroBgSrc: bgEl ? bgEl.getAttribute('src') : null,
             heroBgNaturalWidth: bgEl && bgEl.naturalWidth != null ? bgEl.naturalWidth : null,
             heroBgNaturalHeight: bgEl && bgEl.naturalHeight != null ? bgEl.naturalHeight : null,
+            documentElementScrollWidth: docScrollW,
+            documentElementClientWidth: docClientW,
+            bodyScrollWidth: bodyScrollW,
+            bodyClientWidth: bodyClientW,
             wrapScrollWidth: wrap ? wrap.scrollWidth : null,
             wrapClientWidth: wrap ? wrap.clientWidth : null,
+            wrapComputedWidth: wrapStyle ? parseFloat(wrapStyle.width) : null,
             pageScrollWidth: page ? page.scrollWidth : null,
             pageClientWidth: page ? page.clientWidth : null,
-            bodyScrollWidth: body ? body.scrollWidth : null,
-            docElClientWidth: docEl ? docEl.clientWidth : null,
-            overflowX: body ? (body.scrollWidth > body.clientWidth) : false
+            pageComputedWidth: pageStyle ? parseFloat(pageStyle.width) : null,
+            heroScrollWidth: hero ? hero.scrollWidth : null,
+            heroClientWidth: hero ? hero.clientWidth : null,
+            heroComputedWidth: heroStyle ? parseFloat(heroStyle.width) : null,
+            overflowDocumentElement: overflowDoc,
+            overflowBody: overflowBody,
+            horizontalOverflow: overflowDoc || overflowBody
           };
         })()`
       )
       .catch(() => ({}));
     logger.info("[pdf] diagnostyka: renderer .hero backgroundImage", rendererDiag.heroBackgroundImage ?? "(brak)");
-    logger.info("[pdf] diagnostyka: renderer .hero__bg src/naturalWidth/naturalHeight", {
-      src: rendererDiag.heroBgSrc ?? "(brak elem .hero__bg)",
-      naturalWidth: rendererDiag.heroBgNaturalWidth,
-      naturalHeight: rendererDiag.heroBgNaturalHeight,
+    logger.info("[pdf] diagnostyka: document/body widths i overflow", {
+      documentElementScrollWidth: rendererDiag.documentElementScrollWidth,
+      documentElementClientWidth: rendererDiag.documentElementClientWidth,
+      bodyScrollWidth: rendererDiag.bodyScrollWidth,
+      bodyClientWidth: rendererDiag.bodyClientWidth,
+      horizontalOverflow: rendererDiag.horizontalOverflow,
     });
-    logger.info("[pdf] diagnostyka: wymiary wrappera i overflow", {
+    logger.info("[pdf] diagnostyka: wrap/page/hero widths", {
       wrapScrollWidth: rendererDiag.wrapScrollWidth,
       wrapClientWidth: rendererDiag.wrapClientWidth,
+      wrapComputedWidth: rendererDiag.wrapComputedWidth,
       pageScrollWidth: rendererDiag.pageScrollWidth,
       pageClientWidth: rendererDiag.pageClientWidth,
-      bodyScrollWidth: rendererDiag.bodyScrollWidth,
-      docElClientWidth: rendererDiag.docElClientWidth,
-      overflowX: rendererDiag.overflowX,
+      pageComputedWidth: rendererDiag.pageComputedWidth,
+      heroScrollWidth: rendererDiag.heroScrollWidth,
+      heroClientWidth: rendererDiag.heroClientWidth,
+      heroComputedWidth: rendererDiag.heroComputedWidth,
     });
-    if (rendererDiag.overflowX) {
-      logger.warn("[pdf] overflow X wykryty – możliwy biały pasek po prawej; sprawdź .wrap/.page width i padding");
+    if (rendererDiag.horizontalOverflow) {
+      logger.warn("[pdf] horizontal overflow detected – scrollWidth > clientWidth (możliwy biały pasek po prawej)");
     }
 
     let pdfBuf: Buffer;

@@ -24,14 +24,41 @@ function str(v: unknown): string {
   return String(v).trim();
 }
 
+/** First non-empty string from row for given keys (Supabase may return different column casings). */
+function firstStr(row: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const k of keys) {
+    const val = row[k];
+    if (val != null && String(val).trim() !== "") return String(val).trim();
+  }
+  return undefined;
+}
+
+/** Normalized surface row (pricing_surface) with optional spec fields for PDF. */
+export interface NormalizedSurfaceRow {
+  variant: string;
+  name: string;
+  area_min_m2: number;
+  area_max_m2: number;
+  price: number;
+  unit?: string;
+  construction_type?: string;
+  roof_type?: string;
+  walls?: string;
+  roof?: string;
+}
+
 /** Normalize a single row from pricing_surface (column-based or data_json). */
-function normalizeSurfaceRow(row: Record<string, unknown>): { variant: string; name: string; area_min_m2: number; area_max_m2: number; price: number; unit?: string } | null {
+function normalizeSurfaceRow(row: Record<string, unknown>): NormalizedSurfaceRow | null {
   let variant: string;
   let name: string;
   let area_min_m2: number;
   let area_max_m2: number;
   let price: number;
   let unit: string | undefined;
+  let construction_type: string | undefined;
+  let roof_type: string | undefined;
+  let walls: string | undefined;
+  let roof: string | undefined;
 
   if (row.data_json != null && typeof row.data_json === "string") {
     try {
@@ -54,14 +81,18 @@ function normalizeSurfaceRow(row: Record<string, unknown>): { variant: string; n
   if (row.unit != null || row.stawka_jednostka != null || row.stawka_jedn != null) {
     unit = str(row.unit ?? row.stawka_jednostka ?? row.stawka_jedn) || undefined;
   }
+  construction_type = firstStr(row, "construction_type", "Typ_Konstrukcji", "constructionType");
+  roof_type = firstStr(row, "roof_type", "Typ_Dachu", "roofType");
+  walls = firstStr(row, "walls", "Boki", "sides");
+  roof = firstStr(row, "roof", "Dach");
 
   if (!variant) return null;
-  return { variant, name, area_min_m2, area_max_m2, price, unit };
+  return { variant, name, area_min_m2, area_max_m2, price, unit, construction_type, roof_type, walls, roof };
 }
 
-/** Group surface rows by variant+name and build HallVariant[]. */
-export function buildHallVariants(surfaceRows: Array<{ variant: string; name: string; area_min_m2: number; area_max_m2: number; price: number; unit?: string }>): HallVariant[] {
-  const byKey = new Map<string, typeof surfaceRows>();
+/** Group surface rows by variant+name and build HallVariant[]. Meta (Konstrukcja/Dach/Ściany) from first row of each group. */
+export function buildHallVariants(surfaceRows: NormalizedSurfaceRow[]): HallVariant[] {
+  const byKey = new Map<string, NormalizedSurfaceRow[]>();
   for (const r of surfaceRows) {
     const key = `${r.variant}\n${r.name}`;
     if (!byKey.has(key)) byKey.set(key, []);
@@ -78,7 +109,20 @@ export function buildHallVariants(surfaceRows: Array<{ variant: string; name: st
         price: r.price,
         unit: r.unit,
       }));
-    result.push({ variant, name, tiers });
+    const first = rows[0];
+    const meta =
+      first?.construction_type != null ||
+      first?.roof_type != null ||
+      first?.walls != null ||
+      first?.roof != null
+        ? {
+            typKonstrukcji: first.construction_type,
+            typDachu: first.roof_type,
+            boki: first.walls,
+            dach: first.roof,
+          }
+        : undefined;
+    result.push({ variant, name, tiers, meta });
   }
   if (DEBUG) {
     console.debug("[relationalPricing] buildHallVariants", {
@@ -90,7 +134,7 @@ export function buildHallVariants(surfaceRows: Array<{ variant: string; name: st
   return result;
 }
 
-/** Flatten HallVariant[] to cennik (CennikRow[]) for pricing_cache and calculatePrice. */
+/** Flatten HallVariant[] to cennik (CennikRow[]) for pricing_cache and calculatePrice. Typ_Konstrukcji/Typ_Dachu/Boki/Dach from variant meta for PDF spec. */
 export function hallVariantsToCennik(hallVariants: HallVariant[]): CennikRow[] {
   const cennik: CennikRow[] = [];
   for (const hv of hallVariants) {
@@ -98,6 +142,10 @@ export function hallVariantsToCennik(hallVariants: HallVariant[]): CennikRow[] {
       cennik.push({
         wariant_hali: hv.variant,
         Nazwa: hv.name,
+        Typ_Konstrukcji: hv.meta?.typKonstrukcji,
+        Typ_Dachu: hv.meta?.typDachu,
+        Boki: hv.meta?.boki,
+        Dach: hv.meta?.dach,
         area_min_m2: t.min,
         area_max_m2: t.max,
         cena: t.price,
@@ -201,6 +249,17 @@ export async function fetchRelationalPricing(supabase: SupabaseClient): Promise<
   if (normalizedSurface.length === 0) {
     if (DEBUG) console.debug("[relationalPricing] no surface rows after normalize");
     return null;
+  }
+
+  if (DEBUG && surfaceRows.length > 0) {
+    const firstRaw = surfaceRows[0] as Record<string, unknown>;
+    const firstNorm = normalizedSurface[0];
+    console.debug("[relationalPricing] first surface row keys (pricing_surface)", Object.keys(firstRaw).sort());
+    console.debug("[relationalPricing] first normalized spec (construction_type, roof_type, walls)", {
+      construction_type: firstNorm?.construction_type ?? "(brak)",
+      roof_type: firstNorm?.roof_type ?? "(brak)",
+      walls: firstNorm?.walls ?? "(brak)",
+    });
   }
 
   const hallVariants = buildHallVariants(normalizedSurface);

@@ -29,7 +29,7 @@
   src: local('Inter Bold'), local('Segoe UI'), local('Arial');
 }
 
-@page { size: A4; margin: -2px; }
+@page { size: A4; margin: 0; }
 
 :root{
   --ink: #0B1220;
@@ -58,6 +58,9 @@ html, body{
 }
 body.pdf-export{
   overflow-x: hidden;
+  max-width: 794px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .wrap{
@@ -84,6 +87,7 @@ body.pdf-export{
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 /* A4 screen canvas: full px to avoid Chromium print subpixel seam */

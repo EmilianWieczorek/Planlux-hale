@@ -103,7 +103,7 @@ function normalizeCennikRow(raw: RawRecord): CennikRow {
     Nazwa: deriveHallVariantLabel(n, "cennik", variantKey),
     Typ_Konstrukcji: n.construction_type != null ? String(n.construction_type) : (n.Typ_Konstrukcji as string | undefined),
     Typ_Dachu: n.roof_type != null ? String(n.roof_type) : (n.Typ_Dachu as string | undefined),
-    Boki: n.sides != null ? String(n.sides) : (n.Boki as string | undefined),
+    Boki: n.walls != null ? String(n.walls) : (n.sides != null ? String(n.sides) : (n.Boki as string | undefined)),
     Dach: n.roof != null ? String(n.roof) : (n.Dach as string | undefined),
     area_min_m2: toNum(n.area_min_m2, 0),
     area_max_m2: toNum(n.area_max_m2, 0),

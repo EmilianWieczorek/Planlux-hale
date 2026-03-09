@@ -108,6 +108,9 @@ export function mapOfferDataToPayload(
   }
   const variantName = o.variantNazwa || o.variantHali;
   const baseRow = pr.base?.row;
+  const konstrukcja = baseRow?.Typ_Konstrukcji ?? o.construction_type;
+  const dach = baseRow?.Typ_Dachu ?? baseRow?.Dach ?? o.roof_type;
+  const sciany = baseRow?.Boki ?? o.walls;
 
   const baseTableRow = `<tr>
     <td>Hala – ${escapeHtml(variantName)}</td>
@@ -178,9 +181,14 @@ export function mapOfferDataToPayload(
     lengthM: o.lengthM,
     heightM: o.heightM,
     areaM2: o.areaM2,
-    constructionType: baseRow?.Typ_Konstrukcji,
-    roofType: baseRow?.Typ_Dachu ?? baseRow?.Dach,
-    wallsType: baseRow?.Boki,
+    constructionType: konstrukcja,
+    roofType: dach,
+    wallsType: sciany,
+    technicalSpec: {
+      konstrukcja: konstrukcja ?? undefined,
+      dach: dach ?? undefined,
+      sciany: sciany ?? undefined,
+    },
     priceNet,
     priceGross,
     breakdownRowsHtml,
@@ -295,6 +303,17 @@ export async function generatePdfFromTemplate(
   const now = new Date();
   const offerDate = now.toLocaleDateString("pl-PL", { day: "2-digit", month: "2-digit", year: "numeric" });
   const payload = mapOfferDataToPayload(offerData, offerDate, pdfOverrides?.page1 ?? null);
+
+  logger.info("[pdf] technical spec payload", {
+    construction_type: payload.constructionType ?? "(brak)",
+    roof_type: payload.roofType ?? "(brak)",
+    walls: payload.wallsType ?? "(brak)",
+    source: offerData.pricing?.base?.row
+      ? "pricing.base.row"
+      : offerData.offer?.construction_type != null || offerData.offer?.roof_type != null || offerData.offer?.walls != null
+        ? "offer"
+        : "brak",
+  });
 
   const editorContentForPage2 = pdfOverrides?.page2
     ? ({ page2: pdfOverrides.page2 } as Partial<PdfEditorContent>)

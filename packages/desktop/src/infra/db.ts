@@ -76,15 +76,34 @@ export function saveBase(db: Db, base: CachedBase): void {
   writeBaseToLocalTables(db, base);
 }
 
+/** Row from cennik may have Typ_Konstrukcji, Typ_Dachu, Boki (or construction_type, roof_type, walls). */
+function getSpecFromCennikRow(row: unknown): { construction_type: string | null; roof_type: string | null; walls: string | null } {
+  const r = row as Record<string, unknown> | null;
+  if (!r || typeof r !== "object") return { construction_type: null, roof_type: null, walls: null };
+  const construction_type = (r.Typ_Konstrukcji ?? r.construction_type) != null ? String(r.Typ_Konstrukcji ?? r.construction_type).trim() || null : null;
+  const roof_type = (r.Typ_Dachu ?? r.Dach ?? r.roof_type) != null ? String(r.Typ_Dachu ?? r.Dach ?? r.roof_type).trim() || null : null;
+  const walls = (r.Boki ?? r.walls) != null ? String(r.Boki ?? r.walls).trim() || null : null;
+  return { construction_type, roof_type, walls };
+}
+
 /** Write base to pricing_surface, addons_surcharges, standard_included so local fallback has data. */
 export function writeBaseToLocalTables(db: Db, base: CachedBase): void {
   try {
     const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
     if (!hasSurface?.name) return;
+    const surfaceCols = db.prepare("PRAGMA table_info(pricing_surface)").all() as Array<{ name: string }>;
+    const hasSpecCols = surfaceCols.some((c) => c.name === "construction_type");
     db.prepare("DELETE FROM pricing_surface").run();
-    const insSurface = db.prepare("INSERT INTO pricing_surface (data_json) VALUES (?)");
+    const insSurface = hasSpecCols
+      ? db.prepare("INSERT INTO pricing_surface (data_json, construction_type, roof_type, walls) VALUES (?, ?, ?, ?)")
+      : db.prepare("INSERT INTO pricing_surface (data_json) VALUES (?)");
     for (const row of base.cennik) {
-      insSurface.run(JSON.stringify(row));
+      if (hasSpecCols) {
+        const spec = getSpecFromCennikRow(row);
+        insSurface.run(JSON.stringify(row), spec.construction_type, spec.roof_type, spec.walls);
+      } else {
+        insSurface.run(JSON.stringify(row));
+      }
     }
     db.prepare("DELETE FROM addons_surcharges").run();
     const insAddons = db.prepare("INSERT INTO addons_surcharges (data_json) VALUES (?)");
@@ -126,12 +145,28 @@ export function loadBaseFromLocalTables(db: Db): CachedBase | null {
     const version = metaRow?.version ?? 1;
     const lastUpdated = new Date().toISOString();
 
-    const cennikRows = db.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>;
+    const surfaceCols = db.prepare("PRAGMA table_info(pricing_surface)").all() as Array<{ name: string }>;
+    const hasSpecCols = surfaceCols.some((c) => c.name === "construction_type");
+    const cennikRows = hasSpecCols
+      ? (db.prepare("SELECT data_json, construction_type, roof_type, walls FROM pricing_surface").all() as Array<{
+          data_json: string;
+          construction_type: string | null;
+          roof_type: string | null;
+          walls: string | null;
+        }>)
+      : (db.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>);
     const cennik: unknown[] = [];
     for (const row of cennikRows) {
       try {
         const parsed = JSON.parse(row.data_json);
-        cennik.push(typeof parsed === "object" && parsed != null ? parsed : row.data_json);
+        const obj = typeof parsed === "object" && parsed != null ? parsed : {};
+        if (hasSpecCols && "construction_type" in row) {
+          const r = row as { construction_type?: string | null; roof_type?: string | null; walls?: string | null };
+          if (r.construction_type != null && r.construction_type !== "" && parsed.Typ_Konstrukcji == null) (obj as Record<string, unknown>).Typ_Konstrukcji = r.construction_type;
+          if (r.roof_type != null && r.roof_type !== "" && parsed.Typ_Dachu == null && parsed.Dach == null) (obj as Record<string, unknown>).Typ_Dachu = r.roof_type;
+          if (r.walls != null && r.walls !== "" && parsed.Boki == null) (obj as Record<string, unknown>).Boki = r.walls;
+        }
+        cennik.push(obj);
       } catch {
         // skip invalid row
       }

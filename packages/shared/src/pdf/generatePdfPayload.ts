@@ -21,6 +21,12 @@ export interface GeneratePdfOffer {
   areaM2: number;
   variantNazwa: string;
   variantHali: string;
+  /** Konstrukcja (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Typ_Konstrukcji lub variant. */
+  construction_type?: string;
+  /** Dach (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Typ_Dachu/Dach lub variant. */
+  roof_type?: string;
+  /** Ściany (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Boki lub variant. */
+  walls?: string;
 }
 
 export interface GeneratePdfPricingBase {

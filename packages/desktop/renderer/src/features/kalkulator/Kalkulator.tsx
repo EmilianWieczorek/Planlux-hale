@@ -562,6 +562,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       return;
     }
     if (isDebugLog) console.debug("[Kalkulator] saveOffer success", { id: saveRes.offer.id });
+    const baseRow = r.result?.base?.row;
     const payload = {
       userId,
       sellerName: userDisplayName?.trim() || "Planlux",
@@ -579,6 +580,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         areaM2,
         variantNazwa,
         variantHali,
+        construction_type: baseRow?.Typ_Konstrukcji,
+        roof_type: baseRow?.Typ_Dachu ?? baseRow?.Dach,
+        walls: baseRow?.Boki,
       },
       pricing: r.result,
       offerNumber,
