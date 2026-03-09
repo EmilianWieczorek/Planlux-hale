@@ -368,12 +368,12 @@ export const offerDraftStore = {
   },
 };
 
-/** Buduje GeneratePdfPayload z draftu + pricing (z kalkulatora). Spec (Konstrukcja/Dach/Ściany) z pricing.base.row. */
+/** Builds GeneratePdfPayload from draft + pricing. Technical spec (Konstrukcja, Dach, Ściany) is resolved in main process from pricing_surface; not from pricing.base.row. */
 export function buildPayloadFromDraft(
   userId: string,
   pricing: {
     totalPln: number;
-    base?: { totalBase?: number; row?: { Typ_Konstrukcji?: string; Typ_Dachu?: string; Dach?: string; Boki?: string } };
+    base?: { totalBase?: number; row?: unknown };
     additions?: unknown[];
     standardInPrice?: unknown[];
   },
@@ -384,7 +384,6 @@ export function buildPayloadFromDraft(
   const l = parseFloat(d.lengthM) || 0;
   const h = d.heightM ? parseFloat(d.heightM) : undefined;
   const areaM2 = w * l;
-  const baseRow = pricing.base?.row;
   return {
     userId,
     offerNumber: d.offerNumber?.trim() || "—",
@@ -403,9 +402,6 @@ export function buildPayloadFromDraft(
       areaM2: areaM2 || 800,
       variantNazwa: d.variantHali,
       variantHali: d.variantHali,
-      construction_type: baseRow?.Typ_Konstrukcji,
-      roof_type: baseRow?.Typ_Dachu ?? baseRow?.Dach,
-      walls: baseRow?.Boki,
     },
     pricing: {
       totalPln: pricing.totalPln,

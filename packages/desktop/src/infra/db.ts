@@ -223,6 +223,63 @@ export function getCachedBase(db: Db): CachedBase | null {
   };
 }
 
+const SPEC_FALLBACK = "(brak danych)";
+
+/**
+ * Get technical spec (construction_type, roof_type, walls) from pricing_surface for a variant.
+ * Matches by variant_hali or variant; if multiple rows exist, takes the first by lowest area_min_m2.
+ * Returns SPEC_FALLBACK for any missing value.
+ */
+export function getTechnicalSpecFromPricingSurface(
+  db: Db,
+  variantHali: string
+): { construction_type: string; roof_type: string; walls: string } | null {
+  try {
+    const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
+    if (!hasSurface?.name) return null;
+    const surfaceCols = db.prepare("PRAGMA table_info(pricing_surface)").all() as Array<{ name: string }>;
+    const hasSpecCols = surfaceCols.some((c) => c.name === "construction_type");
+    const rows = hasSpecCols
+      ? (db.prepare("SELECT data_json, construction_type, roof_type, walls FROM pricing_surface").all() as Array<{
+          data_json: string;
+          construction_type: string | null;
+          roof_type: string | null;
+          walls: string | null;
+        }>)
+      : (db.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>);
+    const variantNorm = (variantHali ?? "").trim();
+    const candidates: { area_min_m2: number; construction_type: string | null; roof_type: string | null; walls: string | null }[] = [];
+    for (const row of rows) {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(row.data_json) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const rowVariant = (String(parsed.wariant_hali ?? parsed.variant ?? "").trim());
+      if (rowVariant !== variantNorm) continue;
+      const area_min_m2 = typeof parsed.area_min_m2 === "number" ? parsed.area_min_m2 : Number(parsed.area_min_m2) || 0;
+      const r = row as { construction_type?: string | null; roof_type?: string | null; walls?: string | null };
+      candidates.push({
+        area_min_m2,
+        construction_type: hasSpecCols && r.construction_type != null ? String(r.construction_type).trim() || null : (parsed.construction_type != null ? String(parsed.construction_type).trim() : null) ?? (parsed.Typ_Konstrukcji != null ? String(parsed.Typ_Konstrukcji).trim() : null) ?? null,
+        roof_type: hasSpecCols && r.roof_type != null ? String(r.roof_type).trim() || null : (parsed.roof_type != null ? String(parsed.roof_type).trim() : null) ?? (parsed.Typ_Dachu != null ? String(parsed.Typ_Dachu).trim() : null) ?? (parsed.Dach != null ? String(parsed.Dach).trim() : null) ?? null,
+        walls: hasSpecCols && r.walls != null ? String(r.walls).trim() || null : (parsed.walls != null ? String(parsed.walls).trim() : null) ?? (parsed.Boki != null ? String(parsed.Boki).trim() : null) ?? null,
+      });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.area_min_m2 - b.area_min_m2);
+    const first = candidates[0];
+    return {
+      construction_type: first.construction_type ?? SPEC_FALLBACK,
+      roof_type: first.roof_type ?? SPEC_FALLBACK,
+      walls: first.walls ?? SPEC_FALLBACK,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve offer_number to offers_crm.id (for FK-safe inserts).
  * Returns id or null if not found. Throws only on invalid input.

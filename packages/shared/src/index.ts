@@ -36,6 +36,7 @@ export type {
   GeneratePdfPricingBase,
   GeneratePdfAddition,
   GeneratePdfStandardInPrice,
+  GeneratePdfTechnicalSpec,
 } from "./pdf/generatePdfPayload";
 export type {
   PdfTemplateConfig,

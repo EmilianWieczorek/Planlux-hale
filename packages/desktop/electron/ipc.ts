@@ -1470,6 +1470,14 @@ export async function registerIpcHandlers(deps: {
       logger.warn("[pdf] payload validation failed – missing fields", { missing });
       return { ok: false, error: `Nieprawidłowe dane do generowania PDF (brak: ${missing.join(", ")}).`, missingFields: missing };
     }
+    const variantHali = p.offer?.variantHali ?? "";
+    const { resolveTechnicalSpecForPdf } = await import("./pdf/resolveTechnicalSpecForPdf");
+    const technicalSpec = await resolveTechnicalSpecForPdf(variantHali, {
+      getSupabase: getSupabase ?? undefined,
+      getDb: getDb ?? undefined,
+      logger,
+    });
+    (p as { technicalSpec?: { construction_type: string; roof_type: string; walls: string } }).technicalSpec = technicalSpec;
     const desktopRootFromIpc = path.join(__dirname, "..", "..");
     if (fs.existsSync(path.join(desktopRootFromIpc, ".e2e-run-dir"))) {
       try {
@@ -1855,6 +1863,15 @@ export async function registerIpcHandlers(deps: {
       return { ok: false, error: "Nieprawidłowe dane (wymagane: offer, pricing, offerNumber)." };
     }
     try {
+      const variantHali = p.offer?.variantHali ?? "";
+      const { resolveTechnicalSpecForPdf } = await import("./pdf/resolveTechnicalSpecForPdf");
+      const technicalSpec = await resolveTechnicalSpecForPdf(variantHali, {
+        getSupabase: getSupabase ?? undefined,
+        getDb: getDb ?? undefined,
+        logger,
+      });
+      (p as { technicalSpec?: { construction_type: string; roof_type: string; walls: string } }).technicalSpec = technicalSpec;
+
       const { getPdfTemplateDir } = await import("./pdf/pdfPaths");
       const templateDir = getPdfTemplateDir();
       if (!templateDir) {
@@ -1873,6 +1890,7 @@ export async function registerIpcHandlers(deps: {
         sellerEmail: p.sellerEmail,
         sellerPhone: p.sellerPhone,
         clientAddressOrInstall: p.clientAddressOrInstall,
+        technicalSpec: p.technicalSpec,
       };
       const result = await generatePdfFromTemplate(
         offerData,

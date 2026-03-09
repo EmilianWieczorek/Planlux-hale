@@ -86,10 +86,12 @@ export interface PriceOverride {
   priceGross?: number;
 }
 
+const SPEC_FALLBACK = "(brak danych)";
+
 /**
  * Map payload z IPC (GeneratePdfPayload) na format szablonu (OfferPdfPayload).
- * constructionType/roofType/wallsType z base.row (CENNIK), gdy dostępne.
- * priceOverride: gdy ustawione, nadpisuje cenę z pricing engine.
+ * Technical spec (Konstrukcja, Dach, Ściany) only from input.technicalSpec (set by main from pricing_surface).
+ * Never uses pricing.base.row. Fallback SPEC_FALLBACK when technicalSpec missing.
  */
 export function mapOfferDataToPayload(
   input: GeneratePdfPayload,
@@ -107,10 +109,13 @@ export function mapOfferDataToPayload(
     else if (typeof priceOverride.priceNet === "number") priceGross = Math.round(priceOverride.priceNet * 1.23);
   }
   const variantName = o.variantNazwa || o.variantHali;
-  const baseRow = pr.base?.row;
-  const konstrukcja = baseRow?.Typ_Konstrukcji ?? o.construction_type;
-  const dach = baseRow?.Typ_Dachu ?? baseRow?.Dach ?? o.roof_type;
-  const sciany = baseRow?.Boki ?? o.walls;
+  const spec = input.technicalSpec;
+  const construction_type = spec?.construction_type?.trim() || SPEC_FALLBACK;
+  const roof_type = spec?.roof_type?.trim() || SPEC_FALLBACK;
+  const walls = spec?.walls?.trim() || SPEC_FALLBACK;
+  const konstrukcja = construction_type;
+  const dach = roof_type;
+  const sciany = walls;
 
   const baseTableRow = `<tr>
     <td>Hala – ${escapeHtml(variantName)}</td>
@@ -185,9 +190,9 @@ export function mapOfferDataToPayload(
     roofType: dach,
     wallsType: sciany,
     technicalSpec: {
-      konstrukcja: konstrukcja ?? undefined,
-      dach: dach ?? undefined,
-      sciany: sciany ?? undefined,
+      konstrukcja,
+      dach,
+      sciany,
     },
     priceNet,
     priceGross,
@@ -304,16 +309,27 @@ export async function generatePdfFromTemplate(
   const offerDate = now.toLocaleDateString("pl-PL", { day: "2-digit", month: "2-digit", year: "numeric" });
   const payload = mapOfferDataToPayload(offerData, offerDate, pdfOverrides?.page1 ?? null);
 
-  logger.info("[pdf] technical spec payload", {
-    construction_type: payload.constructionType ?? "(brak)",
-    roof_type: payload.roofType ?? "(brak)",
-    walls: payload.wallsType ?? "(brak)",
-    source: offerData.pricing?.base?.row
-      ? "pricing.base.row"
-      : offerData.offer?.construction_type != null || offerData.offer?.roof_type != null || offerData.offer?.walls != null
-        ? "offer"
-        : "brak",
+  const specMissing =
+    (payload.constructionType?.trim() || "") === "" ||
+    (payload.roofType?.trim() || "") === "" ||
+    (payload.wallsType?.trim() || "") === "" ||
+    payload.constructionType === SPEC_FALLBACK ||
+    payload.roofType === SPEC_FALLBACK ||
+    payload.wallsType === SPEC_FALLBACK;
+  logger.info("[pdf] technical spec payload final", {
+    construction_type: payload.constructionType ?? SPEC_FALLBACK,
+    roof_type: payload.roofType ?? SPEC_FALLBACK,
+    walls: payload.wallsType ?? SPEC_FALLBACK,
+    source: offerData.technicalSpec ? "technicalSpec" : "fallback",
   });
+  if (specMissing) {
+    logger.warn("[pdf] technical spec missing", {
+      reason: offerData.technicalSpec ? "empty fields in technicalSpec" : "technicalSpec not set",
+      construction_type: payload.constructionType ?? SPEC_FALLBACK,
+      roof_type: payload.roofType ?? SPEC_FALLBACK,
+      walls: payload.wallsType ?? SPEC_FALLBACK,
+    });
+  }
 
   const editorContentForPage2 = pdfOverrides?.page2
     ? ({ page2: pdfOverrides.page2 } as Partial<PdfEditorContent>)

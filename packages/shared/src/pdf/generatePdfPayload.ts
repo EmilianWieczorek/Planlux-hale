@@ -21,11 +21,11 @@ export interface GeneratePdfOffer {
   areaM2: number;
   variantNazwa: string;
   variantHali: string;
-  /** Konstrukcja (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Typ_Konstrukcji lub variant. */
+  /** Konstrukcja (PDF). Źródło: payload.technicalSpec (main process z pricing_surface). */
   construction_type?: string;
-  /** Dach (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Typ_Dachu/Dach lub variant. */
+  /** Dach (PDF). Źródło: payload.technicalSpec (main process z pricing_surface). */
   roof_type?: string;
-  /** Ściany (PDF: SPECYFIKACJA TECHNICZNA). Źródło: pricing.base.row.Boki lub variant. */
+  /** Ściany (PDF). Źródło: payload.technicalSpec (main process z pricing_surface). */
   walls?: string;
 }
 
@@ -64,6 +64,13 @@ export interface GeneratePdfPricing {
   totalPln: number;
 }
 
+/** Technical spec for PDF SPECYFIKACJA TECHNICZNA. Single source: main process resolver (pricing_surface). */
+export interface GeneratePdfTechnicalSpec {
+  construction_type: string;
+  roof_type: string;
+  walls: string;
+}
+
 /** Payload przekazywany do pdf:generate – dane oferty + wycena. */
 export interface GeneratePdfPayload {
   userId?: string;
@@ -74,4 +81,6 @@ export interface GeneratePdfPayload {
   sellerEmail?: string;
   sellerPhone?: string;
   clientAddressOrInstall?: string;
+  /** Technical spec (Konstrukcja, Dach, Ściany). Set by main process from pricing_surface; never from pricing.base.row. */
+  technicalSpec?: GeneratePdfTechnicalSpec;
 }

@@ -178,15 +178,57 @@ export async function syncConfig(
           standard: baseData.standard.length,
           hallVariants: Array.isArray(rel.hallVariants) ? rel.hallVariants.length : 0,
         });
+        if (process.env.LOG_LEVEL === "debug" && baseData.cennik.length > 0) {
+          const first = baseData.cennik[0] as Record<string, unknown> | undefined;
+          log.info("[configSync] first cennik row spec (PDF)", {
+            Typ_Konstrukcji: first?.Typ_Konstrukcji ?? "(brak)",
+            Typ_Dachu: first?.Typ_Dachu ?? first?.Dach ?? "(brak)",
+            Boki: first?.Boki ?? "(brak)",
+          });
+        }
       }
     } catch (e) {
       log.warn("[configSync] getRelationalPricing failed", e instanceof Error ? e.message : String(e));
     }
   }
 
-  // 2) Fallback: local SQLite tables (offline cache) + seed if empty.
+  // 2) Fallback: base_pricing.payload (getBase) when relational empty.
+  if ((!baseData || baseData.cennik.length === 0) && typeof api.getBase === "function") {
+    try {
+      const baseRes = await api.getBase();
+      if (baseRes?.cennik && Array.isArray(baseRes.cennik) && baseRes.cennik.length > 0) {
+        baseData = {
+          meta: {
+            version: baseRes.meta?.version ?? 1,
+            lastUpdated: baseRes.meta?.lastUpdated ?? new Date().toISOString(),
+          },
+          cennik: baseRes.cennik,
+          dodatki: baseRes.dodatki ?? [],
+          standard: baseRes.standard ?? [],
+        };
+        source = "remote";
+        log.info("[configSync] base_pricing.payload loaded", {
+          cennik: baseData.cennik.length,
+          dodatki: baseData.dodatki.length,
+          standard: baseData.standard.length,
+        });
+        if (process.env.LOG_LEVEL === "debug" && baseData.cennik.length > 0) {
+          const first = baseData.cennik[0] as Record<string, unknown> | undefined;
+          log.info("[configSync] first cennik row from base_pricing.payload (PDF spec)", {
+            Typ_Konstrukcji: first?.Typ_Konstrukcji ?? first?.construction_type ?? "(brak)",
+            Typ_Dachu: first?.Typ_Dachu ?? first?.Dach ?? first?.roof_type ?? "(brak)",
+            Boki: first?.Boki ?? first?.walls ?? "(brak)",
+          });
+        }
+      }
+    } catch (e) {
+      log.warn("[configSync] getBase (base_pricing.payload) failed", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // 3) Fallback: local SQLite tables (offline cache) + seed if empty.
   if (!baseData || baseData.cennik.length === 0) {
-    log.info("[configSync] no relational data, using SQLite fallback / seed");
+    log.info("[configSync] no relational/base_pricing data, using SQLite fallback / seed");
     let local = loadBaseFromLocalTables(db);
     let usedSeed = false;
     if (!local || local.cennik.length === 0) {

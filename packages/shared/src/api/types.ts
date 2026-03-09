@@ -22,6 +22,8 @@ export interface CennikRow {
   cena: number;
   stawka_jednostka?: string;
   uwagi?: string;
+  /** Optional technical spec from base_pricing.payload (jsonb) for PDF. */
+  payload?: { Typ_Konstrukcji?: string; Typ_Dachu?: string; Boki?: string };
 }
 
 export interface DodatkiRow {

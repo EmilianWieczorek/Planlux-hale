@@ -95,6 +95,14 @@ function normalizeCennikRow(raw: RawRecord): CennikRow {
   if (hasPolishKeys) {
     const row = { ...n } as Record<string, unknown>;
     row.stawka_jednostka = n.stawka_jednostka ?? n.stawka_jedn;
+    const spec = (v: unknown): string | undefined => (v != null && typeof v === "string" ? v.trim() || undefined : undefined);
+    row.Typ_Konstrukcji = spec(n.Typ_Konstrukcji ?? n.construction_type ?? n.konstrukcja) ?? (row.Typ_Konstrukcji as string | undefined);
+    row.Typ_Dachu = spec(n.Typ_Dachu ?? n.Dach ?? n.roof_type) ?? (row.Typ_Dachu as string | undefined);
+    row.Boki = spec(n.Boki ?? n.walls ?? n.Ściany ?? n.sides) ?? (row.Boki as string | undefined);
+    row.Dach = spec(n.Dach ?? n.roof_type ?? n.roof) ?? (row.Dach as string | undefined);
+    row.construction_type = row.construction_type ?? row.Typ_Konstrukcji;
+    row.roof_type = row.roof_type ?? row.Typ_Dachu ?? row.Dach;
+    row.walls = row.walls ?? row.Boki;
     return row as unknown as CennikRow;
   }
   const variantKey = deriveHallVariantKey(n, "cennik");
@@ -344,10 +352,25 @@ export function createSupabaseApiAdapter(config: SupabaseApiAdapterConfig): {
       dodatki: p.dodatki,
       standard: p.standard,
     });
+    // base_pricing stores spec in payload (jsonb); attach optional payload to each CennikRow so PDF can read row.payload.Typ_*.
+    const hasSpecInPayload =
+      rawPayload.Typ_Konstrukcji != null || rawPayload.Typ_Dachu != null || rawPayload.Boki != null;
+    const specPayload =
+      hasSpecInPayload
+        ? {
+            Typ_Konstrukcji: rawPayload.Typ_Konstrukcji as string | undefined,
+            Typ_Dachu: rawPayload.Typ_Dachu as string | undefined,
+            Boki: rawPayload.Boki as string | undefined,
+          }
+        : undefined;
+    const cennik: CennikRow[] =
+      specPayload != null
+        ? normalized.cennik.map((r) => ({ ...r, payload: specPayload }))
+        : normalized.cennik;
     return {
       ok: true,
       meta: { ...normalized.meta, version: rowVersion },
-      cennik: normalized.cennik,
+      cennik,
       dodatki: normalized.dodatki,
       standard: normalized.standard,
       debug: process.env.LOG_LEVEL === "debug" ? { counts: { cennik: normalized.cennik.length, dodatki: normalized.dodatki.length, standard: normalized.standard.length } } : undefined,

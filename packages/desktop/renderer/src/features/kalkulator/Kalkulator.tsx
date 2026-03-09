@@ -436,6 +436,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       const pricing = r?.ok && r.result
         ? { totalPln: r.result.totalPln ?? 210_000, base: r.result.base, additions: r.result.additions ?? [], standardInPrice: r.result.standardInPrice ?? [] }
         : { totalPln: 210_000, base: {}, additions: [] as unknown[], standardInPrice: [] as unknown[] };
+      if (isDebugLog) {
+        console.debug("[Kalkulator] PDF preview – technicalSpec resolved by main (pricing_surface)");
+      }
       const payload = buildPayloadFromDraft(userId, pricing, { sellerName: userDisplayName });
       const res = (await api("planlux:generatePdfPreview", payload, draft.pdfOverrides)) as { ok: boolean; base64Pdf?: string; error?: string };
       if (token !== previewTokenRef.current) return;
@@ -524,6 +527,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       manualSurcharges,
     })) as { ok: boolean; result?: { base?: { matched?: boolean }; additions?: unknown[]; standardInPrice?: unknown[]; totalPln?: number } };
     if (!r.ok || !r.result) throw new Error("Błąd wyceny");
+    if (isDebugLog) {
+      console.debug("[Kalkulator] pdf:generate – technicalSpec will be resolved by main (pricing_surface)");
+    }
     let offerNumber = draft.offerNumber?.trim();
     if (!offerNumber) {
       if (typeof window.planlux?.invoke === "function") {
@@ -562,7 +568,6 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       return;
     }
     if (isDebugLog) console.debug("[Kalkulator] saveOffer success", { id: saveRes.offer.id });
-    const baseRow = r.result?.base?.row;
     const payload = {
       userId,
       sellerName: userDisplayName?.trim() || "Planlux",
@@ -580,9 +585,6 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         areaM2,
         variantNazwa,
         variantHali,
-        construction_type: baseRow?.Typ_Konstrukcji,
-        roof_type: baseRow?.Typ_Dachu ?? baseRow?.Dach,
-        walls: baseRow?.Boki,
       },
       pricing: r.result,
       offerNumber,
