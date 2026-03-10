@@ -263,7 +263,16 @@ export async function fetchRelationalPricing(supabase: SupabaseClient): Promise<
   }
 
   const hallVariants = buildHallVariants(normalizedSurface);
-  const cennik = hallVariantsToCennik(hallVariants);
+  let cennik = hallVariantsToCennik(hallVariants);
+  cennik = cennik.filter((r) => r && String(r.wariant_hali ?? "").trim() !== "");
+  cennik = cennik.map((r) => ({
+    ...r,
+    Nazwa: r.Nazwa && String(r.Nazwa).trim() !== "" ? r.Nazwa : (r.wariant_hali ?? ""),
+  }));
+  const uniqueVariants = [...new Set(cennik.map((r) => String(r.wariant_hali ?? "").trim()).filter(Boolean))];
+  if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
+    console.info("[variants][main] relational loader mapped entries:", cennik.length, "unique variants:", uniqueVariants.length);
+  }
 
   const dodatki: DodatkiRow[] = addonsRows
     .map((r) => normalizeAddonsRow(r))

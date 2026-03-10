@@ -10,7 +10,7 @@ import fs from "fs";
 import { hashPassword, verifyPassword, validatePassword, isLegacyHash, LEGACY_SALT } from "./auth/password";
 import * as session from "./auth/session";
 import { performLogin } from "./auth/login";
-import type { GeneratePdfPayload } from "@planlux/shared";
+import type { GeneratePdfPayload, PricingEngineData, CennikRow, DodatkiRow, StandardRow } from "@planlux/shared";
 import { normalizeErrorMessage, normalizeRoleRbac } from "@planlux/shared";
 import { generatePdfPipeline, getTestPdfFileName, getE2EPlaceholderPdfBuffer } from "./pdf/generatePdf";
 import { generatePdfFromTemplate, mapOfferDataToPayload, type GeneratePdfFromTemplateOptions } from "./pdf/generatePdfFromTemplate";
@@ -648,12 +648,46 @@ export async function registerIpcHandlers(deps: {
     };
   }));
 
+  /** Typed empty pricing for engine and IPC. No unknown[]. */
+  const EMPTY_PRICING_DATA: PricingEngineData = { cennik: [], dodatki: [], standard: [] };
+  const EMPTY_PRICING = { version: 0, lastUpdated: "", ...EMPTY_PRICING_DATA };
+  type PricingSource = "pricing_cache" | "local_tables" | "fallback_json" | "empty";
+
+  function toPricingEngineData(
+    base?: { cennik?: unknown[]; dodatki?: unknown[]; standard?: unknown[] } | null
+  ): PricingEngineData {
+    return {
+      cennik: Array.isArray(base?.cennik) ? (base.cennik as CennikRow[]) : [],
+      dodatki: Array.isArray(base?.dodatki) ? (base.dodatki as DodatkiRow[]) : [],
+      standard: Array.isArray(base?.standard) ? (base.standard as StandardRow[]) : [],
+    };
+  }
+
   ipcMain.handle("planlux:getPricingCache", async () => {
+    const safeEmpty = (source: PricingSource) => ({
+      ok: true as const,
+      data: { ...EMPTY_PRICING },
+      pricingData: { ...EMPTY_PRICING_DATA },
+      source,
+    });
+    const safeError = (error: string) => {
+      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
+        logger.info("[variants][ipc] source=empty", { error });
+      }
+      return {
+        ok: false as const,
+        error,
+        data: { ...EMPTY_PRICING },
+        pricingData: { ...EMPTY_PRICING_DATA },
+        source: "empty" as const,
+      };
+    };
     try {
       const { getCachedBase, loadBaseFromLocalTables, saveBase } = await import("../src/infra/db");
       const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
       const db = getDb();
       let base = getCachedBase(db);
+      let source: PricingSource = "pricing_cache";
       if (!base || !base.cennik?.length) {
         let local = loadBaseFromLocalTables(db);
         if (!local || local.cennik.length === 0) {
@@ -667,20 +701,45 @@ export async function registerIpcHandlers(deps: {
           try {
             saveBase(db, local);
             base = local;
+            source = "local_tables";
           } catch (e) {
             logger.warn("[getPricingCache] saveBase failed after local load", e);
             base = local;
+            source = "local_tables";
           }
         }
       }
-      if (!base) {
-        logger.warn("[getPricingCache] no pricing data (cache and local tables empty)");
-        return { ok: true, data: null };
+      if (!base || !base.cennik?.length) {
+        logger.warn("[getPricingCache] no pricing data (cache and local tables empty), returning empty structure");
+        if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
+          const cacheRows = db.prepare("SELECT COUNT(1) as c FROM pricing_cache").get() as { c: number };
+          const surfaceRows = db.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c: number };
+          logger.info("[variants][main] getPricingCache empty", { pricing_cache_rows: cacheRows?.c ?? 0, pricing_surface_rows: surfaceRows?.c ?? 0 });
+          logger.info("[variants][ipc] source=empty");
+        }
+        return safeEmpty("empty");
       }
-      return { ok: true, data: base };
+      const pricingData = toPricingEngineData(base);
+      const cennik = pricingData.cennik;
+      const variantIds = [...new Set(cennik.map((r) => String(r?.wariant_hali ?? (r as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
+        logger.info("[variants][main] getPricingCache", {
+          pricing_cache_rows: 1,
+          cennik_entries: cennik.length,
+          unique_variants: variantIds.length,
+          sample_variants: variantIds.slice(0, 5),
+        });
+        logger.info("[variants][ipc] source=" + source);
+      }
+      return {
+        ok: true,
+        data: { version: base.version, lastUpdated: base.lastUpdated, ...pricingData },
+        pricingData,
+        source,
+      };
     } catch (e) {
       logger.error("getPricingCache failed", e);
-      return { ok: false, error: String(e) };
+      return safeError(String(e));
     }
   });
 
@@ -830,33 +889,49 @@ export async function registerIpcHandlers(deps: {
           if (r.failed > 0) logger.warn("[outbox] flush had failures", { failed: r.failed, operationType: r.firstError?.operationType, reason: r.firstError?.message ?? r.firstError?.code ?? "see outbox.last_error" });
         }).catch((e) => logger.error("[outbox] flush after sync failed", e instanceof Error ? e.message : String(e)));
       }
+      const data =
+        base && Array.isArray(base.cennik) && base.cennik.length > 0
+          ? { version: base.version, lastUpdated: base.lastUpdated, ...toPricingEngineData(base) }
+          : { ...EMPTY_PRICING };
+      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
+        const pd = toPricingEngineData(base);
+        const variantIds = [...new Set(pd.cennik.map((r) => String(r?.wariant_hali ?? "").trim()).filter(Boolean))];
+        logger.info("[variants][main] base:sync result", {
+          status: result.status,
+          cennik_entries: pd.cennik.length,
+          unique_variants: variantIds.length,
+          sample_variants: variantIds.slice(0, 5),
+        });
+      }
       return {
         ok: result.status !== "error",
         status: result.status,
-        version: result.version,
-        lastUpdated: result.lastUpdated ?? base?.lastUpdated,
-        data: base,
+        version: result.version ?? data.version,
+        lastUpdated: result.lastUpdated ?? base?.lastUpdated ?? data.lastUpdated,
+        data,
+        pricingData: base ? toPricingEngineData(base) : { ...EMPTY_PRICING_DATA },
         error: result.error,
       };
     } catch (e) {
       logger.error("base:sync failed", e);
-      throw AppError.fromUnknown(e);
+      return {
+        ok: false,
+        status: "error" as const,
+        data: { ...EMPTY_PRICING },
+        pricingData: { ...EMPTY_PRICING_DATA },
+        error: String(e),
+      };
     }
   }));
 
   ipcMain.handle("planlux:calculatePrice", async (_, input: unknown) => {
     try {
       const { calculatePrice } = await import("@planlux/shared");
+      const { getCachedBase } = await import("../src/infra/db");
       const db = getDb();
-      const row = db.prepare(
-        "SELECT cennik_json, dodatki_json, standard_json FROM pricing_cache ORDER BY pricing_version DESC LIMIT 1"
-      ).get() as { cennik_json: string; dodatki_json: string; standard_json: string } | undefined;
-      if (!row) return { ok: false, error: "Brak bazy cennika. Połącz się z internetem i uruchom synchronizację." };
-      const data = {
-        cennik: JSON.parse(row.cennik_json),
-        dodatki: JSON.parse(row.dodatki_json),
-        standard: JSON.parse(row.standard_json),
-      };
+      const base = getCachedBase(db);
+      if (!base || !Array.isArray(base.cennik)) return { ok: false, error: "Brak bazy cennika. Połącz się z internetem i uruchom synchronizację." };
+      const data: PricingEngineData = toPricingEngineData(base);
       const inp = input as {
         variantHali: string;
         widthM: number;
@@ -1912,7 +1987,10 @@ export async function registerIpcHandlers(deps: {
         { previewMode: true },
         (pdfOverrides as import("./pdf/generatePdfFromTemplate").PdfOverridesForGenerator | null | undefined) ?? undefined
       );
-      if (!result.ok) return { ok: false, error: result.error, details: result.details };
+      if (!result.ok) {
+        const errMsg = (result as { stage?: string }).stage === "TEMPLATE_MISSING" ? "Brak szablonu PDF" : (result.error ?? "Błąd generowania PDF");
+        return { ok: false, error: errMsg, details: result.details };
+      }
       const buf = fs.readFileSync(result.filePath);
       const fileSize = buf.length;
       const base64Pdf = buf.toString("base64");
@@ -1959,7 +2037,10 @@ export async function registerIpcHandlers(deps: {
         (templateConfig as Partial<import("@planlux/shared").PdfTemplateConfig> | null | undefined) ?? undefined,
         { previewMode: true }
       );
-      if (!result.ok) return { ok: false, error: result.error, details: result.details };
+      if (!result.ok) {
+        const errMsg = (result as { stage?: string }).stage === "TEMPLATE_MISSING" ? "Brak szablonu PDF" : (result.error ?? "Błąd generowania PDF");
+        return { ok: false, error: errMsg, details: result.details };
+      }
       const fileUrl = `planlux-pdf://preview/${result.fileName}`;
       if (process.env.NODE_ENV !== "production") {
         logger.info("[pdf] preview generated", { filePath: result.filePath, fileName: result.fileName });

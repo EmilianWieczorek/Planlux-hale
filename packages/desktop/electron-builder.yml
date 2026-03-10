@@ -23,6 +23,9 @@ asarUnpack:
 extraResources:
   - from: assets
     to: assets
+  - from: assets/pdf-template
+    to: assets/pdf-template
+    filter: ["**/*"]
 
 publish: null
 

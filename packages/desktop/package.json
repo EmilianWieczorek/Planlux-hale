@@ -1,6 +1,6 @@
 {
   "name": "@planlux/desktop",
-  "version": "1.0.13",
+  "version": "1.0.15",
   "description": "Planlux Hale – kalkulator i CRM ofert hal stalowych",
   "author": "Planlux",
   "repository": {
@@ -35,7 +35,8 @@
     "dist:portable": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win portable",
     "build:win": "npm run build && electron-builder --win",
     "dist:win": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --publish never --projectDir .",
-    "rebuild": "electron-rebuild -f -w keytar"
+    "rebuild": "electron-rebuild -f -w keytar",
+    "build:seed": "node scripts/buildSeedDb.mjs"
   },
   "build": {
     "appId": "pl.planlux.hale",
@@ -101,6 +102,7 @@
   "devDependencies": {
     "cross-env": "^7.0.3",
     "dotenv": "^16.4.5",
+    "sql.js": "^1.10.0",
     "@playwright/test": "^1.49.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

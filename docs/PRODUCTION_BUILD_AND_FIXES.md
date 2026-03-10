@@ -149,11 +149,11 @@ Wymagane wcześniej:
 Po zakończeniu buildu:
 
 - **Instalator Windows (NSIS):**  
-  `packages/desktop/release/Planlux Hale Setup 1.0.13.exe`  
+  `packages/desktop/release/Planlux Hale Setup 1.0.14.exe`  
   (wersja z `package.json` / `packages/desktop/package.json`).
 
 - **Katalog unpacked (do testów):**  
   `packages/desktop/release/win-unpacked/`  
   – uruchamiany plik: `Planlux Hale.exe`.
 
-Weryfikacja na czystym PC: zainstaluj z `Planlux Hale Setup 1.0.13.exe`, uruchom, sprawdź punkty z sekcji „Test plan” i w razie problemów prześlij fragment logów z `userData/logs/app.log`.
+Weryfikacja na czystym PC: zainstaluj z `Planlux Hale Setup 1.0.14.exe`, uruchom, sprawdź punkty z sekcji „Test plan” i w razie problemów prześlij fragment logów z `userData/logs/app.log`.

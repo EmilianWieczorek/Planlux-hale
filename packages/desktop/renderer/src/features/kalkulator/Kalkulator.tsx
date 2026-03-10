@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useOfferDraft } from "../../state/useOfferDraft";
 import { buildPayloadFromDraft, offerDraftStore, requestSyncTempNumbers, type OfferStatus } from "../../state/offerDraftStore";
 import { buildPdfFileName as buildPdfFileNameFromShared, normalizeErrorMessage as normalizeErrorMessageFromShared } from "@planlux/shared";
+import type { PricingEngineData } from "@planlux/shared";
 
 /** Bezpieczne wywołanie – fallback gdy import nie zadziała (np. cache Vite). */
 const buildPdfFileName =
@@ -47,6 +48,7 @@ import {
   Button,
   IconButton,
   Tooltip,
+  Alert,
 } from "@mui/material";
 import { ContentCopy, Lock } from "@mui/icons-material";
 import { DuplicateOffersModal, type DuplicateOffer } from "./DuplicateOffersModal";
@@ -55,13 +57,41 @@ import { StandardPanel } from "./StandardPanel";
 import { formatStandardLabel } from "./formatStandardLabel";
 import { EmailComposer } from "../oferty/EmailComposer";
 
-const defaultVariants = [
-  { id: "T18_T35_DACH", name: "Hala T-18 + T-35 dach" },
-  { id: "TERM_60_PNEU", name: "Hala Termiczna płyta 60 mm – dach pneumatyczny" },
-  { id: "PLYTA_WARSTWOWA", name: "Hala całość z płyty warstwowej" },
-  { id: "PLANDEKA_T18", name: "Hala Plandeka boki blacha T-18" },
-  { id: "PLANDEKA", name: "Hala Plandeka boki Plandeka" },
+const defaultVariants: Array<{ id: string; name: string }> = [
+  { id: "T18_T35_DACH", name: "Hala T18 + T35 dach" },
+  { id: "T18_T35_POL", name: "Hala T18 + T35 pełna" },
+  { id: "T22_T35_DACH", name: "Hala T22 + T35 dach" },
+  { id: "T22_T35_POL", name: "Hala T22 + T35 pełna" },
 ];
+
+/** Jedno źródło prawdy: cennik → lista wariantów do UI. Odrzuca rekordy bez wariant_hali, deduplikuje, mapuje na { id, name }. */
+function normalizeVariantsFromPricing(pricingData: {
+  cennik?: unknown[];
+  dodatki?: unknown[];
+  standard?: unknown[];
+} | null): { variants: Array<{ id: string; name: string }>; source: "pricing_cache" | "fallback" | "defaultVariants" } {
+  if (!pricingData?.cennik || !Array.isArray(pricingData.cennik) || pricingData.cennik.length === 0) {
+    return { variants: defaultVariants, source: "defaultVariants" };
+  }
+  const rows = pricingData.cennik as Array<{ wariant_hali?: string; variant?: string; Nazwa?: string; name?: string }>;
+  const byId = new Map<string, { id: string; name: string }>();
+  for (const r of rows) {
+    const id = String(r?.wariant_hali ?? r?.variant ?? "").trim();
+    if (!id) continue;
+    if (!byId.has(id)) byId.set(id, { id, name: String(r?.Nazwa ?? r?.name ?? id) });
+  }
+  const variants = [...byId.values()];
+  if (variants.length === 0) return { variants: defaultVariants, source: "defaultVariants" };
+  return { variants, source: "pricing_cache" };
+}
+
+const EMPTY_PRICING_DATA: PricingEngineData & { version?: number; lastUpdated?: string } = {
+  version: 0,
+  lastUpdated: "",
+  cennik: [],
+  dodatki: [],
+  standard: [],
+};
 
 const styles = {
   grid: {
@@ -236,12 +266,27 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     if (newNum) showToast(`Numer zsynchronizowany: ${newNum}`);
   }, [showToast]);
 
-  const loadPricing = useCallback(async () => {
+  const pricingLoadRetryDoneRef = useRef(false);
+  const loadPricing = useCallback(async (isRetry = false) => {
     const r = ((await api("planlux:getPricingCache")) ?? {}) as {
       ok?: boolean;
       data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
+      pricingData?: { cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
+      reason?: string;
+      source?: string;
     };
-    if (r.ok && r.data) setPricingData(r.data);
+    const raw = r.data ?? r.pricingData;
+    const data = raw && Array.isArray(raw.cennik) ? raw : EMPTY_PRICING_DATA;
+    setPricingData(data);
+    if (import.meta.env?.DEV && typeof window !== "undefined") {
+      const count = Array.isArray(data.cennik) ? data.cennik.length : 0;
+      const { variants: v, source } = normalizeVariantsFromPricing(data);
+      console.info("[variants][renderer] loadPricing", { pricingDataLoaded: true, cennikCount: count, variantsCount: v.length, source: (r as { source?: string }).source ?? source, isRetry });
+    }
+    if (!isRetry && Array.isArray(data.cennik) && data.cennik.length === 0 && !pricingLoadRetryDoneRef.current) {
+      pricingLoadRetryDoneRef.current = true;
+      setTimeout(() => loadPricing(true), 500);
+    }
   }, [api]);
 
   useEffect(() => {
@@ -283,6 +328,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
   }, [online, draft.offerNumber, runSyncOfferNumber]);
 
+  const pricingMissingToastShownRef = useRef(false);
   useEffect(() => {
     const autoSync = async () => {
       setSyncing(true);
@@ -297,17 +343,26 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           error?: string;
         };
         setSyncStatus(r.status ?? null);
-        if (r.ok && r.data) setPricingData(r.data);
-        else if (r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
+        const data = r.data && Array.isArray(r.data.cennik) ? r.data : EMPTY_PRICING_DATA;
+        setPricingData(data);
+        if (!r.ok && r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
       } catch (e) {
         setSyncStatus("error");
         setSyncError(e instanceof Error ? e.message : "Błąd synchronizacji");
+        setPricingData(EMPTY_PRICING_DATA);
       } finally {
         setSyncing(false);
       }
     };
     autoSync();
   }, [api]);
+
+  useEffect(() => {
+    if (!syncing && pricingData == null && !pricingMissingToastShownRef.current) {
+      pricingMissingToastShownRef.current = true;
+      showToast("Cennik nie został załadowany");
+    }
+  }, [syncing, pricingData, showToast]);
 
   const syncPricing = async () => {
     setSyncing(true);
@@ -322,8 +377,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         error?: string;
       };
       setSyncStatus(r.status ?? null);
-      if (r.ok && r.data) setPricingData(r.data);
-      else if (r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
+      const data = r.data && Array.isArray(r.data.cennik) ? r.data : EMPTY_PRICING_DATA;
+      setPricingData(data);
+      if (!r.ok && r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
       if (r.status === "synced") showToast("Baza zaktualizowana");
       else if (r.status === "unchanged") showToast("Baza aktualna");
       else if (r.status === "offline") showToast("Offline – używam lokalnej bazy");
@@ -338,19 +394,33 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
   };
 
-  const variants =
-    pricingData?.cennik &&
-    Array.isArray(pricingData.cennik) &&
-    (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).length > 0
-      ? [
-          ...new Map(
-            (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).map((r) => [
-              r.wariant_hali,
-              { id: r.wariant_hali, name: r.Nazwa ?? r.wariant_hali },
-            ])
-          ).values(),
-        ]
-      : defaultVariants;
+  const { variants: normalizedVariants, source: variantsSource } = useMemo(
+    () => normalizeVariantsFromPricing(pricingData ?? null),
+    [pricingData]
+  );
+
+  const variantHaliValid = normalizedVariants.some((v) => v.id === draft.variantHali);
+  useEffect(() => {
+    if (normalizedVariants.length > 0 && !variantHaliValid) {
+      actions.ensureVariantInList(normalizedVariants.map((v) => v.id));
+    }
+  }, [normalizedVariants, variantHaliValid, actions]);
+
+  const variants = normalizedVariants;
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const cennikCount = Array.isArray(pricingData?.cennik) ? pricingData.cennik.length : 0;
+    const inList = variants.some((v) => v.id === draft.variantHali);
+    console.info("[variants][renderer] state", {
+      pricingDataReceived: pricingData != null,
+      cennikCount,
+      variantsCount: variants.length,
+      selectedVariant: draft.variantHali,
+      selectedVariantInList: inList,
+      source: variantsSource,
+    });
+  }, [pricingData, variants.length, draft.variantHali, variantsSource]);
 
   const standardOptions =
     (pricingData?.standard as Array<{ wariant_hali: string; element: string; uwagi?: string }> | undefined)
@@ -955,6 +1025,26 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <input style={styles.input} value={clientPhone} onChange={(e) => actions.setClientPhone(e.target.value)} placeholder="+48 123 456 789" />
           </AccordionDetails>
         </Accordion>
+        {!pricingData && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Brak wczytanego cennika. Wykonaj synchronizację.
+          </Alert>
+        )}
+        {variantsSource === "defaultVariants" && pricingData != null && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Brak pełnego cennika. Wyświetlono warianty awaryjne.
+          </Alert>
+        )}
+        {import.meta.env?.DEV && (
+          <Box sx={{ mb: 1, p: 1, bgcolor: "grey.100", borderRadius: 1, fontSize: "0.75rem" }}>
+            <Typography variant="caption" component="div" fontWeight="bold">[DEV] Variants</Typography>
+            <Typography variant="caption" component="div">pricingData loaded: {pricingData != null ? "yes" : "no"}</Typography>
+            <Typography variant="caption" component="div">cennik count: {Array.isArray(pricingData?.cennik) ? pricingData.cennik.length : 0}</Typography>
+            <Typography variant="caption" component="div">variants count: {variants.length}</Typography>
+            <Typography variant="caption" component="div">selectedVariant: {draft.variantHali}</Typography>
+            <Typography variant="caption" component="div">source: {variantsSource}</Typography>
+          </Box>
+        )}
         <Accordion defaultExpanded sx={{ "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
             <Typography variant="subtitle2">Konfiguracja hali</Typography>
@@ -964,7 +1054,12 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           </AccordionSummary>
           <AccordionDetails>
             <label style={styles.label}>Wariant hali</label>
-            <select style={styles.input} value={variantHali} onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); }} data-testid="hall-variant">
+            <select
+              style={styles.input}
+              value={variantHaliValid ? variantHali : (variants[0]?.id ?? "")}
+              onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); }}
+              data-testid="hall-variant"
+            >
               {variants.map((v) => (
                 <option key={v.id} value={v.id}>{v.name}</option>
               ))}

@@ -636,10 +636,57 @@ async function runStartup(): Promise<void> {
   logger.info("[app] config", sanitizeConfigForLog(electronCfg));
 
   const database = getDb();
+  logger.info("[bootstrap] migrations complete");
+
+  // Ensure pricing tables exist (defensive: create if missing).
+  try {
+    const hasSurface = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
+    const hasAddons = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='addons_surcharges'").get() as { name?: string } | undefined;
+    const hasStandard = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='standard_included'").get() as { name?: string } | undefined;
+    if (!hasSurface?.name || !hasAddons?.name || !hasStandard?.name) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS config_sync_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL DEFAULT 0, last_synced_at TEXT DEFAULT NULL);
+        INSERT OR IGNORE INTO config_sync_meta (id, version) VALUES (1, 0);
+        CREATE TABLE IF NOT EXISTS pricing_surface (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS addons_surcharges (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS standard_included (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
+      `);
+      logger.info("[bootstrap] created missing pricing tables");
+    }
+  } catch (e) {
+    logger.warn("[bootstrap] ensure pricing tables failed", e);
+  }
+
+  const { getSeedDbPath, restorePricingFromSeedDb, getSeedVersionFromFile } = await import("../src/infra/seedDb");
   const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
   const { loadBaseFromLocalTables, saveBase, getCachedBase } = await import("../src/infra/db");
 
+  const seedPath = getSeedDbPath({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath || "",
+    appPath: app.getAppPath(),
+    dirname: __dirname,
+  });
+  let restoredFromSeedThisRun = false;
+  if (seedPath) {
+    logger.info("[seed-db] seed database found");
+    const surfaceCount = (database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number } | undefined)?.c ?? 0;
+    const cacheRow = getCachedBase(database);
+    const cacheEmpty = !cacheRow || !cacheRow.cennik?.length;
+    if (surfaceCount === 0 || cacheEmpty) {
+      logger.info("[seed-db] local pricing empty, restoring from seed");
+      const restored = restorePricingFromSeedDb(database, seedPath, logger);
+      if (restored) {
+        restoredFromSeedThisRun = true;
+        const ver = getSeedVersionFromFile(seedPath);
+        if (ver != null) logger.info("[seed-db] seed version = " + String(ver));
+      }
+    }
+  }
+
   const seeded = seedBaseIfEmpty(database);
+  if (seeded) logger.info("[bootstrap] seeding database");
+
   try {
     const pricingSurfaceCount =
       database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number } | undefined;
@@ -653,8 +700,15 @@ async function runStartup(): Promise<void> {
       addons_surcharges: addonsCount?.c ?? 0,
       standard_included: standardCount?.c ?? 0,
     });
-    if (seeded && (pricingSurfaceCount?.c ?? 0) === 0) {
-      logger.warn("[bootstrap] seed reported true but pricing_surface still empty – possible migration/table mismatch");
+    if ((pricingSurfaceCount?.c ?? 0) === 0) {
+      const reseeded = seedBaseIfEmpty(database);
+      if (reseeded) {
+        const after = loadBaseFromLocalTables(database);
+        if (after && after.cennik.length > 0) {
+          saveBase(database, after);
+          logger.info("[bootstrap] reseeded pricing cache because database was empty");
+        }
+      }
     }
   } catch (e) {
     logger.warn("[bootstrap] pricing tables count failed", e);
@@ -673,14 +727,18 @@ async function runStartup(): Promise<void> {
     }
   }
 
+  let syncSucceeded = false;
   try {
     const { syncConfig } = await import("../src/services/configSync");
     await syncConfig(database, logger, apiClient);
+    syncSucceeded = true;
+    logger.info("[bootstrap] pricing sync success");
+    if (restoredFromSeedThisRun) logger.info("[seed-db] sync updated local pricing after seed");
   } catch (e) {
     logger.warn("[configSync] startup sync failed – app continues with local data", e);
   }
 
-  // Ensure pricing_cache is never empty after bootstrap: if still empty, fill from local tables or seed.
+  // Ensure pricing_cache is never empty: fill from local tables, seed DB, seed script, or default-pricing.json.
   let cacheRow = getCachedBase(database);
   if (!cacheRow || !cacheRow.cennik?.length) {
     let local = loadBaseFromLocalTables(database);
@@ -689,6 +747,39 @@ async function runStartup(): Promise<void> {
       if (reseeded) logger.info("[bootstrap] re-ran seed (cache empty after sync)");
       local = loadBaseFromLocalTables(database);
     }
+    if ((!local || local.cennik.length === 0) && seedPath) {
+      const restored = restorePricingFromSeedDb(database, seedPath, logger);
+      if (restored) local = loadBaseFromLocalTables(database);
+    }
+    if ((!local || local.cennik.length === 0) && !syncSucceeded) {
+      const defaultPath = path.join(app.getAppPath(), "assets", "default-pricing.json");
+      const defaultPathResources = path.join(process.resourcesPath || "", "assets", "default-pricing.json");
+      const defaultPathDev = path.join(__dirname, "..", "assets", "default-pricing.json");
+      for (const p of [defaultPathResources, defaultPath, defaultPathDev]) {
+        const normalized = path.normalize(p);
+        if (fs.existsSync(normalized)) {
+          try {
+            const raw = fs.readFileSync(normalized, "utf-8");
+            const data = JSON.parse(raw) as { version?: number; lastUpdated?: string; cennik?: unknown[]; dodatki?: unknown[]; standard?: unknown[] };
+            if (Array.isArray(data.cennik) && data.cennik.length > 0) {
+              const base = {
+                version: data.version ?? 1,
+                lastUpdated: data.lastUpdated ?? new Date().toISOString(),
+                cennik: data.cennik,
+                dodatki: Array.isArray(data.dodatki) ? data.dodatki : [],
+                standard: Array.isArray(data.standard) ? data.standard : [],
+              };
+              saveBase(database, base);
+              logger.info("[bootstrap] fallback pricing loaded", { from: normalized, cennik: base.cennik.length });
+              local = base;
+              break;
+            }
+          } catch (e) {
+            logger.warn("[bootstrap] load default-pricing.json failed", { path: normalized, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+    }
     if (local && local.cennik.length > 0) {
       try {
         saveBase(database, local);
@@ -696,7 +787,7 @@ async function runStartup(): Promise<void> {
       } catch (e) {
         logger.warn("[bootstrap] saveBase after fallback failed", e);
       }
-    } else {
+    } else if (!cacheRow?.cennik?.length) {
       logger.error("[bootstrap] pricing_cache still empty after sync and seed – variants/standards/addons will not load");
     }
   }
@@ -715,6 +806,24 @@ async function runStartup(): Promise<void> {
       logger.warn("[pdf] startup template check failed", e);
     }
   }
+
+  try {
+    const cacheRow = getCachedBase(database);
+    const cacheCount = database.prepare("SELECT COUNT(1) as c FROM pricing_cache").get() as { c: number };
+    const surfaceCount = database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c: number };
+    const cennik = cacheRow && Array.isArray(cacheRow.cennik) ? cacheRow.cennik : [];
+    const variantIds = [...new Set((cennik as Array<{ wariant_hali?: string; variant?: string }>).map((r) => String(r?.wariant_hali ?? r?.variant ?? "").trim()).filter(Boolean))];
+    logger.info("[variants][main] bootstrap_done", {
+      pricing_cache_rows: cacheCount?.c ?? 0,
+      pricing_surface_rows: surfaceCount?.c ?? 0,
+      cennik_entries: cennik.length,
+      unique_variants: variantIds.length,
+      sample_variants: variantIds.slice(0, 5),
+    });
+  } catch (e) {
+    logger.warn("[variants][main] bootstrap_done log failed", e);
+  }
+
   await registerIpcHandlers({
     getDb,
     getDbPath: () => dbPath,

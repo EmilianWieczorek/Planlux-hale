@@ -23,7 +23,7 @@ vi.mock("../../state/useOfferDraft", () => ({
       status: "DRAFT",
       addons: [],
     },
-    actions: {},
+    actions: { ensureVariantInList: () => {}, setVariantHali: () => {} },
   }),
 }));
 

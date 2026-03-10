@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "lastUpdated": "2025-01-01T00:00:00.000Z",
+  "cennik": [
+    { "wariant_hali": "T18_T35_DACH", "Nazwa": "Hala T18 + T35 dach", "cena": 350, "area_min_m2": 1, "area_max_m2": 5000, "stawka_jedn": "m2" },
+    { "wariant_hali": "T18_T35_POL", "Nazwa": "Hala T18 + T35 pełna", "cena": 380, "area_min_m2": 1, "area_max_m2": 5000, "stawka_jedn": "m2" },
+    { "wariant_hali": "T22_T35_DACH", "Nazwa": "Hala T22 + T35 dach", "cena": 370, "area_min_m2": 1, "area_max_m2": 5000, "stawka_jedn": "m2" },
+    { "wariant_hali": "T22_T35_POL", "Nazwa": "Hala T22 + T35 pełna", "cena": 400, "area_min_m2": 1, "area_max_m2": 5000, "stawka_jedn": "m2" },
+    { "wariant_hali": "T18_T35_DACH", "Nazwa": "Hala T18 + T35 dach (mała)", "cena": 360, "area_min_m2": 1, "area_max_m2": 500, "stawka_jedn": "m2" },
+    { "wariant_hali": "T22_T35_DACH", "Nazwa": "Hala T22 + T35 dach (mała)", "cena": 380, "area_min_m2": 1, "area_max_m2": 500, "stawka_jedn": "m2" },
+    { "wariant_hali": "T18_T35_POL", "Nazwa": "Hala T18 + T35 pełna (mała)", "cena": 390, "area_min_m2": 1, "area_max_m2": 500, "stawka_jedn": "m2" },
+    { "wariant_hali": "T22_T35_POL", "Nazwa": "Hala T22 + T35 pełna (mała)", "cena": 410, "area_min_m2": 1, "area_max_m2": 500, "stawka_jedn": "m2" },
+    { "wariant_hali": "T18_T35_DACH", "Nazwa": "Hala T18 + T35 dach (średnia)", "cena": 355, "area_min_m2": 501, "area_max_m2": 1500, "stawka_jedn": "m2" },
+    { "wariant_hali": "T22_T35_DACH", "Nazwa": "Hala T22 + T35 dach (średnia)", "cena": 375, "area_min_m2": 501, "area_max_m2": 1500, "stawka_jedn": "m2" }
+  ],
+  "dodatki": [
+    { "wariant_hali": "T18_T35_DACH", "nazwa": "Dopłata za wysokość", "stawka": 40, "jednostka": "m2" },
+    { "wariant_hali": "T18_T35_DACH", "nazwa": "Dopłata za bramę", "stawka": 1200, "jednostka": "szt" },
+    { "wariant_hali": "T18_T35_DACH", "nazwa": "Dopłata za świetliki", "stawka": 25, "jednostka": "m2" },
+    { "wariant_hali": "T22_T35_DACH", "nazwa": "Dopłata za wysokość", "stawka": 45, "jednostka": "m2" },
+    { "wariant_hali": "T22_T35_DACH", "nazwa": "Dopłata za bramę", "stawka": 1300, "jednostka": "szt" },
+    { "wariant_hali": "T22_T35_DACH", "nazwa": "Dopłata za świetliki", "stawka": 28, "jednostka": "m2" },
+    { "wariant_hali": "T18_T35_POL", "nazwa": "Dopłata za wysokość", "stawka": 42, "jednostka": "m2" },
+    { "wariant_hali": "T18_T35_POL", "nazwa": "Dopłata za bramę", "stawka": 1250, "jednostka": "szt" },
+    { "wariant_hali": "T22_T35_POL", "nazwa": "Dopłata za wysokość", "stawka": 47, "jednostka": "m2" },
+    { "wariant_hali": "T22_T35_POL", "nazwa": "Dopłata za bramę", "stawka": 1350, "jednostka": "szt" }
+  ],
+  "standard": [
+    { "wariant_hali": "T18_T35_DACH", "element": "Konstrukcja stalowa", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T18_T35_DACH", "element": "Pokrycie dachowe", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T18_T35_DACH", "element": "Ściany boczne", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T22_T35_DACH", "element": "Konstrukcja stalowa", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T22_T35_DACH", "element": "Pokrycie dachowe", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T18_T35_POL", "element": "Konstrukcja stalowa", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T18_T35_POL", "element": "Pokrycie pełne", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T22_T35_POL", "element": "Konstrukcja stalowa", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T22_T35_POL", "element": "Pokrycie pełne", "ilosc": 1, "wartosc_ref": 1, "uwagi": "" },
+    { "wariant_hali": "T18_T35_DACH", "element": "Fundament", "ilosc": 1, "wartosc_ref": 1, "uwagi": "w cenie" }
+  ]
+}

@@ -209,17 +209,44 @@ export function loadBaseFromLocalTables(db: Db): CachedBase | null {
   }
 }
 
+function safeParseArray(json: string, label: string): unknown[] | null {
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) {
+      if (typeof process !== "undefined" && process.env?.LOG_LEVEL !== "silent") {
+        console.warn("[variants][db] invalid pricing cache json", { field: label, reason: "not array" });
+      }
+      return null;
+    }
+    return parsed;
+  } catch {
+    if (typeof process !== "undefined" && process.env?.LOG_LEVEL !== "silent") {
+      console.warn("[variants][db] invalid pricing cache json", { field: label });
+    }
+    return null;
+  }
+}
+
 export function getCachedBase(db: Db): CachedBase | null {
-  const row = db.prepare(
-    "SELECT pricing_version, last_updated, cennik_json, dodatki_json, standard_json FROM pricing_cache ORDER BY pricing_version DESC LIMIT 1"
-  ).get() as { pricing_version: number; last_updated: string; cennik_json: string; dodatki_json: string; standard_json: string } | undefined;
+  let row: { pricing_version: number; last_updated: string; cennik_json: string; dodatki_json: string; standard_json: string } | undefined;
+  try {
+    row = db.prepare(
+      "SELECT pricing_version, last_updated, cennik_json, dodatki_json, standard_json FROM pricing_cache ORDER BY pricing_version DESC LIMIT 1"
+    ).get() as typeof row;
+  } catch {
+    return null;
+  }
   if (!row) return null;
+  const cennik = safeParseArray(row.cennik_json, "cennik_json");
+  const dodatki = safeParseArray(row.dodatki_json, "dodatki_json");
+  const standard = safeParseArray(row.standard_json, "standard_json");
+  if (cennik === null || dodatki === null || standard === null) return null;
   return {
     version: row.pricing_version,
     lastUpdated: row.last_updated,
-    cennik: JSON.parse(row.cennik_json),
-    dodatki: JSON.parse(row.dodatki_json),
-    standard: JSON.parse(row.standard_json),
+    cennik,
+    dodatki,
+    standard,
   };
 }
 

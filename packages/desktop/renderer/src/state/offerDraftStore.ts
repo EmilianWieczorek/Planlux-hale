@@ -274,6 +274,20 @@ export const offerDraftStore = {
 
   /** Kalkulator */
   setVariantHali: (v: string) => setState((s) => ({ ...s, variantHali: v })),
+  /** Upewnij się, że variantHali jest na liście ważnych id (np. z normalizedVariants). Jeśli nie – ustaw pierwszy z listy. */
+  ensureVariantInList: (validIds: string[]) => {
+    if (validIds.length === 0) return;
+    const current = state.variantHali;
+    if (validIds.includes(current)) return;
+    const previous = current;
+    state = { ...state, variantHali: validIds[0], updatedAt: new Date().toISOString() };
+    refreshCachedSnapshot();
+    scheduleSave();
+    notify();
+    if (typeof console !== "undefined" && console.info) {
+      console.info("[variants][draft] restored variant invalid, fallback applied", { previous, fallback: validIds[0] });
+    }
+  },
   setWidthM: (v: string) => setState((s) => ({ ...s, widthM: v })),
   setLengthM: (v: string) => setState((s) => ({ ...s, lengthM: v })),
   setHeightM: (v: string) => setState((s) => ({ ...s, heightM: v })),
