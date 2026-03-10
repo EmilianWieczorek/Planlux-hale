@@ -227,12 +227,13 @@ const SPEC_FALLBACK = "(brak danych)";
 
 /**
  * Get technical spec (construction_type, roof_type, walls) from pricing_surface for a variant.
- * Matches by variant_hali or variant; if multiple rows exist, takes the first by lowest area_min_m2.
- * Returns SPEC_FALLBACK for any missing value.
+ * Matches by normalized variant or by possibleValues (alias list from resolver). No area columns used.
+ * Takes first matching row; returns SPEC_FALLBACK for any missing value.
  */
 export function getTechnicalSpecFromPricingSurface(
   db: Db,
-  variantHali: string
+  variantHali: string,
+  possibleValues?: string[]
 ): { construction_type: string; roof_type: string; walls: string } | null {
   try {
     const hasSurface = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
@@ -247,8 +248,15 @@ export function getTechnicalSpecFromPricingSurface(
           walls: string | null;
         }>)
       : (db.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>);
-    const variantNorm = (variantHali ?? "").trim();
-    const candidates: { area_min_m2: number; construction_type: string | null; roof_type: string | null; walls: string | null }[] = [];
+    const norm = (s: string) =>
+      (s ?? "")
+        .trim()
+        .toUpperCase()
+        .replace(/[\s-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_|_$/g, "") || (s ?? "").trim();
+    const variantNorm = norm(variantHali ?? "");
+    const matchSet = possibleValues && possibleValues.length > 0 ? new Set(possibleValues) : null;
     for (const row of rows) {
       let parsed: Record<string, unknown>;
       try {
@@ -256,25 +264,21 @@ export function getTechnicalSpecFromPricingSurface(
       } catch {
         continue;
       }
-      const rowVariant = (String(parsed.wariant_hali ?? parsed.variant ?? "").trim());
-      if (rowVariant !== variantNorm) continue;
-      const area_min_m2 = typeof parsed.area_min_m2 === "number" ? parsed.area_min_m2 : Number(parsed.area_min_m2) || 0;
+      const rowVariant = norm(String(parsed.wariant_hali ?? parsed.variant ?? parsed.name ?? ""));
+      if (!rowVariant) continue;
+      const matches = rowVariant === variantNorm || (matchSet != null && matchSet.has(rowVariant));
+      if (!matches) continue;
       const r = row as { construction_type?: string | null; roof_type?: string | null; walls?: string | null };
-      candidates.push({
-        area_min_m2,
-        construction_type: hasSpecCols && r.construction_type != null ? String(r.construction_type).trim() || null : (parsed.construction_type != null ? String(parsed.construction_type).trim() : null) ?? (parsed.Typ_Konstrukcji != null ? String(parsed.Typ_Konstrukcji).trim() : null) ?? null,
-        roof_type: hasSpecCols && r.roof_type != null ? String(r.roof_type).trim() || null : (parsed.roof_type != null ? String(parsed.roof_type).trim() : null) ?? (parsed.Typ_Dachu != null ? String(parsed.Typ_Dachu).trim() : null) ?? (parsed.Dach != null ? String(parsed.Dach).trim() : null) ?? null,
-        walls: hasSpecCols && r.walls != null ? String(r.walls).trim() || null : (parsed.walls != null ? String(parsed.walls).trim() : null) ?? (parsed.Boki != null ? String(parsed.Boki).trim() : null) ?? null,
-      });
+      const construction_type = hasSpecCols && r.construction_type != null ? String(r.construction_type).trim() || null : (parsed.construction_type != null ? String(parsed.construction_type).trim() : null) ?? (parsed.Typ_Konstrukcji != null ? String(parsed.Typ_Konstrukcji).trim() : null) ?? null;
+      const roof_type = hasSpecCols && r.roof_type != null ? String(r.roof_type).trim() || null : (parsed.roof_type != null ? String(parsed.roof_type).trim() : null) ?? (parsed.Typ_Dachu != null ? String(parsed.Typ_Dachu).trim() : null) ?? (parsed.Dach != null ? String(parsed.Dach).trim() : null) ?? null;
+      const walls = hasSpecCols && r.walls != null ? String(r.walls).trim() || null : (parsed.walls != null ? String(parsed.walls).trim() : null) ?? (parsed.Boki != null ? String(parsed.Boki).trim() : null) ?? null;
+      return {
+        construction_type: construction_type ?? SPEC_FALLBACK,
+        roof_type: roof_type ?? SPEC_FALLBACK,
+        walls: walls ?? SPEC_FALLBACK,
+      };
     }
-    if (candidates.length === 0) return null;
-    candidates.sort((a, b) => a.area_min_m2 - b.area_min_m2);
-    const first = candidates[0];
-    return {
-      construction_type: first.construction_type ?? SPEC_FALLBACK,
-      roof_type: first.roof_type ?? SPEC_FALLBACK,
-      walls: first.walls ?? SPEC_FALLBACK,
-    };
+    return null;
   } catch {
     return null;
   }

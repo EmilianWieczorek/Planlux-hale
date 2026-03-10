@@ -6,6 +6,7 @@
 
 import { mergePdfOverrides, type PdfOverrides } from "./pdfOverrides";
 import type { GeneratePdfPayload } from "@planlux/shared";
+import { formatStandardLabel } from "../features/kalkulator/formatStandardLabel";
 
 export type OfferStatus = "DRAFT" | "READY_TO_SEND" | "SENT" | "ACCEPTED" | "REJECTED";
 
@@ -48,13 +49,40 @@ export interface OfferDraft {
   clientNip: string;
   clientEmail: string;
   clientPhone: string;
+  /**
+   * DODATKI (płatne) – nowy stan UI.
+   * Uwaga: dla kompatybilności wstecznej utrzymujemy też legacy `addons` (nazwa+ilosc) używany przez wycenę.
+   */
+  selectedAddons?: Array<{ name: string; price: number; unit?: string; quantity: number; optionKey?: string }>;
+  /**
+   * STANDARD HALI (informacyjny, nie wpływa na cenę) – nowy stan UI.
+   * Źródło: standard_included (w praktyce: pricingData.standard z cache).
+   */
+  selectedStandards?: Array<{ name: string; description: string }>;
+  /** Legacy: dodatki przekazywane do calculatePrice (nazwa + ilosc). */
   addons: Array<{ nazwa: string; ilosc: number }>;
-  /** Standardy: element → w cenie (INCLUDED_FREE) vs dolicz (CHARGE_EXTRA) */
+  /** Legacy: snapshot standardów do trybu CHARGE_EXTRA (stary UI). Pozostawione dla kompatybilności, ale UI już go nie używa. */
   standardSnapshot: Array<{ element: string; pricingMode: "INCLUDED_FREE" | "CHARGE_EXTRA" }>;
+  /**
+   * STANDARD: System rynnowy (sterowany ze Standardów).
+   * enabled jest pochodne od selectedStandards (czy użytkownik dodał pozycję "system rynnowy"),
+   * ale trzymamy konfigurację w store, żeby nie gubić ustawień po klikach.
+   */
+  gutterStandard?: {
+    pricingMode: "INCLUDED" | "ADD";
+    calcMode: "BY_LENGTH" | "BY_WIDTH";
+    sides: 1 | 2;
+    /** Nazwa dodatku w bazie (addons_surcharges) używana do wyceny gdy pricingMode=ADD. */
+    addonName?: string;
+  };
   /** Auto system rynnowy (obwód × stawka) */
   rainGuttersAuto?: boolean;
   /** Bramy segmentowe: width, height, quantity */
-  gates?: Array<{ width: number; height: number; quantity: number }>;
+  gates?: Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>;
+  /** Dopłata do płyty 80 mm – wybór w sekcji dodatków specjalnych (T18_T35_DACH) */
+  plate80?: boolean;
+  /** Dopłata do płyty 100 mm – wybór w sekcji dodatków specjalnych (T18_T35_DACH) */
+  plate100?: boolean;
   /** Auto dopłata za wysokość */
   heightSurchargeAuto?: boolean;
   /** Ręczne dopłaty */
@@ -90,8 +118,13 @@ function createEmptyDraft(): OfferDraft {
     clientNip: "",
     clientEmail: "",
     clientPhone: "",
+    selectedAddons: [],
+    selectedStandards: [],
     addons: [],
     standardSnapshot: [],
+    gutterStandard: { pricingMode: "INCLUDED", calcMode: "BY_LENGTH", sides: 2 },
+    plate80: false,
+    plate100: false,
     pdfOverrides: {},
     updatedAt: new Date().toISOString(),
     lastPreviewAt: null,
@@ -251,11 +284,24 @@ export const offerDraftStore = {
   setClientNip: (v: string) => setState((s) => ({ ...s, clientNip: v })),
   setClientEmail: (v: string) => setState((s) => ({ ...s, clientEmail: v })),
   setClientPhone: (v: string) => setState((s) => ({ ...s, clientPhone: v })),
+  setSelectedStandards: (v: Array<{ name: string; description: string }>) =>
+    setState((s) => ({ ...s, selectedStandards: v })),
+  setSelectedAddons: (v: Array<{ name: string; price: number; unit?: string; quantity: number; optionKey?: string }>) =>
+    setState((s) => ({
+      ...s,
+      selectedAddons: v,
+      // keep legacy shape in sync for calculatePrice (no pricing data needed there)
+      addons: v.map((a) => ({ nazwa: a.name, ilosc: a.quantity })),
+    })),
+  setGutterStandard: (v: OfferDraft["gutterStandard"]) =>
+    setState((s) => ({ ...s, gutterStandard: v ?? s.gutterStandard })),
   setAddons: (v: Array<{ nazwa: string; ilosc: number }>) => setState((s) => ({ ...s, addons: v })),
   setStandardSnapshot: (v: Array<{ element: string; pricingMode: "INCLUDED_FREE" | "CHARGE_EXTRA" }>) =>
     setState((s) => ({ ...s, standardSnapshot: v })),
   setRainGuttersAuto: (v: boolean) => setState((s) => ({ ...s, rainGuttersAuto: v })),
-  setGates: (v: Array<{ width: number; height: number; quantity: number }>) => setState((s) => ({ ...s, gates: v })),
+  setGates: (v: Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>) => setState((s) => ({ ...s, gates: v })),
+  setPlate80: (v: boolean) => setState((s) => ({ ...s, plate80: v })),
+  setPlate100: (v: boolean) => setState((s) => ({ ...s, plate100: v })),
   setHeightSurchargeAuto: (v: boolean) => setState((s) => ({ ...s, heightSurchargeAuto: v })),
   setManualSurcharges: (v: Array<{ description: string; amount: number }>) => setState((s) => ({ ...s, manualSurcharges: v })),
 
@@ -326,6 +372,18 @@ export const offerDraftStore = {
   hydrate: (loaded: Partial<OfferDraft> & Record<string, unknown> | null) => {
     if (!loaded || typeof loaded !== "object") return;
     const { canvaLayout: _c, editorContent: _e, ...rest } = loaded;
+    const legacyAddons = (loaded.addons ?? []) as Array<{ nazwa?: string; ilosc?: number }>;
+    const loadedSelectedAddons = (loaded.selectedAddons ?? null) as Array<{ name?: string; price?: number; unit?: string; quantity?: number; optionKey?: string }> | null;
+    const selectedAddons =
+      Array.isArray(loadedSelectedAddons) && loadedSelectedAddons.length > 0
+        ? loadedSelectedAddons
+            .filter((a) => a && typeof a === "object" && a.name)
+            .map((a) => ({ name: String(a.name), price: Number(a.price ?? 0) || 0, unit: a.unit ? String(a.unit) : undefined, quantity: Number(a.quantity ?? 0) || 0, optionKey: a.optionKey }))
+        : Array.isArray(legacyAddons) && legacyAddons.length > 0
+          ? legacyAddons
+              .filter((a) => a && typeof a === "object" && a.nazwa)
+              .map((a) => ({ name: String(a.nazwa), price: 0, unit: undefined, quantity: Number(a.ilosc ?? 0) || 0 }))
+          : [];
     state = {
       ...createEmptyDraft(),
       ...rest,
@@ -334,7 +392,11 @@ export const offerDraftStore = {
       personName: loaded.personName ?? state.personName ?? "",
       clientAddress: loaded.clientAddress ?? state.clientAddress ?? "",
       clientName: loaded.clientName ?? state.clientName ?? "",
+      selectedStandards: (loaded.selectedStandards ?? state.selectedStandards) as OfferDraft["selectedStandards"],
+      selectedAddons,
+      addons: Array.isArray(legacyAddons) ? legacyAddons.map((a) => ({ nazwa: String(a.nazwa ?? ""), ilosc: Number(a.ilosc ?? 0) || 0 })).filter((a) => a.nazwa) : state.addons,
       standardSnapshot: loaded.standardSnapshot ?? state.standardSnapshot,
+      gutterStandard: (loaded.gutterStandard ?? state.gutterStandard) as OfferDraft["gutterStandard"],
       rainGuttersAuto: loaded.rainGuttersAuto ?? state.rainGuttersAuto,
       gates: loaded.gates ?? state.gates,
       heightSurchargeAuto: loaded.heightSurchargeAuto ?? state.heightSurchargeAuto,
@@ -384,6 +446,60 @@ export function buildPayloadFromDraft(
   const l = parseFloat(d.lengthM) || 0;
   const h = d.heightM ? parseFloat(d.heightM) : undefined;
   const areaM2 = w * l;
+  const selectedStandards = (d.selectedStandards ?? []).filter((s) => s && s.name && String(s.name).trim() !== "");
+  const gutterSelected = selectedStandards.some((s) => /system\s*rynnowy/i.test(String(s.name ?? "")));
+  const gutterCfg = d.gutterStandard ?? { pricingMode: "INCLUDED" as const, calcMode: "BY_LENGTH" as const, sides: 2 as const };
+  const gutterBase = gutterCfg.calcMode === "BY_LENGTH" ? l : w;
+  const gutterMb = Math.max(0, gutterBase * (gutterCfg.sides ?? 2));
+  const gutterAddonName = gutterCfg.addonName ?? "System rynnowy";
+  const additionsList = (pricing.additions ?? []) as Array<{ nazwa?: string; total?: number }>;
+  const gutterAdditionTotal =
+    gutterCfg.pricingMode === "ADD"
+      ? (additionsList.find((a) => String(a.nazwa ?? "") === gutterAddonName)?.total ?? null)
+      : null;
+  const gutterUwagi =
+    gutterSelected
+      ? (() => {
+          const modeLabel = gutterCfg.pricingMode === "ADD" ? "doliczenie" : "w cenie hali";
+          const calcLabel = gutterCfg.calcMode === "BY_LENGTH" ? "po długości" : "po szerokości";
+          const sidesLabel = `${gutterCfg.sides ?? 2} boki`;
+          const mbLabel = `${gutterMb.toLocaleString("pl-PL")} mb`;
+          const priceLabel =
+            gutterCfg.pricingMode === "ADD" && typeof gutterAdditionTotal === "number"
+              ? `, doliczenie: ${Math.round(gutterAdditionTotal).toLocaleString("pl-PL")} zł`
+              : gutterCfg.pricingMode === "ADD"
+                ? ", doliczenie: (brak ceny)"
+                : "";
+          return `System rynnowy: ${mbLabel}, ${sidesLabel}, ${calcLabel}, ${modeLabel}${priceLabel}`;
+        })()
+      : null;
+  // Standardy w PDF tylko gdy użytkownik faktycznie coś wybrał w dropdownie.
+  // Brak wyboru => pusta lista (bez fallbacku do wyników wyceny).
+  const standardInPrice =
+    selectedStandards.length > 0
+      ? [
+          ...selectedStandards.map((s) => ({
+            element: formatStandardLabel(String(s.name).trim()),
+            ilosc: 1,
+            jednostka: "szt",
+            wartoscRef: 0,
+            pricingMode: "INCLUDED_FREE",
+            uwagi: s.description ? String(s.description) : undefined,
+          })),
+          ...(gutterUwagi
+            ? [
+                {
+                  element: "System rynnowy",
+                  ilosc: 1,
+                  jednostka: "",
+                  wartoscRef: 0,
+                  pricingMode: "INCLUDED_FREE",
+                  uwagi: gutterUwagi,
+                },
+              ]
+            : []),
+        ]
+      : [];
   return {
     userId,
     offerNumber: d.offerNumber?.trim() || "—",
@@ -407,7 +523,7 @@ export function buildPayloadFromDraft(
       totalPln: pricing.totalPln,
       base: pricing.base,
       additions: pricing.additions,
-      standardInPrice: pricing.standardInPrice,
+      standardInPrice,
     },
     clientAddressOrInstall: d.clientAddress || "Adres montażu – do uzupełnienia",
   };

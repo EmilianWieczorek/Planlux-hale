@@ -4,6 +4,8 @@ export interface GateInput {
   width: number;
   height: number;
   quantity: number;
+  /** Nie używane – cena za m² jest zawsze pobierana z bazy (addons_surcharges). Zachowane dla kompatybilności wstecznej. */
+  unitPricePerM2?: number;
 }
 
 export interface ManualSurchargeInput {

@@ -1,8 +1,11 @@
 appId: pl.planlux.hale
 productName: Planlux Hale
-electronVersion: "28.0.0"
+electronVersion: "28.3.3"
+
 directories:
   output: release
+  buildResources: assets
+
 files:
   - "dist/**/*"
   - "node_modules/**/*"
@@ -11,16 +14,17 @@ files:
 # Produkcyjna konfiguracja
 asar: true
 compression: maximum
-artifactName: "Planlux-Hale-${version}.${ext}"
+artifactName: "Planlux Hale Setup ${version}.${ext}"
 
-# Domyślnie electron-builder kopiuje dist, assets, package.json i produkcyjne node_modules
 asarUnpack:
   - "**/node_modules/better-sqlite3/**"
+  - "**/node_modules/keytar/**"
 
-publish:
-  provider: github
-  releaseType: release
-  vPrefixedTagName: true
+extraResources:
+  - from: assets
+    to: assets
+
+publish: null
 
 win:
   target:

@@ -853,7 +853,7 @@ export async function registerIpcHandlers(deps: {
         selectedAdditions: Array<{ nazwa: string; ilosc: number }>;
         standardSnapshot?: Array<{ element: string; pricingMode: "INCLUDED_FREE" | "CHARGE_EXTRA" }>;
         rainGuttersAuto?: boolean;
-        gates?: Array<{ width: number; height: number; quantity: number }>;
+        gates?: Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>;
         heightSurchargeAuto?: boolean;
         manualSurcharges?: Array<{ description: string; amount: number }>;
       };
@@ -1574,6 +1574,7 @@ export async function registerIpcHandlers(deps: {
             sellerEmail: p.sellerEmail,
             sellerPhone: p.sellerPhone,
             clientAddressOrInstall: p.clientAddressOrInstall,
+            technicalSpec: p.technicalSpec,
           },
           logger,
           (templateConfig as Partial<import("@planlux/shared").PdfTemplateConfig> | null | undefined) ?? undefined,
@@ -1921,6 +1922,14 @@ export async function registerIpcHandlers(deps: {
       return { ok: false, error: "Nieprawidłowe dane (wymagane: offer, pricing, offerNumber)." };
     }
     try {
+      const variantHali = p.offer?.variantHali ?? "";
+      const { resolveTechnicalSpecForPdf } = await import("./pdf/resolveTechnicalSpecForPdf");
+      const technicalSpec = await resolveTechnicalSpecForPdf(variantHali, {
+        getSupabase: getSupabase ?? undefined,
+        getDb: getDb ?? undefined,
+        logger,
+      });
+      (p as { technicalSpec?: { construction_type: string; roof_type: string; walls: string } }).technicalSpec = technicalSpec;
       const offerData = {
         userId: p.userId,
         offer: p.offer,
@@ -1930,6 +1939,7 @@ export async function registerIpcHandlers(deps: {
         sellerEmail: p.sellerEmail,
         sellerPhone: p.sellerPhone,
         clientAddressOrInstall: p.clientAddressOrInstall,
+        technicalSpec: p.technicalSpec,
       };
       const result = await generatePdfFromTemplate(
         offerData,

@@ -51,6 +51,8 @@ import {
 import { ContentCopy, Lock } from "@mui/icons-material";
 import { DuplicateOffersModal, type DuplicateOffer } from "./DuplicateOffersModal";
 import { AddonsPanel } from "./AddonsPanel";
+import { StandardPanel } from "./StandardPanel";
+import { formatStandardLabel } from "./formatStandardLabel";
 import { EmailComposer } from "../oferty/EmailComposer";
 
 const defaultVariants = [
@@ -152,11 +154,28 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const widthM = draft.widthM;
   const lengthM = draft.lengthM;
   const heightM = draft.heightM;
-  const addons = draft.addons ?? [];
-  const standardSnapshot = draft.standardSnapshot ?? [];
+  const selectedStandards = (draft.selectedStandards ?? []) as Array<{ name: string; description: string }>;
+  const selectedAddons = (draft.selectedAddons ?? []) as Array<{ name: string; price: number; unit?: string; quantity: number }>;
+  const gutterStandard = (draft.gutterStandard ?? { pricingMode: "INCLUDED", calcMode: "BY_LENGTH", sides: 2 }) as {
+    pricingMode: "INCLUDED" | "ADD";
+    calcMode: "BY_LENGTH" | "BY_WIDTH";
+    sides: 1 | 2;
+    addonName?: string;
+  };
+  const normalizeName = useCallback((s: unknown) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " "), []);
+  const actualSelectedStandards = (selectedStandards ?? []).filter(
+    (item) =>
+      item &&
+      typeof item === "object" &&
+      (item as { name?: unknown }).name != null &&
+      String((item as { name?: unknown }).name).trim() !== "" &&
+      String((item as { name?: unknown }).name) !== "Wybierz standard (w cenie, informacyjnie)"
+  );
+  const gutterSelected = actualSelectedStandards.some((s) => normalizeName(s?.name) === "system rynnowy");
   const rainGuttersAuto = draft.rainGuttersAuto ?? false;
-  const gates = draft.gates ?? [];
-  const heightSurchargeAuto = draft.heightSurchargeAuto ?? false;
+  const gates = (draft.gates ?? []) as Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>;
+  const plate80 = draft.plate80 ?? false;
+  const plate100 = draft.plate100 ?? false;
   const manualSurcharges = draft.manualSurcharges ?? [];
   const [pricingData, setPricingData] = useState<{
     version?: number;
@@ -311,11 +330,250 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
   };
 
-  const recalcInputRef = useRef({ addons, standardSnapshot, gates, manualSurcharges });
-  recalcInputRef.current = { addons, standardSnapshot, gates, manualSurcharges };
+  const variants =
+    pricingData?.cennik &&
+    Array.isArray(pricingData.cennik) &&
+    (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).length > 0
+      ? [
+          ...new Map(
+            (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).map((r) => [
+              r.wariant_hali,
+              { id: r.wariant_hali, name: r.Nazwa ?? r.wariant_hali },
+            ])
+          ).values(),
+        ]
+      : defaultVariants;
+
+  const standardOptions =
+    (pricingData?.standard as Array<{ wariant_hali: string; element: string; uwagi?: string }> | undefined)
+      ?.filter((s) => s?.wariant_hali === variantHali)
+      .map((s) => ({ name: String(s.element), description: String(s.uwagi ?? "") }))
+      .filter((s) => s.name.trim() !== "") ?? [];
+
+  const rawAddonsForVariant =
+    (pricingData?.dodatki as Array<{ wariant_hali: string; nazwa: string; stawka?: number | string; jednostka?: string }> | undefined)
+      ?.filter((d) => d?.wariant_hali === variantHali) ?? [];
+
+  const sectionalGateRow = rawAddonsForVariant.find((d) =>
+    /dodatkowa\s*brama\s*segmentowa|bramy\s*segmentowe|brama\s*segmentowa/i.test(String(d.nazwa ?? ""))
+  );
+  const sectionalGateUnitPricePerM2Default =
+    sectionalGateRow != null
+      ? (typeof sectionalGateRow.stawka === "number" ? sectionalGateRow.stawka : parseFloat(String(sectionalGateRow.stawka ?? 0)) || 0)
+      : null;
+
+  // gutterSelected is computed early (above) to avoid TDZ runtime errors.
+  const gutterAddonRow = rawAddonsForVariant.find(
+    (d) => /rynnowy|rynny/i.test(String(d.nazwa ?? "")) && /mb/i.test(String(d.jednostka ?? ""))
+  );
+  const gutterAddonName = gutterAddonRow?.nazwa ? String(gutterAddonRow.nazwa) : (gutterStandard.addonName ?? "System rynnowy");
+  const gutterUnitPrice =
+    gutterAddonRow != null
+      ? (typeof gutterAddonRow.stawka === "number" ? gutterAddonRow.stawka : parseFloat(String(gutterAddonRow.stawka ?? 0)) || 0)
+      : null;
+
+  const plate80Row = rawAddonsForVariant.find((d) =>
+    /dopłata\s*do\s*płyty\s*80\s*mm|doplata\s*do\s*plyty\s*80/i.test(String(d.nazwa ?? ""))
+  );
+  const plate100Row = rawAddonsForVariant.find((d) =>
+    /dopłata\s*do\s*płyty\s*100\s*mm|doplata\s*do\s*plyty\s*100/i.test(String(d.nazwa ?? ""))
+  );
+
+  const wNum = parseFloat(widthM) || 0;
+  const lNum = parseFloat(lengthM) || 0;
+  const gutterBase = gutterStandard.calcMode === "BY_LENGTH" ? lNum : wNum;
+  const gutterMb = Math.max(0, gutterBase * (gutterStandard.sides ?? 2));
+  const gutterTotalPrice = gutterStandard.pricingMode === "ADD" ? Math.round((gutterUnitPrice ?? 0) * gutterMb) : 0;
+
+  // addon_name is not unique across variants; use stable composite key for React key
+  const addonOptions =
+    rawAddonsForVariant
+      .map((d, idx) => {
+        const row = d as { nazwa?: string; stawka?: number | string; jednostka?: string; wariant_hali?: string; Nr?: number };
+        return {
+          optionKey: `${row.wariant_hali ?? variantHali}-${row.Nr ?? idx}-${String(row.nazwa ?? "")}`,
+          name: String(row.nazwa),
+          price: typeof row.stawka === "number" ? row.stawka : parseFloat(String(row.stawka ?? 0)) || 0,
+          unit: row.jednostka ? String(row.jednostka) : undefined,
+        };
+      })
+      .filter((a) => a.name.trim() !== "")
+      .filter((a) => !/dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(a.name))
+      .filter((a) => !gutterSelected || a.name !== gutterAddonName)
+      // Poza dropdownem – obsługiwane w sekcji „Dodatki specjalne”: płyty 80/100 mm, dopłata za wysokość, bramy segmentowe
+      .filter((a) => !/dopłata\s*do\s*płyty\s*80\s*mm|doplata\s*do\s*plyty\s*80/i.test(a.name))
+      .filter((a) => !/dopłata\s*do\s*płyty\s*100\s*mm|doplata\s*do\s*plyty\s*100/i.test(a.name))
+      .filter((a) => !/dodatkowa\s*brama\s*segmentowa|bramy\s*segmentowe|brama\s*segmentowa/i.test(a.name));
+
+  /** Standardy pokazywane w sekcji "W cenie standardowej" – bez rynien w trybie DOLICZ (te idą do dodatków płatnych). */
+  const standardsIncluded = actualSelectedStandards.filter((s) => {
+    if (normalizeName((s as { name?: string }).name) === "system rynnowy") return gutterStandard.pricingMode === "INCLUDED";
+    return true;
+  });
+
+  /** Dodatki płatne do wyświetlenia: tylko dodatki dostępne dla wariantu, z quantity > 0, + rynny w trybie DOLICZ. */
+  const availableAddonNamesSet = useMemo(() => new Set(addonOptions.map((o) => o.name)), [addonOptions]);
+  const actualPaidAddons = (() => {
+    const list: Array<{ label: string; quantity: number; unit: string; price: number; lineTotal: number }> = (selectedAddons ?? [])
+      .filter((a) => availableAddonNamesSet.has(a.name) && (a.quantity ?? 0) > 0)
+      .map((a) => ({
+        label: formatStandardLabel(a.name),
+        quantity: a.quantity,
+        unit: (a.unit && String(a.unit).trim() ? String(a.unit).trim() : "szt") as string,
+        price: a.price ?? 0,
+        lineTotal: Math.round((a.price ?? 0) * (a.quantity ?? 0)),
+      }));
+
+    // Bramy segmentowe – cena za m² tylko z bazy (sectionalGateUnitPricePerM2Default)
+    const unitPriceM2 = sectionalGateUnitPricePerM2Default ?? 0;
+    for (const g of gates ?? []) {
+      const width = Number.isFinite(g.width) ? g.width : 0;
+      const height = Number.isFinite(g.height) ? g.height : 0;
+      const qty = Number.isFinite(g.quantity) ? g.quantity : 0;
+      if (qty > 0 && width > 0 && height > 0 && unitPriceM2 > 0) {
+        const areaOne = width * height;
+        const priceOne = areaOne * unitPriceM2;
+        const total = Math.round(priceOne * qty);
+        list.push({
+          label: `Brama segmentowa ${width} × ${height}`,
+          quantity: qty,
+          unit: "szt",
+          price: Math.round(priceOne),
+          lineTotal: total,
+        });
+      }
+    }
+
+    if (gutterSelected && gutterStandard.pricingMode === "ADD" && gutterMb > 0) {
+      list.push({
+        label: formatStandardLabel(gutterAddonName),
+        quantity: gutterMb,
+        unit: "mb",
+        price: gutterUnitPrice ?? 0,
+        lineTotal: gutterTotalPrice,
+      });
+    }
+    for (const a of result?.additions ?? []) {
+      const nazwa = String((a as { nazwa?: string }).nazwa ?? "");
+      if (/dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(nazwa)) {
+        const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
+        const qty = line.ilosc ?? 0;
+        const total = line.total ?? 0;
+        list.push({
+          label: "Dopłata za wysokość",
+          quantity: qty,
+          unit: "mkw",
+          price: line.stawka ?? 0,
+          lineTotal: total,
+        });
+      }
+      if (/dopłata\s*do\s*płyty\s*80|doplata\s*do\s*plyty\s*80/i.test(nazwa)) {
+        const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
+        list.push({
+          label: nazwa,
+          quantity: line.ilosc ?? 1,
+          unit: (line.jednostka && String(line.jednostka).trim()) ? String(line.jednostka).trim() : "szt",
+          price: line.stawka ?? 0,
+          lineTotal: line.total ?? 0,
+        });
+      }
+      if (/dopłata\s*do\s*płyty\s*100|doplata\s*do\s*plyty\s*100/i.test(nazwa)) {
+        const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
+        list.push({
+          label: nazwa,
+          quantity: line.ilosc ?? 1,
+          unit: (line.jednostka && String(line.jednostka).trim()) ? String(line.jednostka).trim() : "szt",
+          price: line.stawka ?? 0,
+          lineTotal: line.total ?? 0,
+        });
+      }
+    }
+    return list;
+  })();
+
+  /** Dopłata za wysokość – do wyświetlenia w sekcji „Dodatki specjalne” tylko dla T18_T35_DACH gdy aktywna */
+  const heightSurchargeDisplay =
+    variantHali === "T18_T35_DACH"
+      ? (() => {
+          const line = (result?.additions ?? []).find((a) =>
+            /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(String((a as { nazwa?: string }).nazwa ?? ""))
+          ) as { nazwa?: string; total?: number } | undefined;
+          return line != null && line.total != null && line.total > 0
+            ? { label: "Dopłata za wysokość", amount: line.total }
+            : null;
+        })()
+      : null;
+
+  /** Po zmianie wariantu: zostaw tylko dodatki/standardy dostępne dla tego wariantu; wyczyść bramy jeśli wariant nie ma bramy segmentowej. */
+  useEffect(() => {
+    if (!pricingData) return;
+    const d = offerDraftStore.getState();
+    const currentAddons = (d.selectedAddons ?? []) as Array<{ name: string }>;
+    const currentStandards = (d.selectedStandards ?? []) as Array<{ name: string }>;
+    const currentGates = d.gates ?? [];
+    const availableAddonNames = new Set(addonOptions.map((o) => o.name));
+    const availableStandardNames = new Set(standardOptions.map((o) => o.name));
+    const nextAddons = currentAddons.filter((a) => availableAddonNames.has(a.name));
+    const nextStandards = currentStandards.filter((s) => availableStandardNames.has((s as { name?: string }).name ?? ""));
+    if (nextAddons.length !== currentAddons.length || nextAddons.some((a, i) => a.name !== currentAddons[i]?.name)) {
+      actions.setSelectedAddons(nextAddons as Array<{ name: string; price: number; unit?: string; quantity: number; optionKey?: string }>);
+    }
+    if (nextStandards.length !== currentStandards.length || nextStandards.some((s, i) => (s as { name?: string }).name !== (currentStandards[i] as { name?: string })?.name)) {
+      actions.setSelectedStandards(nextStandards as Array<{ name: string; description: string }>);
+    }
+    if (!sectionalGateRow && currentGates.length > 0) {
+      actions.setGates([]);
+    }
+    if (variantHali !== "T18_T35_DACH" && (d.plate80 || d.plate100)) {
+      actions.setPlate80(false);
+      actions.setPlate100(false);
+    }
+    if (nextAddons.length !== currentAddons.length || nextStandards.length !== currentStandards.length || (!sectionalGateRow && currentGates.length > 0)) {
+      schedulePreviewRefresh("commit");
+    }
+  }, [variantHali, pricingData]);
+
+  const recalcInputRef = useRef({
+    selectedAddons,
+    gates,
+    manualSurcharges,
+    gutterSelected,
+    gutterStandard,
+    gutterAddonName,
+    gutterMb,
+    plate80,
+    plate100,
+    plate80Name: plate80Row?.nazwa,
+    plate100Name: plate100Row?.nazwa,
+  });
+  recalcInputRef.current = {
+    selectedAddons,
+    gates,
+    manualSurcharges,
+    gutterSelected,
+    gutterStandard,
+    gutterAddonName,
+    gutterMb,
+    plate80,
+    plate100,
+    plate80Name: plate80Row?.nazwa,
+    plate100Name: plate100Row?.nazwa,
+  };
 
   const recalc = useCallback(async () => {
-    const { addons: a, standardSnapshot: s, gates: g, manualSurcharges: m } = recalcInputRef.current;
+    const {
+      selectedAddons: a,
+      gates: g,
+      manualSurcharges: m,
+      gutterSelected: gs,
+      gutterStandard: gc,
+      gutterAddonName: gan,
+      gutterMb: gmb,
+      plate80: p80,
+      plate100: p100,
+      plate80Name: name80,
+      plate100Name: name100,
+    } = recalcInputRef.current;
     const w = parseFloat(widthM) || 0;
     const l = parseFloat(lengthM) || 0;
     const h = heightM ? parseFloat(heightM) : undefined;
@@ -324,16 +582,21 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       return;
     }
     try {
+      const additions = a.map((x) => ({ nazwa: x.name, ilosc: x.quantity }));
+      if (gs && gc.pricingMode === "ADD") {
+        additions.push({ nazwa: gan, ilosc: gmb });
+      }
+      if (p80 && name80) additions.push({ nazwa: String(name80), ilosc: 1 });
+      if (p100 && name100) additions.push({ nazwa: String(name100), ilosc: 1 });
       const r = (await api("planlux:calculatePrice", {
         variantHali,
         widthM: w,
         lengthM: l,
         heightM: h,
-        selectedAdditions: a,
-        standardSnapshot: s,
+        selectedAdditions: additions,
         rainGuttersAuto,
         gates: g,
-        heightSurchargeAuto,
+        heightSurchargeAuto: true,
         manualSurcharges: m,
       })) as {
         ok: boolean;
@@ -355,58 +618,28 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     } catch (e) {
       setResult({ success: false, errorMessage: String(e) });
     }
-  }, [api, variantHali, widthM, lengthM, heightM, rainGuttersAuto, heightSurchargeAuto]);
+  }, [api, variantHali, widthM, lengthM, heightM, rainGuttersAuto]);
 
   const recalcTrigger = useMemo(
-    () => JSON.stringify(addons) + JSON.stringify(standardSnapshot) + JSON.stringify(gates) + JSON.stringify(manualSurcharges),
-    [addons, standardSnapshot, gates, manualSurcharges]
+    () =>
+      JSON.stringify(selectedAddons) +
+      JSON.stringify(gates) +
+      JSON.stringify(manualSurcharges) +
+      JSON.stringify(selectedStandards) +
+      JSON.stringify(gutterStandard) +
+      String(plate80) +
+      String(plate100) +
+      (plate80Row?.nazwa ?? "") +
+      (plate100Row?.nazwa ?? ""),
+    [selectedAddons, gates, manualSurcharges, selectedStandards, gutterStandard, plate80, plate100, plate80Row?.nazwa, plate100Row?.nazwa]
   );
 
   useEffect(() => {
     recalc();
   }, [recalc, recalcTrigger]);
 
-  const variants =
-    pricingData?.cennik &&
-    Array.isArray(pricingData.cennik) &&
-    (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).length > 0
-      ? [
-          ...new Map(
-            (pricingData.cennik as Array<{ wariant_hali: string; Nazwa?: string }>).map((r) => [
-              r.wariant_hali,
-              { id: r.wariant_hali, name: r.Nazwa ?? r.wariant_hali },
-            ])
-          ).values(),
-        ]
-      : defaultVariants;
-
-  const availableAddons = (pricingData?.dodatki as Array<{ wariant_hali: string; nazwa: string }>)?.filter(
-    (d) => d.wariant_hali === variantHali
-  ) ?? [];
-  const groupedAddons = [...new Set(availableAddons.map((a) => a.nazwa))];
-
-  const heightSurchargeThreshold = (() => {
-    const dodatki = pricingData?.dodatki as Array<{ wariant_hali: string; nazwa: string; warunek_min?: number | string }> | undefined;
-    if (!Array.isArray(dodatki)) return undefined;
-    const doplata = dodatki.find(
-      (d) => d.wariant_hali === variantHali && /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(d.nazwa)
-    );
-    if (!doplata?.warunek_min) return undefined;
-    const v = typeof doplata.warunek_min === "number" ? doplata.warunek_min : parseFloat(String(doplata.warunek_min));
-    return Number.isFinite(v) ? v : undefined;
-  })();
-
-  const toggleAddon = (nazwa: string, ilosc: number) => {
-    if (ilosc <= 0) actions.setAddons(addons.filter((x) => x.nazwa !== nazwa));
-    else {
-      const idx = addons.findIndex((x) => x.nazwa === nazwa);
-      if (idx >= 0) {
-        const next = [...addons];
-        next[idx] = { nazwa, ilosc };
-        actions.setAddons(next);
-      } else actions.setAddons([...addons, { nazwa, ilosc }]);
-    }
-  };
+  // selectedAddons is the only source for paid addons. Keep legacy `addons` in sync via store setter.
+  const setSelectedAddons = (v: Array<{ name: string; price: number; unit?: string; quantity: number }>) => actions.setSelectedAddons(v);
 
   const refreshPdfPreview = useCallback(async () => {
     const w = parseFloat(widthM) || 0;
@@ -425,11 +658,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         widthM: w,
         lengthM: l,
         heightM: h,
-        selectedAdditions: addons,
-        standardSnapshot,
+        selectedAdditions: (() => {
+          const additions = selectedAddons.map((x) => ({ nazwa: x.name, ilosc: x.quantity }));
+          if (gutterSelected && gutterStandard.pricingMode === "ADD") additions.push({ nazwa: gutterAddonName, ilosc: gutterMb });
+          if (plate80 && plate80Row?.nazwa) additions.push({ nazwa: String(plate80Row.nazwa), ilosc: 1 });
+          if (plate100 && plate100Row?.nazwa) additions.push({ nazwa: String(plate100Row.nazwa), ilosc: 1 });
+          return additions;
+        })(),
         rainGuttersAuto,
         gates,
-        heightSurchargeAuto,
+        heightSurchargeAuto: true,
         manualSurcharges,
       })) as { ok: boolean; result?: { totalPln?: number; base?: unknown; additions?: unknown[]; standardInPrice?: unknown[] } };
       if (token !== previewTokenRef.current) return;
@@ -458,7 +696,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     } finally {
       /* no loading state - keep showing old preview until new one arrives */
     }
-  }, [api, userId, userDisplayName, variantHali, widthM, lengthM, heightM, addons, standardSnapshot, rainGuttersAuto, gates, heightSurchargeAuto, manualSurcharges, draft.pdfOverrides, actions]);
+  }, [api, userId, userDisplayName, variantHali, widthM, lengthM, heightM, selectedAddons, rainGuttersAuto, gates, manualSurcharges, plate80, plate100, plate80Row?.nazwa, plate100Row?.nazwa, draft.pdfOverrides, actions]);
 
   const hasEnoughDataForPreview = parseFloat(widthM) > 0 && parseFloat(lengthM) > 0;
   const DEBOUNCE_TYPING_MS = 450;
@@ -494,7 +732,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     return () => {
       if (refreshDebounceRef.current) clearTimeout(refreshDebounceRef.current);
     };
-  }, [variantHali, widthM, lengthM, heightM, addons, standardSnapshot, rainGuttersAuto, gates, heightSurchargeAuto, manualSurcharges, draft.pdfOverrides, draft.offerNumber, schedulePreviewRefresh]);
+  }, [variantHali, widthM, lengthM, heightM, selectedAddons, selectedStandards, rainGuttersAuto, gates, manualSurcharges, draft.pdfOverrides, draft.offerNumber, schedulePreviewRefresh]);
 
   useEffect(() => () => {
     if (refreshDebounceRef.current) clearTimeout(refreshDebounceRef.current);
@@ -519,11 +757,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       widthM: w,
       lengthM: l,
       heightM: h,
-      selectedAdditions: addons,
-      standardSnapshot,
+      selectedAdditions: (() => {
+        const additions = selectedAddons.map((x) => ({ nazwa: x.name, ilosc: x.quantity }));
+        if (gutterSelected && gutterStandard.pricingMode === "ADD") additions.push({ nazwa: gutterAddonName, ilosc: gutterMb });
+        if (plate80 && plate80Row?.nazwa) additions.push({ nazwa: String(plate80Row.nazwa), ilosc: 1 });
+        if (plate100 && plate100Row?.nazwa) additions.push({ nazwa: String(plate100Row.nazwa), ilosc: 1 });
+        return additions;
+      })(),
       rainGuttersAuto,
       gates,
-      heightSurchargeAuto,
+      heightSurchargeAuto: true,
       manualSurcharges,
     })) as { ok: boolean; result?: { base?: { matched?: boolean }; additions?: unknown[]; standardInPrice?: unknown[]; totalPln?: number } };
     if (!r.ok || !r.result) throw new Error("Błąd wyceny");
@@ -667,8 +910,15 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
   };
 
-  const dimensionsPreview = [widthM, lengthM].filter(Boolean).join(" × ");
-  const addonsCount = addons.reduce((s, a) => s + a.ilosc, 0);
+  const dimensionsPreview = [widthM, lengthM, heightM].filter((x) => String(x ?? "").trim() !== "").join(" × ");
+  const addonsCount = selectedAddons.reduce((s, a) => s + (a.quantity || 0), 0);
+  const standardsCount = actualSelectedStandards.length;
+  const salesPriceCaption =
+    result?.success && typeof result.totalPln === "number"
+      ? `${Math.round(result.totalPln).toLocaleString("pl-PL")} zł`
+      : "—";
+  const pdfOverrideCount = draft.pdfOverrides && typeof draft.pdfOverrides === "object" ? Object.keys(draft.pdfOverrides).length : 0;
+  const pdfEditCaption = pdfOverrideCount > 0 ? "Zmieniono" : "Brak zmian";
   /** Shown only after PDF generation succeeds (doGeneratePdf sets lastPdfPath). */
   const hasGeneratedPdf = Boolean(lastPdfPath?.trim());
 
@@ -706,7 +956,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           </AccordionSummary>
           <AccordionDetails>
             <label style={styles.label}>Wariant hali</label>
-            <select style={styles.input} value={variantHali} onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); actions.setAddons([]); actions.setStandardSnapshot([]); }} data-testid="hall-variant">
+            <select style={styles.input} value={variantHali} onChange={(e) => { previewDebounceModeRef.current = "commit"; actions.setVariantHali(e.target.value); }} data-testid="hall-variant">
               {variants.map((v) => (
                 <option key={v.id} value={v.id}>{v.name}</option>
               ))}
@@ -725,35 +975,65 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <input style={styles.input} type="number" min={0} step={0.01} value={heightM} onChange={(e) => { previewDebounceModeRef.current = "typing"; actions.setHeightM(e.target.value); }} onBlur={() => schedulePreviewRefresh("commit")} placeholder="np. 5.5" data-testid="hall-height" />
           </AccordionDetails>
         </Accordion>
+
+        {/* 3. Standardy */}
+        <Accordion defaultExpanded sx={{ "&:before": { display: "none" } }}>
+          <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
+            <Typography variant="subtitle2">Standardy</Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+              {standardsCount > 0 ? `${standardsCount} elementy` : "—"}
+            </Typography>
+          </AccordionSummary>
+          <AccordionDetails>
+            <StandardPanel
+              standardOptions={standardOptions}
+              selectedStandards={selectedStandards}
+              onSelectedStandardsChange={(v) => actions.setSelectedStandards(v)}
+              gutter={{
+                selected: gutterSelected,
+                pricingMode: gutterStandard.pricingMode,
+                calcMode: gutterStandard.calcMode,
+                sides: gutterStandard.sides,
+                mb: gutterMb,
+                unitPrice: gutterUnitPrice == null ? null : gutterUnitPrice,
+                totalPrice: gutterTotalPrice,
+              }}
+              onGutterChange={(next) => {
+                actions.setGutterStandard({ ...gutterStandard, ...next, addonName: gutterAddonName });
+              }}
+              schedulePreviewRefresh={schedulePreviewRefresh}
+              previewDebounceModeRef={previewDebounceModeRef}
+            />
+          </AccordionDetails>
+        </Accordion>
+
         <Accordion defaultExpanded sx={{ "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
             <Typography variant="subtitle2">Dodatki</Typography>
             <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
-              {addonsCount > 0 || [rainGuttersAuto, gates.length > 0, heightSurchargeAuto, manualSurcharges.length > 0].some(Boolean)
-                ? `${addonsCount} szt.` + ([rainGuttersAuto, gates.length > 0, heightSurchargeAuto, manualSurcharges.length > 0].filter(Boolean).length > 0 ? " · zaawansowane" : "")
+              {addonsCount > 0 || [rainGuttersAuto, gates.length > 0, manualSurcharges.length > 0].some(Boolean)
+                ? `${addonsCount} szt.` + ([rainGuttersAuto, gates.length > 0, manualSurcharges.length > 0].filter(Boolean).length > 0 ? " · zaawansowane" : "")
                 : "—"}
             </Typography>
           </AccordionSummary>
           <AccordionDetails>
             <AddonsPanel
-              groupedAddons={groupedAddons}
-              addons={addons}
-              toggleAddon={toggleAddon}
-              standardInPrice={((result as { standardInPrice?: Array<{ element: string; ilosc: number; jednostka: string; wartoscRef: number; pricingMode?: string; total?: number }> })?.standardInPrice ?? [])}
-              standardSnapshot={standardSnapshot}
-              onStandardModeChange={(element, mode) => {
-                const next = standardSnapshot.filter((sn) => sn.element !== element);
-                next.push({ element, pricingMode: mode });
-                actions.setStandardSnapshot(next);
-              }}
+              addonOptions={addonOptions}
+              selectedAddons={selectedAddons}
+              onSelectedAddonsChange={(v) => setSelectedAddons(v)}
               rainGuttersAuto={rainGuttersAuto}
               onRainGuttersChange={actions.setRainGuttersAuto}
+              sectionalGateAvailable={sectionalGateRow != null}
               gates={gates}
               onGatesChange={actions.setGates}
-              heightSurchargeAuto={heightSurchargeAuto}
-              onHeightSurchargeChange={actions.setHeightSurchargeAuto}
-              heightM={heightM}
-              heightSurchargeThreshold={heightSurchargeThreshold}
+              gateUnitPricePerM2Default={sectionalGateUnitPricePerM2Default}
+              plate80Available={!!plate80Row}
+              plate100Available={!!plate100Row}
+              plate80Selected={plate80}
+              plate100Selected={plate100}
+              onPlate80Change={actions.setPlate80}
+              onPlate100Change={actions.setPlate100}
+              heightSurchargeDisplay={heightSurchargeDisplay}
               manualSurcharges={manualSurcharges}
               onManualSurchargesChange={actions.setManualSurcharges}
               schedulePreviewRefresh={schedulePreviewRefresh}
@@ -765,7 +1045,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
             <Typography variant="subtitle2">Sprzedaż</Typography>
             <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
-              {draft.offerNumber || "—"}
+              {salesPriceCaption}
             </Typography>
           </AccordionSummary>
           <AccordionDetails>
@@ -935,20 +1215,31 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             )}
           </AccordionDetails>
         </Accordion>
-        <EdycjaPdfSection
-          pdfOverrides={draft.pdfOverrides}
-          onPdfOverridesChange={(next) => actions.setPdfOverrides(mergePdfOverrides(next))}
-          calculatorPriceNet={result?.success ? result.totalPln : undefined}
-          calculatorPriceGross={result?.success ? (result.totalPln ?? 0) * 1.23 : undefined}
-          onDirtyChange={(mode) => schedulePreviewRefresh(mode ?? "typing")}
-          expanded={edycjaPdfExpanded}
-          onExpandedChange={setEdycjaPdfExpanded}
-          activeTab={edycjaPdfTab}
-          onActiveTabChange={(t) => {
-            setEdycjaPdfTab(t);
-            setPdfPreviewPage((t + 1) as 1 | 2 | 3);
-          }}
-        />
+        {/* 6. Edycja PDF */}
+        <Accordion defaultExpanded={false} sx={{ "&:before": { display: "none" } }}>
+          <AccordionSummary expandIcon={<span style={{ fontSize: 20 }}>▼</span>}>
+            <Typography variant="subtitle2">Edycja PDF</Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+              {pdfEditCaption}
+            </Typography>
+          </AccordionSummary>
+          <AccordionDetails>
+            <EdycjaPdfSection
+              pdfOverrides={draft.pdfOverrides}
+              onPdfOverridesChange={(next) => actions.setPdfOverrides(mergePdfOverrides(next))}
+              calculatorPriceNet={result?.success ? result.totalPln : undefined}
+              calculatorPriceGross={result?.success ? (result.totalPln ?? 0) * 1.23 : undefined}
+              onDirtyChange={(mode) => schedulePreviewRefresh(mode ?? "typing")}
+              expanded={edycjaPdfExpanded}
+              onExpandedChange={setEdycjaPdfExpanded}
+              activeTab={edycjaPdfTab}
+              onActiveTabChange={(t) => {
+                setEdycjaPdfTab(t);
+                setPdfPreviewPage((t + 1) as 1 | 2 | 3);
+              }}
+            />
+          </AccordionDetails>
+        </Accordion>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: tokens.space[4], minHeight: 0 }}>
         <div style={{ ...styles.card, marginBottom: 0, flexShrink: 0 }}>
@@ -1017,21 +1308,54 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                   )}
                 </div>
               )}
-              {(() => {
-                const standard = (result as { standardInPrice?: Array<{ element: string; ilosc: number; jednostka: string; pricingMode?: string }> }).standardInPrice ?? [];
-                const inPrice = standard.filter((s) => (s.pricingMode ?? "INCLUDED_FREE") !== "CHARGE_EXTRA");
-                if (inPrice.length === 0) return null;
-                return (
-                  <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>
-                    <div style={{ fontWeight: tokens.font.weight.medium, marginBottom: 4 }}>W cenie zawarte:</div>
-                    <ul style={{ margin: 0, paddingLeft: 20 }}>
-                      {inPrice.map((s, i) => (
-                        <li key={i}>{s.element} – {s.ilosc} {s.jednostka}</li>
-                      ))}
-                    </ul>
-                  </div>
-                );
-              })()}
+              <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>
+                <div style={{ fontWeight: tokens.font.weight.medium, marginBottom: 4 }}>W cenie standardowej:</div>
+                {standardsIncluded.length === 0 ? (
+                  <div>Brak wybranych standardów</div>
+                ) : (
+                  <ul style={{ margin: 0, paddingLeft: 20 }}>
+                    {standardsIncluded.map((s, i) => {
+                      const isGutter =
+                        normalizeName((s as { name?: string }).name) === "system rynnowy" &&
+                        gutterStandard.pricingMode === "INCLUDED";
+                      const label = formatStandardLabel((s as { name?: string }).name);
+                      const detail = isGutter
+                        ? `${gutterMb} mb, ${gutterStandard.sides === 1 ? "1 bok" : "2 boki"}, w cenie`
+                        : "1 szt";
+                      return (
+                        <li key={i}>
+                          {label} – {detail}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+              <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 12 }}>
+                <div style={{ fontWeight: tokens.font.weight.medium, marginBottom: 4 }}>Dodatki płatne:</div>
+                {actualPaidAddons.length === 0 ? (
+                  <div>Brak dodatków płatnych</div>
+                ) : (
+                  <ul style={{ margin: 0, paddingLeft: 20 }}>
+                    {actualPaidAddons.map((item, i) => {
+                      const isHeightSurcharge = item.label === "Dopłata za wysokość";
+                      if (isHeightSurcharge) {
+                        return (
+                          <li key={i}>
+                            {item.label} – {item.quantity} mkw × {new Intl.NumberFormat("pl-PL").format(item.price)} zł ={" "}
+                            {new Intl.NumberFormat("pl-PL").format(item.lineTotal)} zł
+                          </li>
+                        );
+                      }
+                      return (
+                        <li key={i}>
+                          {item.label} – {item.quantity} {item.unit} – {new Intl.NumberFormat("pl-PL").format(item.lineTotal)} zł
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
               <p style={styles.total}>{new Intl.NumberFormat("pl-PL").format(result.totalPln ?? 0)} zł netto</p>
             </>
           )}

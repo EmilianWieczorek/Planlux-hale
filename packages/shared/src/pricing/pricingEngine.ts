@@ -18,6 +18,7 @@ import type {
   FallbackReason,
 } from "./types";
 import { toNumber, normalizeJednostka } from "./normalize";
+import { heightInRange } from "./parseHeightCondition";
 
 function normalizeCennik(rows: CennikRow[]): CennikRowNormalized[] {
   return rows.map((r) => ({
@@ -198,6 +199,8 @@ function computeAdditions(
   const forVariant = dodatki.filter((d) => d.wariant_hali === variantHali);
 
   for (const sel of input.selectedAdditions) {
+    // Dopłata za wysokość jest zawsze liczona w computeAdvancedAdditions jako powierzchnia × stawka (mkw). Nie dublować z selectedAdditions.
+    if (/dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(sel.nazwa ?? "")) continue;
     const candidates = forVariant.filter((d) => d.nazwa === sel.nazwa);
     const def = candidates.find((d) =>
       satisfiesCondition(d.warunek_type, d.warunek_min, d.warunek_max, input.heightM)
@@ -254,19 +257,22 @@ function computeAdvancedAdditions(
 
   if (input.gates?.length) {
     const bramy = forVariant.find(
-      (d) => /bramy\s*segmentowe|brama\s*segmentowa/i.test(d.nazwa)
+      (d) => /dodatkowa\s*brama\s*segmentowa|bramy\s*segmentowe|brama\s*segmentowa/i.test(d.nazwa)
     );
     if (bramy) {
-      const stawka = bramy.stawka;
+      const stawkaM2 = bramy.stawka;
       for (const g of input.gates) {
-        if (g.quantity > 0 && g.width > 0 && g.height > 0) {
-          const areaM2 = g.width * g.height;
-          const total = stawka * areaM2 * g.quantity;
+        const width = Number.isFinite(g.width) ? g.width : 0;
+        const height = Number.isFinite(g.height) ? g.height : 0;
+        const qty = Number.isFinite(g.quantity) ? g.quantity : 0;
+        if (qty > 0 && width > 0 && height > 0) {
+          const areaM2 = width * height;
+          const total = stawkaM2 * areaM2 * qty;
           lines.push({
-            nazwa: `${bramy.nazwa} ${g.width}×${g.height} m`,
-            stawka,
+            nazwa: `Brama segmentowa ${width} × ${height} – ${qty} szt`,
+            stawka: stawkaM2,
             jednostka: "m²",
-            ilosc: areaM2 * g.quantity,
+            ilosc: areaM2 * qty,
             total,
             warunek: bramy.warunek,
           });
@@ -275,19 +281,27 @@ function computeAdvancedAdditions(
     }
   }
 
-  /** Dopłata za wysokość: auto gdy wysokość spełnia warunek. heightSurchargeAuto=false wyłącza (override). */
-  if (input.heightSurchargeAuto !== false && input.heightM != null) {
+  /** Dopłata za wysokość: automatyczna gdy wysokość wpada w zakres. Gdy jednostka mkw/m²: powierzchnia hali × stawka. */
+  if (input.heightM != null && input.areaM2 != null && input.areaM2 > 0) {
     const doplata = forVariant.find(
-      (d) => /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(d.nazwa) &&
-        satisfiesCondition(d.warunek_type, d.warunek_min, d.warunek_max, input.heightM)
+      (d) =>
+        /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(d.nazwa) &&
+        heightInRange(input.heightM, d.warunek, d.warunek_min, d.warunek_max)
     );
     if (doplata) {
+      const stawka = doplata.stawka;
+      const j = normalizeJednostka(doplata.jednostka ?? "");
+      const hallAreaM2 = input.areaM2;
+      const isMkw = j === "m2" || /mkw|m\s*²/i.test(String(doplata.jednostka ?? ""));
+      const ilosc = isMkw ? hallAreaM2 : 1;
+      const total = isMkw ? Math.round(hallAreaM2 * stawka) : Math.round(stawka);
+      const jednostka = isMkw ? "m²" : (doplata.jednostka ?? "szt");
       lines.push({
         nazwa: doplata.nazwa,
-        stawka: doplata.stawka,
-        jednostka: doplata.jednostka ?? "szt",
-        ilosc: 1,
-        total: doplata.stawka,
+        stawka,
+        jednostka,
+        ilosc,
+        total,
         warunek: doplata.warunek,
       });
     }

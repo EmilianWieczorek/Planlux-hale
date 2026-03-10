@@ -108,21 +108,52 @@ function buildConfigReplacements(config: PdfTemplateConfig): Record<string, stri
   };
 }
 
-/** Replacements z editorContent (strony 1–2). Strona 3 ignorowana (page3Locked). */
-function buildEditorContentReplacements(editorContent: PdfEditorContent): Record<string, string> {
-  const p1 = editorContent.page1;
+const PAGE2_BOX2_TAGS_DEFAULT =
+  '<span class="tag">stal • ocynk</span><span class="tag">system modułowy</span><span class="tag">montaż na miejscu</span>';
+const PAGE2_BOX3_TAGS_DEFAULT = '<span class="tag">PVC</span><span class="tag">atest</span><span class="tag">szczelność</span>';
+const PAGE2_BOX4_TAGS_DEFAULT = '<span class="tag">bramy</span><span class="tag">drzwi</span><span class="tag">wykończenia</span>';
+
+/** Z tekstu spec (np. constructionType) wyciąga słowa kluczowe jako tagi HTML. Fallback gdy brak lub "(brak danych)". */
+function specToTagsHtml(text: string | undefined, fallback: string): string {
+  const t = (text ?? "").trim();
+  if (!t || t === "(brak danych)") return fallback;
+  const words = t
+    .split(/[\s,•·–—]+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 1);
+  const take = words.slice(0, 4);
+  if (take.length === 0) return fallback;
+  return take.map((w) => `<span class="tag">${escapeHtml(w)}</span>`).join("");
+}
+
+/** Replacements z editorContent (strony 1–2). Gdy payload podany – tagi box2/3/4 z constructionType/roofType/wallsType. */
+function buildEditorContentReplacements(
+  editorContent: PdfEditorContent,
+  payload?: OfferPdfPayload
+): Record<string, string> {
   const p2 = editorContent.page2;
   const noteHtml =
     p2.note?.trim() !== ""
       ? `<section class="spec-note" data-plx-block="SELLER_NOTE" style="margin-top:16px;padding:12px;background:#f8fafc;border-radius:8px;font-size:11px;color:#475569;"><div class="spec-note__text">${escapeHtml(p2.note)}</div></section>`
       : "";
   const emptyPlaceholder = "Brak danych";
+  const box2Tags =
+    payload != null
+      ? specToTagsHtml(payload.constructionType ?? payload.technicalSpec?.konstrukcja, PAGE2_BOX2_TAGS_DEFAULT)
+      : PAGE2_BOX2_TAGS_DEFAULT;
+  const box3Tags =
+    payload != null ? specToTagsHtml(payload.roofType ?? payload.technicalSpec?.dach, PAGE2_BOX3_TAGS_DEFAULT) : PAGE2_BOX3_TAGS_DEFAULT;
+  const box4Tags =
+    payload != null ? specToTagsHtml(payload.wallsType ?? payload.technicalSpec?.sciany, PAGE2_BOX4_TAGS_DEFAULT) : PAGE2_BOX4_TAGS_DEFAULT;
   return {
     "{{page2SectionTitle}}": escapeHtml("SPECYFIKACJA TECHNICZNA"),
     "{{page2Box1}}": linesToHtml((p2.boxText1 ?? "").trim() || emptyPlaceholder),
     "{{page2Box2}}": linesToHtml((p2.boxText2 ?? "").trim() || emptyPlaceholder),
     "{{page2Box3}}": linesToHtml((p2.boxText3 ?? "").trim() || emptyPlaceholder),
     "{{page2Box4}}": linesToHtml((p2.boxText4 ?? "").trim() || emptyPlaceholder),
+    "{{page2Box2Tags}}": box2Tags,
+    "{{page2Box3Tags}}": box3Tags,
+    "{{page2Box4Tags}}": box4Tags,
     "{{page2NoteSection}}": noteHtml,
   };
 }
@@ -284,13 +315,13 @@ export function renderPdfTemplateHtml(
     html = html.split(token).join(value);
   }
   if (editor) {
-    const editorReplacements = buildEditorContentReplacements(editor);
+    const editorReplacements = buildEditorContentReplacements(editor, effectivePayload);
     for (const [token, value] of Object.entries(editorReplacements)) {
       html = html.split(token).join(value);
     }
   } else {
     /* Fallback gdy brak editorContent – domyślne wartości dla page2. */
-    const defaults = buildEditorContentReplacements(mergePdfEditorContent(null));
+    const defaults = buildEditorContentReplacements(mergePdfEditorContent(null), effectivePayload);
     for (const [token, value] of Object.entries(defaults)) {
       html = html.split(token).join(value);
     }

@@ -3,6 +3,7 @@
  * Grupy: Standardy, Bramy, System rynnowy, Pozostałe dodatki, Dopłaty.
  */
 
+import * as React from "react";
 import { Typography } from "@mui/material";
 import { tokens } from "../../theme/tokens";
 
@@ -49,35 +50,45 @@ const styles = {
   } as React.CSSProperties,
 };
 
-interface StandardItem {
-  element: string;
-  ilosc: number;
-  jednostka: string;
-  wartoscRef: number;
-  pricingMode?: string;
-  total?: number;
-}
+export type StandardItem = { name: string; description: string };
+export type AddonOption = { optionKey: string; name: string; price: number; unit?: string };
+export type AddonItem = { name: string; price: number; unit?: string; quantity: number; optionKey?: string };
+export type SectionalGateAddon = {
+  type: "BRAMA_SEGMENTOWA";
+  width: number;
+  height: number;
+  quantity: number;
+  unitPricePerM2: number;
+  areaOne: number;
+  priceOne: number;
+  totalPrice: number;
+};
+
+/** Dopłata za wysokość – automatyczna, tylko do wyświetlenia gdy aktywna */
+export type HeightSurchargeDisplay = { label: string; amount: number } | null;
 
 interface Props {
-  /** Dodatki opcjonalne (rynny, okna, drzwi, bramy itd.) – z cennika */
-  groupedAddons: string[];
-  addons: Array<{ nazwa: string; ilosc: number }>;
-  toggleAddon: (nazwa: string, ilosc: number) => void;
-  /** Standardy – w cenie vs dolicz */
-  standardInPrice: StandardItem[];
-  standardSnapshot: Array<{ element: string; pricingMode: "INCLUDED_FREE" | "CHARGE_EXTRA" }>;
-  onStandardModeChange: (element: string, mode: "INCLUDED_FREE" | "CHARGE_EXTRA") => void;
-  /** System rynnowy */
+  /** DODATKI (płatne) – źródło: addons_surcharges */
+  addonOptions: AddonOption[];
+  selectedAddons: AddonItem[];
+  onSelectedAddonsChange: (v: AddonItem[]) => void;
+  /** System rynnowy (legacy) – sterowany w Standardach; tu zostaje tylko kompatybilność propsów. */
   rainGuttersAuto: boolean;
   onRainGuttersChange: (v: boolean) => void;
-  /** Bramy segmentowe */
-  gates: Array<{ width: number; height: number; quantity: number }>;
-  onGatesChange: (v: Array<{ width: number; height: number; quantity: number }>) => void;
-  /** Dopłata za wysokość (auto) */
-  heightSurchargeAuto: boolean;
-  onHeightSurchargeChange: (v: boolean) => void;
-  heightM: string;
-  heightSurchargeThreshold?: number;
+  /** Bramy segmentowe – pokazywane tylko gdy wariant ma ten dodatek w addons_surcharges */
+  sectionalGateAvailable: boolean;
+  gates: Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>;
+  onGatesChange: (v: Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>) => void;
+  gateUnitPricePerM2Default?: number | null;
+  /** Dodatki specjalne: płyty 80/100 mm (T18_T35_DACH) */
+  plate80Available?: boolean;
+  plate100Available?: boolean;
+  plate80Selected?: boolean;
+  plate100Selected?: boolean;
+  onPlate80Change?: (v: boolean) => void;
+  onPlate100Change?: (v: boolean) => void;
+  /** Dopłata za wysokość – gdy aktywna (wariant + próg), pokazana jako automatyczna */
+  heightSurchargeDisplay?: HeightSurchargeDisplay;
   /** Ręczne dopłaty */
   manualSurcharges: Array<{ description: string; amount: number }>;
   onManualSurchargesChange: (v: Array<{ description: string; amount: number }>) => void;
@@ -86,72 +97,75 @@ interface Props {
 }
 
 export function AddonsPanel({
-  groupedAddons,
-  addons,
-  toggleAddon,
-  standardInPrice,
-  standardSnapshot,
-  onStandardModeChange,
+  addonOptions,
+  selectedAddons,
+  onSelectedAddonsChange,
   rainGuttersAuto,
   onRainGuttersChange,
+  sectionalGateAvailable,
   gates,
   onGatesChange,
-  heightSurchargeAuto,
-  onHeightSurchargeChange,
-  heightM,
-  heightSurchargeThreshold,
+  gateUnitPricePerM2Default,
+  plate80Available,
+  plate100Available,
+  plate80Selected,
+  plate100Selected,
+  onPlate80Change,
+  onPlate100Change,
+  heightSurchargeDisplay,
   manualSurcharges,
   onManualSurchargesChange,
   schedulePreviewRefresh,
   previewDebounceModeRef,
 }: Props) {
-  const heightNum = parseFloat(heightM) || 0;
-  const isHeightSurchargeActive = heightSurchargeAuto && heightNum > 0 && (heightSurchargeThreshold == null || heightNum > heightSurchargeThreshold);
+  const [addonSelect, setAddonSelect] = React.useState<string>("");
+  const safeNum = React.useCallback((v: unknown) => {
+    const n = typeof v === "number" ? v : parseFloat(String(v ?? ""));
+    return Number.isFinite(n) ? n : 0;
+  }, []);
+  const safeInt = React.useCallback((v: unknown) => {
+    const n = typeof v === "number" ? v : parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) ? n : 0;
+  }, []);
+  /** Cena za m² tylko z bazy (gateUnitPricePerM2Default). Nie ma ręcznej edycji. */
+  const buildGateModel = React.useCallback(
+    (g: { width: number; height: number; quantity: number }): SectionalGateAddon => {
+      const width = Math.max(0, safeNum(g.width));
+      const height = Math.max(0, safeNum(g.height));
+      const quantity = Math.max(0, safeInt(g.quantity));
+      const unitPricePerM2 = Math.max(0, safeNum(gateUnitPricePerM2Default ?? 0));
+      const areaOne = width > 0 && height > 0 ? width * height : 0;
+      const priceOne = areaOne > 0 && unitPricePerM2 > 0 ? areaOne * unitPricePerM2 : 0;
+      const totalPrice = priceOne > 0 && quantity > 0 ? priceOne * quantity : 0;
+      return { type: "BRAMA_SEGMENTOWA", width, height, quantity, unitPricePerM2, areaOne, priceOne, totalPrice };
+    },
+    [gateUnitPricePerM2Default, safeInt, safeNum]
+  );
+
+  const hasSpecialAddons =
+    sectionalGateAvailable ||
+    !!plate80Available ||
+    !!plate100Available ||
+    !!heightSurchargeDisplay;
 
   return (
     <div>
-      {/* A) Standardy */}
-      {standardInPrice.length > 0 && (
+      {/* Sekcja DODATKI SPECJALNE: bramy segmentowe, płyty 80/100 mm, dopłata za wysokość */}
+      {hasSpecialAddons && (
         <div style={styles.section}>
           <Typography variant="subtitle2" sx={styles.sectionTitle}>
-            Standardy
+            Dodatki specjalne
           </Typography>
-          {standardInPrice.map((s) => {
-            const mode = standardSnapshot.find((sn) => sn.element === s.element)?.pricingMode ?? (s.pricingMode ?? "INCLUDED_FREE");
-            return (
-              <div key={s.element} style={styles.row}>
-                <span style={{ flex: "1 1 180px", minWidth: 0 }}>{s.element}</span>
-                <span style={{ fontSize: 12, color: tokens.color.textMuted }}>
-                  {s.ilosc} {s.jednostka} · ref. {s.wartoscRef?.toLocaleString("pl-PL")} zł
-                </span>
-                <select
-                  value={mode}
-                  onChange={(e) => {
-                    previewDebounceModeRef.current = "commit";
-                    onStandardModeChange(s.element, e.target.value as "INCLUDED_FREE" | "CHARGE_EXTRA");
-                    schedulePreviewRefresh("commit");
-                  }}
-                  style={{ width: 120, padding: 6 }}
-                >
-                  <option value="INCLUDED_FREE">w cenie</option>
-                  <option value="CHARGE_EXTRA">dolicz</option>
-                </select>
-                {mode === "CHARGE_EXTRA" && s.total != null && (
-                  <span style={{ fontWeight: 600, color: tokens.color.primary }}>+{s.total.toLocaleString("pl-PL")} zł</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
 
-      {/* B) Bramy segmentowe */}
+          {/* A) Bramy segmentowe – tylko gdy wariant ma ten dodatek w addons_surcharges */}
+          {sectionalGateAvailable && (
       <div style={styles.section}>
         <Typography variant="subtitle2" sx={styles.sectionTitle}>
           Bramy segmentowe
         </Typography>
         {gates.map((g, i) => (
-          <div key={i} style={{ ...styles.row, flexWrap: "wrap" }}>
+          <div key={i} style={{ marginBottom: tokens.space[3] }}>
+            <div style={{ ...styles.row, flexWrap: "wrap" }}>
             <input
               type="number"
               min={0}
@@ -196,6 +210,11 @@ export function AddonsPanel({
               onBlur={() => schedulePreviewRefresh("commit")}
               style={{ width: 50, padding: 6 }}
             />
+            {gateUnitPricePerM2Default != null && gateUnitPricePerM2Default > 0 && (
+              <span style={{ fontSize: 12, color: tokens.color.textMuted, alignSelf: "center" }}>
+                Cena z bazy: {Math.round(gateUnitPricePerM2Default).toLocaleString("pl-PL")} zł/m²
+              </span>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -207,6 +226,20 @@ export function AddonsPanel({
             >
               Usuń
             </button>
+            </div>
+            {(() => {
+              const m = buildGateModel({ width: g.width, height: g.height, quantity: g.quantity });
+              const fmt = (n: number) => new Intl.NumberFormat("pl-PL").format(Math.round(n));
+              const fmt2 = (n: number) => n.toLocaleString("pl-PL", { maximumFractionDigits: 2 });
+              return (
+                <div style={{ fontSize: 12, color: tokens.color.textMuted, marginTop: 6, paddingLeft: 2 }}>
+                  <div>Powierzchnia 1 bramy: <strong style={{ color: tokens.color.navy }}>{fmt2(m.areaOne)} m²</strong></div>
+                  <div>Cena 1 bramy: <strong style={{ color: tokens.color.navy }}>{fmt(m.priceOne)} zł</strong></div>
+                  <div>Ilość: <strong style={{ color: tokens.color.navy }}>{m.quantity} szt</strong></div>
+                  <div>Cena wszystkich bram: <strong style={{ color: tokens.color.primary }}>{fmt(m.totalPrice)} zł</strong></div>
+                </div>
+              );
+            })()}
           </div>
         ))}
         <button
@@ -221,92 +254,132 @@ export function AddonsPanel({
           + Dodaj bramę
         </button>
       </div>
+          )}
 
-      {/* C) System rynnowy */}
-      <div style={styles.section}>
-        <Typography variant="subtitle2" sx={styles.sectionTitle}>
-          System rynnowy
-        </Typography>
-        <div style={styles.row}>
-          <input
-            type="checkbox"
-            id="rainGutters"
-            checked={rainGuttersAuto}
-            onChange={(e) => {
-              previewDebounceModeRef.current = "commit";
-              onRainGuttersChange(e.target.checked);
-              schedulePreviewRefresh("commit");
-            }}
-          />
-          <label htmlFor="rainGutters">System rynnowy (obwód × stawka mb)</label>
-        </div>
-      </div>
+          {/* B) Dopłaty do płyt 80 mm / 100 mm – wybór ręczny */}
+          {(plate80Available || plate100Available) && (
+            <div style={{ marginBottom: tokens.space[3] }}>
+              <label style={{ ...styles.label, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                {plate80Available && (
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!plate80Selected}
+                      onChange={(e) => {
+                        onPlate80Change?.(e.target.checked);
+                        previewDebounceModeRef.current = "commit";
+                        schedulePreviewRefresh("commit");
+                      }}
+                    />
+                    <span>Dopłata do płyty 80 mm</span>
+                  </label>
+                )}
+                {plate100Available && (
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!plate100Selected}
+                      onChange={(e) => {
+                        onPlate100Change?.(e.target.checked);
+                        previewDebounceModeRef.current = "commit";
+                        schedulePreviewRefresh("commit");
+                      }}
+                    />
+                    <span>Dopłata do płyty 100 mm</span>
+                  </label>
+                )}
+              </label>
+            </div>
+          )}
 
-      {/* D) Pozostałe dodatki (okna, drzwi, automaty, płyta 80/100) */}
-      {groupedAddons.length > 0 && (
-        <div style={styles.section}>
-          <Typography variant="subtitle2" sx={styles.sectionTitle}>
-            Dodatki opcjonalne
-          </Typography>
-          {groupedAddons.map((nazwa) => {
-            const current = addons.find((a) => a.nazwa === nazwa);
-            return (
-              <div key={nazwa} style={styles.row}>
-                <input
-                  type="checkbox"
-                  checked={(current?.ilosc ?? 0) > 0}
-                  onChange={(e) => {
-                    previewDebounceModeRef.current = "commit";
-                    toggleAddon(nazwa, e.target.checked ? 1 : 0);
-                    schedulePreviewRefresh("commit");
-                  }}
-                />
-                <span style={{ flex: 1 }}>{nazwa}</span>
-                <input
-                  type="number"
-                  min={0}
-                  value={current?.ilosc ?? 0}
-                  onChange={(e) => {
-                    previewDebounceModeRef.current = "typing";
-                    toggleAddon(nazwa, Math.max(0, parseInt(e.target.value, 10) || 0));
-                  }}
-                  onBlur={() => schedulePreviewRefresh("commit")}
-                  style={{ width: 80, padding: 6 }}
-                />
-              </div>
-            );
-          })}
+          {/* C) Dopłata za wysokość – automatyczna, tylko gdy warunek spełniony */}
+          {heightSurchargeDisplay && (
+            <div style={{ marginBottom: tokens.space[2], fontSize: tokens.font.size.sm, color: tokens.color.textMuted }}>
+              <span>{heightSurchargeDisplay.label}</span>
+              <strong style={{ marginLeft: 8, color: tokens.color.primary }}>
+                {Math.round(heightSurchargeDisplay.amount).toLocaleString("pl-PL")} zł
+              </strong>
+              <span style={{ marginLeft: 6 }}>(automatycznie)</span>
+            </div>
+          )}
         </div>
       )}
 
-      {/* E) Dopłaty */}
+      {/* System rynnowy: sterowany w sekcji Standardy (ukryty tutaj, żeby nie dublować) */}
+
+      {/* C) DODATKI (płatne) */}
+      <div style={styles.section}>
+        <div style={styles.section}>
+          <Typography variant="subtitle2" sx={styles.sectionTitle}>
+            DODATKI
+          </Typography>
+          <select
+            value={addonSelect}
+            onChange={(e) => {
+              previewDebounceModeRef.current = "commit";
+              const name = e.target.value;
+              setAddonSelect(name);
+              const opt = addonOptions.find((a) => a.name === name);
+              if (opt && !selectedAddons.some((x) => x.name === opt.name)) {
+                onSelectedAddonsChange([...selectedAddons, { name: opt.name, price: opt.price, unit: opt.unit, quantity: 1, optionKey: opt.optionKey }]);
+                schedulePreviewRefresh("commit");
+              }
+            }}
+            style={styles.input}
+          >
+            <option value="">▼ Wybierz dodatek płatny</option>
+            {/* addon_name is not unique across variants; use stable optionKey for React key */}
+            {addonOptions.map((a) => (
+              <option key={a.optionKey} value={a.name}>{a.name}</option>
+            ))}
+          </select>
+
+          {selectedAddons.length > 0 && (
+            <div style={{ marginTop: tokens.space[2] }}>
+              {selectedAddons.map((a, i) => (
+                <div key={a.optionKey ?? `addon-${i}`} style={styles.row}>
+                  <span style={{ flex: 1 }}>{a.name}</span>
+                  <span style={{ fontSize: 12, color: tokens.color.textMuted }}>
+                    {a.price.toLocaleString("pl-PL")} zł{a.unit ? `/${a.unit}` : ""}
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={a.quantity}
+                    onChange={(e) => {
+                      previewDebounceModeRef.current = "typing";
+                      const q = Math.max(0, parseInt(e.target.value, 10) || 0);
+                      onSelectedAddonsChange(selectedAddons.map((x) => (x.name === a.name ? { ...x, quantity: q } : x)));
+                    }}
+                    onBlur={() => schedulePreviewRefresh("commit")}
+                    style={{ width: 80, padding: 6 }}
+                  />
+                  <span style={{ fontWeight: 600, color: tokens.color.primary }}>
+                    {(a.price * (a.quantity || 0)).toLocaleString("pl-PL")} zł
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      previewDebounceModeRef.current = "commit";
+                      onSelectedAddonsChange(selectedAddons.filter((x) => x.name !== a.name));
+                      schedulePreviewRefresh("commit");
+                    }}
+                    style={{ ...styles.buttonSecondary, padding: "6px 12px" }}
+                  >
+                    Usuń
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* D) Dopłaty – dopłata za wysokość naliczana automatycznie z bazy (nie w dropdownie) */}
       <div style={styles.section}>
         <Typography variant="subtitle2" sx={styles.sectionTitle}>
           Dopłaty
         </Typography>
-        <div style={styles.row}>
-          <input
-            type="checkbox"
-            id="heightSurcharge"
-            checked={heightSurchargeAuto}
-            onChange={(e) => {
-              previewDebounceModeRef.current = "commit";
-              onHeightSurchargeChange(e.target.checked);
-              schedulePreviewRefresh("commit");
-            }}
-          />
-          <label htmlFor="heightSurcharge">
-            Dopłata za wysokość
-            {isHeightSurchargeActive && heightSurchargeThreshold != null && (
-              <span style={{ fontSize: 11, color: tokens.color.textMuted, marginLeft: 4 }}>
-                (auto: {heightNum}m &gt; {heightSurchargeThreshold}m)
-              </span>
-            )}
-            {isHeightSurchargeActive && heightSurchargeThreshold == null && (
-              <span style={{ fontSize: 11, color: tokens.color.primary, marginLeft: 4 }}>auto</span>
-            )}
-          </label>
-        </div>
         <label style={styles.label}>Ręczne dopłaty</label>
         {manualSurcharges.map((m, i) => (
           <div key={i} style={{ ...styles.row, flexWrap: "wrap" }}>
@@ -360,7 +433,7 @@ export function AddonsPanel({
         </button>
       </div>
 
-      {groupedAddons.length === 0 && standardInPrice.length === 0 && (
+      {addonOptions.length === 0 && (
         <p style={{ color: tokens.color.textMuted }}>Wybierz wariant hali i wprowadź wymiary.</p>
       )}
     </div>

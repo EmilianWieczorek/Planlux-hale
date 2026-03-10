@@ -637,7 +637,23 @@ async function runStartup(): Promise<void> {
 
   const database = getDb();
   const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
-  seedBaseIfEmpty(database);
+  const seeded = seedBaseIfEmpty(database);
+  try {
+    const pricingSurfaceCount =
+      database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number } | undefined;
+    const addonsCount =
+      database.prepare("SELECT COUNT(1) as c FROM addons_surcharges").get() as { c?: number } | undefined;
+    const standardCount =
+      database.prepare("SELECT COUNT(1) as c FROM standard_included").get() as { c?: number } | undefined;
+    logger.info("[bootstrap] local pricing tables", {
+      seeded,
+      pricing_surface: pricingSurfaceCount?.c ?? 0,
+      addons_surcharges: addonsCount?.c ?? 0,
+      standard_included: standardCount?.c ?? 0,
+    });
+  } catch (e) {
+    logger.warn("[bootstrap] pricing tables count failed", e);
+  }
   const { getLocalVersion } = await import("../src/infra/db");
   if (getLocalVersion(database) === 0) {
     const cachePath = path.join(app.getPath("userData"), "pricing_cache.json");

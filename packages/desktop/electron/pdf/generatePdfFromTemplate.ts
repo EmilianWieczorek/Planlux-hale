@@ -16,6 +16,7 @@ import { app } from "electron";
 import type { GeneratePdfPayload } from "@planlux/shared";
 import { buildPdfFileName, escapeHtml, formatCurrency } from "@planlux/shared";
 import type { PdfTemplateConfig, PdfEditorContent } from "@planlux/shared";
+import { DEFAULT_PDF_EDITOR_PAGE2 } from "@planlux/shared";
 import { getPdfTemplateDir, getPdfTemplateDirCandidatesWithExists } from "./pdfPaths";
 import { renderPdfTemplateHtml, type OfferPdfPayload } from "./renderTemplate";
 import {
@@ -90,8 +91,10 @@ const SPEC_FALLBACK = "(brak danych)";
 
 /**
  * Map payload z IPC (GeneratePdfPayload) na format szablonu (OfferPdfPayload).
- * Technical spec (Konstrukcja, Dach, Ściany) only from input.technicalSpec (set by main from pricing_surface).
- * Never uses pricing.base.row. Fallback SPEC_FALLBACK when technicalSpec missing.
+ * Technical spec (Konstrukcja, Dach, Ściany):
+ *   A. input.technicalSpec (from resolveTechnicalSpecForPdf / pricing_surface)
+ *   B. fallback pr.base?.row (Typ_Konstrukcji, Typ_Dachu/Dach, Boki)
+ *   C. SPEC_FALLBACK "(brak danych)"
  */
 export function mapOfferDataToPayload(
   input: GeneratePdfPayload,
@@ -100,6 +103,7 @@ export function mapOfferDataToPayload(
 ): OfferPdfPayload {
   const o = input.offer;
   const pr = input.pricing;
+  const baseRow = pr.base?.row;
   const basePrice = pr.base?.totalBase ?? 0;
   let priceNet = pr.totalPln;
   let priceGross = Math.round(priceNet * 1.23);
@@ -110,12 +114,29 @@ export function mapOfferDataToPayload(
   }
   const variantName = o.variantNazwa || o.variantHali;
   const spec = input.technicalSpec;
-  const construction_type = spec?.construction_type?.trim() || SPEC_FALLBACK;
-  const roof_type = spec?.roof_type?.trim() || SPEC_FALLBACK;
-  const walls = spec?.walls?.trim() || SPEC_FALLBACK;
-  const konstrukcja = construction_type;
-  const dach = roof_type;
-  const sciany = walls;
+  const constructionType =
+    (spec?.construction_type != null && String(spec.construction_type).trim() !== "")
+      ? String(spec.construction_type).trim()
+      : (baseRow?.Typ_Konstrukcji != null && String(baseRow.Typ_Konstrukcji).trim() !== "")
+        ? String(baseRow.Typ_Konstrukcji).trim()
+        : SPEC_FALLBACK;
+  const roofType =
+    (spec?.roof_type != null && String(spec.roof_type).trim() !== "")
+      ? String(spec.roof_type).trim()
+      : (baseRow?.Typ_Dachu != null && String(baseRow.Typ_Dachu).trim() !== "")
+        ? String(baseRow.Typ_Dachu).trim()
+        : (baseRow?.Dach != null && String(baseRow.Dach).trim() !== "")
+          ? String(baseRow.Dach).trim()
+          : SPEC_FALLBACK;
+  const wallsType =
+    (spec?.walls != null && String(spec.walls).trim() !== "")
+      ? String(spec.walls).trim()
+      : (baseRow?.Boki != null && String(baseRow.Boki).trim() !== "")
+        ? String(baseRow.Boki).trim()
+        : SPEC_FALLBACK;
+  const konstrukcja = constructionType;
+  const dach = roofType;
+  const sciany = wallsType;
 
   const baseTableRow = `<tr>
     <td>Hala – ${escapeHtml(variantName)}</td>
@@ -222,10 +243,34 @@ export type GeneratePdfFromTemplateResult =
  */
 export type GeneratePdfFromTemplateOptions = { testMode?: boolean; previewMode?: boolean };
 
-/** pdfOverrides: page1 (cena), page2 (treści). */
+/** pdfOverrides: page1 (cena), page2 (treści). Override ma priorytet nad auto-content. */
 export interface PdfOverridesForGenerator {
   page1?: { priceNet?: number; priceGross?: number };
   page2?: { sectionTitle?: string; boxText1?: string; boxText2?: string; boxText3?: string; boxText4?: string; note?: string };
+}
+
+/** Szablony pełnej treści boxów 2–4: tylko wartość z bazy jest wstrzykiwana w miejsce placeholderów. */
+const PAGE2_BOX2_TEMPLATE =
+  "Konstrukcja stalowa dopasowana do wymiarów i obciążeń.\nPołączenia skręcane – szybki montaż i serwis.\nZabezpieczenie antykorozyjne: {{construction_type}}.";
+const PAGE2_BOX3_TEMPLATE =
+  "Materiał: {{roof_type}}.\nWykończenia i uszczelnienia zapewniające szczelność.\nMożliwość doposażenia: świetliki / klapy / wzmocnienia.";
+const PAGE2_BOX4_TEMPLATE =
+  "Ściany boczne: {{walls}}.\nStolarka: bramy i drzwi w standardzie wg ustaleń.\nObróbki i wykończenia naroży – estetyka i trwałość.";
+
+/** Domyślna treść strony 2: box 1 stały, boxy 2–4 = pełna treść szablonowa z wstrzykniętym construction_type / roof_type / walls. Override z pdfOverrides.page2 nadal ma priorytet. */
+function buildDefaultPage2FromPayload(payload: OfferPdfPayload): typeof DEFAULT_PDF_EDITOR_PAGE2 {
+  const fallback = SPEC_FALLBACK;
+  const construction_type = (payload.constructionType ?? payload.technicalSpec?.konstrukcja ?? "").trim() || fallback;
+  const roof_type = (payload.roofType ?? payload.technicalSpec?.dach ?? "").trim() || fallback;
+  const walls = (payload.wallsType ?? payload.technicalSpec?.sciany ?? "").trim() || fallback;
+  return {
+    sectionTitle: DEFAULT_PDF_EDITOR_PAGE2.sectionTitle,
+    boxText1: DEFAULT_PDF_EDITOR_PAGE2.boxText1,
+    boxText2: PAGE2_BOX2_TEMPLATE.replace(/\{\{construction_type\}\}/g, construction_type),
+    boxText3: PAGE2_BOX3_TEMPLATE.replace(/\{\{roof_type\}\}/g, roof_type),
+    boxText4: PAGE2_BOX4_TEMPLATE.replace(/\{\{walls\}\}/g, walls),
+    note: DEFAULT_PDF_EDITOR_PAGE2.note,
+  };
 }
 
 export async function generatePdfFromTemplate(
@@ -307,7 +352,50 @@ export async function generatePdfFromTemplate(
 
   const now = new Date();
   const offerDate = now.toLocaleDateString("pl-PL", { day: "2-digit", month: "2-digit", year: "numeric" });
+  logger.info("[pdf] variantHali input", {
+    variantHali: offerData.offer?.variantHali ?? "(brak)",
+  });
+  logger.info("[pdf] resolved technicalSpec", {
+    hasTechnicalSpec: !!offerData.technicalSpec,
+    construction_type: offerData.technicalSpec?.construction_type ?? "(brak)",
+    roof_type: offerData.technicalSpec?.roof_type ?? "(brak)",
+    walls: offerData.technicalSpec?.walls ?? "(brak)",
+  });
+
   const payload = mapOfferDataToPayload(offerData, offerDate, pdfOverrides?.page1 ?? null);
+
+  const ct = payload.constructionType ?? "";
+  const rt = payload.roofType ?? "";
+  const wt = payload.wallsType ?? "";
+  const sourceConstruction =
+    (offerData.technicalSpec?.construction_type?.trim() && ct === offerData.technicalSpec.construction_type.trim())
+      ? "technicalSpec"
+      : (offerData.pricing?.base?.row?.Typ_Konstrukcji?.trim() && ct === offerData.pricing.base.row.Typ_Konstrukcji.trim())
+        ? "baseRow"
+        : "fallback";
+  const sourceRoof =
+    (offerData.technicalSpec?.roof_type?.trim() && rt === offerData.technicalSpec.roof_type.trim())
+      ? "technicalSpec"
+      : ((offerData.pricing?.base?.row?.Typ_Dachu?.trim() && rt === offerData.pricing.base.row.Typ_Dachu.trim()) ||
+          (offerData.pricing?.base?.row?.Dach?.trim() && rt === offerData.pricing.base.row.Dach.trim()))
+        ? "baseRow"
+        : "fallback";
+  const sourceWalls =
+    (offerData.technicalSpec?.walls?.trim() && wt === offerData.technicalSpec.walls.trim())
+      ? "technicalSpec"
+      : (offerData.pricing?.base?.row?.Boki?.trim() && wt === offerData.pricing.base.row.Boki.trim())
+        ? "baseRow"
+        : "fallback";
+  logger.info("[pdf] mapOfferDataToPayload source chosen", {
+    constructionType: sourceConstruction,
+    roofType: sourceRoof,
+    wallsType: sourceWalls,
+  });
+  logger.info("[pdf] final payload for page2", {
+    constructionType: payload.constructionType ?? SPEC_FALLBACK,
+    roofType: payload.roofType ?? SPEC_FALLBACK,
+    wallsType: payload.wallsType ?? SPEC_FALLBACK,
+  });
 
   const specMissing =
     (payload.constructionType?.trim() || "") === "" ||
@@ -331,12 +419,17 @@ export async function generatePdfFromTemplate(
     });
   }
 
-  const editorContentForPage2 = pdfOverrides?.page2
-    ? ({ page2: pdfOverrides.page2 } as Partial<PdfEditorContent>)
-    : undefined;
+  const autoPage2 = buildDefaultPage2FromPayload(payload);
+  const mergedPage2 = { ...autoPage2, ...pdfOverrides?.page2 };
+  const editorContentForPage2 = { page2: mergedPage2 } as Partial<PdfEditorContent>;
 
   let html: string;
   logger.info("[pdf] render z katalogu (pełna ścieżka)", path.resolve(templateDir));
+  logger.info("[pdf] page2 placeholders replaced with values", {
+    konstrukcja: payload.constructionType ?? SPEC_FALLBACK,
+    dach: payload.roofType ?? SPEC_FALLBACK,
+    sciany: payload.wallsType ?? SPEC_FALLBACK,
+  });
   try {
     html = renderPdfTemplateHtml(
       templateDir,

@@ -26,6 +26,8 @@ export { calculatePrice, runPricingSelfTest } from "./pricing/pricingEngine";
 export type { PricingEngineData } from "./pricing/pricingEngine";
 export type { PricingInput, PricingResult, BasePriceResultType, FallbackReason, PricingTier, HallVariant } from "./pricing/types";
 export { toNumber, toInt, normalizeJednostka } from "./pricing/normalize";
+export { parseHeightCondition, heightInRange } from "./pricing/parseHeightCondition";
+export type { HeightRange } from "./pricing/parseHeightCondition";
 
 export { renderOfferHtml } from "./pdf/template";
 export type { PdfTemplateData, OfferForPdf } from "./pdf/template";
