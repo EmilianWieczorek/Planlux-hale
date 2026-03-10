@@ -94,7 +94,10 @@ export function seedBaseIfEmpty(db: Db): boolean {
       // ignore
     }
     return true;
-  } catch {
+  } catch (e) {
+    if (process.env.NODE_ENV !== "production" || process.env.LOG_LEVEL === "debug") {
+      console.warn("[seedBase] seedBaseIfEmpty failed", e instanceof Error ? e.message : String(e));
+    }
     return false;
   }
 }

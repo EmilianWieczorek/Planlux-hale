@@ -200,6 +200,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const [syncing, setSyncing] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [syncStatus, setSyncStatus] = useState<"offline" | "synced" | "unchanged" | "error" | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [lastPdfPath, setLastPdfPath] = useState<string | null>(null);
   const [lastPdfFileName, setLastPdfFileName] = useState<string | null>(null);
   const [emailComposerOpen, setEmailComposerOpen] = useState(false);
@@ -285,6 +286,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   useEffect(() => {
     const autoSync = async () => {
       setSyncing(true);
+      setSyncError(null);
       try {
         const r = (await api("base:sync")) as {
           ok: boolean;
@@ -296,8 +298,10 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         };
         setSyncStatus(r.status ?? null);
         if (r.ok && r.data) setPricingData(r.data);
-      } catch {
+        else if (r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
+      } catch (e) {
         setSyncStatus("error");
+        setSyncError(e instanceof Error ? e.message : "Błąd synchronizacji");
       } finally {
         setSyncing(false);
       }
@@ -307,6 +311,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
 
   const syncPricing = async () => {
     setSyncing(true);
+    setSyncError(null);
     try {
       const r = (await api("base:sync")) as {
         ok: boolean;
@@ -318,13 +323,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       };
       setSyncStatus(r.status ?? null);
       if (r.ok && r.data) setPricingData(r.data);
+      else if (r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
       if (r.status === "synced") showToast("Baza zaktualizowana");
       else if (r.status === "unchanged") showToast("Baza aktualna");
       else if (r.status === "offline") showToast("Offline – używam lokalnej bazy");
       else if (r.status === "error") showToast(r.error ?? "Błąd synchronizacji");
     } catch (e) {
       setSyncStatus("error");
-      showToast(e instanceof Error ? e.message : "Błąd sync");
+      const msg = e instanceof Error ? e.message : "Błąd sync";
+      setSyncError(msg);
+      showToast(msg);
     } finally {
       setSyncing(false);
     }
@@ -1286,6 +1294,11 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
               Błąd synchronizacji (ale aplikacja działa na lokalnej bazie v{pricingData.version})
             </p>
           )}
+          {syncStatus === "error" && !pricingData && (
+            <p style={{ fontSize: 12, color: tokens.color.error ?? "#c62828", marginBottom: 8 }}>
+              {syncError ?? "Błąd synchronizacji. Sprawdź połączenie z internetem i kliknij „Synchronizuj bazę”."}
+            </p>
+          )}
           {result?.success && (
             <>
               {result.base?.matched && result.base?.fallbackUsed && result.base?.fallbackInfo && (
@@ -1363,7 +1376,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             <div style={styles.diag}>{result.errorMessage ?? "Brak dopasowania ceny"}</div>
           )}
           {!pricingData && (
-            <p style={{ color: tokens.color.textMuted }}>Brak bazy cennika. Kliknij „Synchronizuj bazę” (wymaga internetu).</p>
+            <p style={{ color: tokens.color.textMuted }}>
+              {syncing ? "Ładowanie bazy cennika…" : (syncStatus === "error" ? (syncError ?? "Błąd synchronizacji. Kliknij „Synchronizuj bazę” (wymaga internetu).") : "Brak bazy cennika. Kliknij „Synchronizuj bazę” (wymaga internetu).")}
+            </p>
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
             <button onClick={generatePdf} disabled={generating || !result?.success} style={styles.button} data-testid="offer-generate-pdf">

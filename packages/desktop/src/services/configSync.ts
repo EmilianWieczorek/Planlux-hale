@@ -186,9 +186,20 @@ export async function syncConfig(
             Boki: first?.Boki ?? "(brak)",
           });
         }
+      } else {
+        log.info("[configSync] getRelationalPricing returned empty (RLS or empty tables)", {
+          hasRel: !!rel,
+          cennikLength: rel?.cennik?.length ?? 0,
+        });
       }
     } catch (e) {
-      log.warn("[configSync] getRelationalPricing failed", e instanceof Error ? e.message : String(e));
+      const err = e instanceof Error ? e : new Error(String(e));
+      const code = (e as { code?: string })?.code;
+      log.warn("[configSync] getRelationalPricing failed", {
+        message: err.message,
+        code: code ?? undefined,
+        name: err.name,
+      });
     }
   }
 
@@ -249,13 +260,18 @@ export async function syncConfig(
         standard: local.standard,
       };
       source = usedSeed ? "seed" : "local-fallback";
-      log.info("[configSync] using local fallback from SQLite", { source, cennik: baseData.cennik.length, dodatki: baseData.dodatki.length, standard: baseData.standard.length });
+      log.info("[configSync] using local fallback from SQLite", {
+        source,
+        cennik: baseData.cennik.length,
+        dodatki: baseData.dodatki.length,
+        standard: baseData.standard.length,
+      });
     } else {
       log.error("[configSync] No pricing base available (relational empty, SQLite fallback empty, seed had no data)");
       lastSyncResult = {
         status: "error",
         version: localVersion,
-        error: "No pricing base available",
+        error: "Brak bazy cennika. Sprawdź połączenie z internetem i kliknij „Synchronizuj bazę”, lub skontaktuj się z supportem.",
       };
       return lastSyncResult;
     }

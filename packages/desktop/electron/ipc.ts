@@ -651,20 +651,32 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:getPricingCache", async () => {
     try {
       const { getCachedBase, loadBaseFromLocalTables, saveBase } = await import("../src/infra/db");
+      const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
       const db = getDb();
       let base = getCachedBase(db);
       if (!base || !base.cennik?.length) {
-        const local = loadBaseFromLocalTables(db);
+        let local = loadBaseFromLocalTables(db);
+        if (!local || local.cennik.length === 0) {
+          const seeded = seedBaseIfEmpty(db);
+          if (seeded) {
+            logger.info("[getPricingCache] cache empty, ran seedBaseIfEmpty");
+            local = loadBaseFromLocalTables(db);
+          }
+        }
         if (local && local.cennik.length > 0) {
           try {
             saveBase(db, local);
-          } catch {
-            // ignore
+            base = local;
+          } catch (e) {
+            logger.warn("[getPricingCache] saveBase failed after local load", e);
+            base = local;
           }
-          base = local;
         }
       }
-      if (!base) return { ok: true, data: null };
+      if (!base) {
+        logger.warn("[getPricingCache] no pricing data (cache and local tables empty)");
+        return { ok: true, data: null };
+      }
       return { ok: true, data: base };
     } catch (e) {
       logger.error("getPricingCache failed", e);

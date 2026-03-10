@@ -637,6 +637,8 @@ async function runStartup(): Promise<void> {
 
   const database = getDb();
   const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
+  const { loadBaseFromLocalTables, saveBase, getCachedBase } = await import("../src/infra/db");
+
   const seeded = seedBaseIfEmpty(database);
   try {
     const pricingSurfaceCount =
@@ -651,9 +653,13 @@ async function runStartup(): Promise<void> {
       addons_surcharges: addonsCount?.c ?? 0,
       standard_included: standardCount?.c ?? 0,
     });
+    if (seeded && (pricingSurfaceCount?.c ?? 0) === 0) {
+      logger.warn("[bootstrap] seed reported true but pricing_surface still empty – possible migration/table mismatch");
+    }
   } catch (e) {
     logger.warn("[bootstrap] pricing tables count failed", e);
   }
+
   const { getLocalVersion } = await import("../src/infra/db");
   if (getLocalVersion(database) === 0) {
     const cachePath = path.join(app.getPath("userData"), "pricing_cache.json");
@@ -666,11 +672,48 @@ async function runStartup(): Promise<void> {
       logger.warn("[configSync] remove pricing_cache.json failed", e);
     }
   }
+
   try {
     const { syncConfig } = await import("../src/services/configSync");
     await syncConfig(database, logger, apiClient);
   } catch (e) {
     logger.warn("[configSync] startup sync failed – app continues with local data", e);
+  }
+
+  // Ensure pricing_cache is never empty after bootstrap: if still empty, fill from local tables or seed.
+  let cacheRow = getCachedBase(database);
+  if (!cacheRow || !cacheRow.cennik?.length) {
+    let local = loadBaseFromLocalTables(database);
+    if (!local || local.cennik.length === 0) {
+      const reseeded = seedBaseIfEmpty(database);
+      if (reseeded) logger.info("[bootstrap] re-ran seed (cache empty after sync)");
+      local = loadBaseFromLocalTables(database);
+    }
+    if (local && local.cennik.length > 0) {
+      try {
+        saveBase(database, local);
+        logger.info("[bootstrap] filled pricing_cache from local/seed", { cennik: local.cennik.length, dodatki: local.dodatki.length, standard: local.standard.length });
+      } catch (e) {
+        logger.warn("[bootstrap] saveBase after fallback failed", e);
+      }
+    } else {
+      logger.error("[bootstrap] pricing_cache still empty after sync and seed – variants/standards/addons will not load");
+    }
+  }
+
+  if (app.isPackaged) {
+    try {
+      const { getPdfTemplateDir, getPdfTemplateDirCandidatesWithExists } = await import("./pdf/pdfPaths");
+      const templateDir = getPdfTemplateDir();
+      if (!templateDir) {
+        const candidates = getPdfTemplateDirCandidatesWithExists();
+        logger.error("[pdf] TEMPLATE_MISSING at startup (packaged app)", { resourcesPath: process.resourcesPath, candidates });
+      } else {
+        logger.info("[pdf] template dir resolved at startup", { dir: templateDir });
+      }
+    } catch (e) {
+      logger.warn("[pdf] startup template check failed", e);
+    }
   }
   await registerIpcHandlers({
     getDb,
