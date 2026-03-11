@@ -75,6 +75,33 @@ function requireRole(allowedRoles: string[]): SessionUser {
   return user;
 }
 
+/**
+ * Map app offer status to Supabase-accepted value.
+ * Supabase may use enum offer_status with values like DRAFT/GENERATED/SENT/REALIZED (no IN_PROGRESS).
+ * Logs mapping when LOG_LEVEL=debug.
+ */
+function mapOfferStatusForSupabase(status: string | undefined): string {
+  const input = (status ?? "IN_PROGRESS").trim();
+  const s = input.toUpperCase();
+  let mapped: string;
+  if (s === "IN_PROGRESS") mapped = "DRAFT";
+  else if (["GENERATED", "SENT", "REALIZED"].includes(s)) mapped = s;
+  else mapped = s || "DRAFT";
+  if (process.env.LOG_LEVEL === "debug") {
+    // eslint-disable-next-line no-console
+    console.debug("[supabase][offers] mapOfferStatusForSupabase", { input: status, normalized: s, mapped });
+  }
+  return mapped;
+}
+
+/** Map Supabase offer_status (DRAFT/...) back to app status (IN_PROGRESS/...) for UI consistency. */
+function mapSupabaseStatusToApp(status: string | undefined): string {
+  const s = (status ?? "").trim().toUpperCase();
+  if (s === "DRAFT") return "IN_PROGRESS";
+  if (["GENERATED", "SENT", "REALIZED"].includes(s)) return s;
+  return s || "IN_PROGRESS";
+}
+
 /** Placeholder hash for users synced from backend without password (never verifies). Check password_unavailable for offline message. */
 function placeholderHash(): string {
   return crypto.scryptSync("__unavailable__", LEGACY_SALT, 64).toString("hex");
@@ -250,7 +277,7 @@ export function getEmailHistoryForOfferData(
 export async function registerIpcHandlers(deps: {
   getDb: () => ReturnType<typeof import("better-sqlite3")>;
   getDbPath?: () => string;
-  apiClient: import("@planlux/shared").ApiClient;
+  apiClient: ReturnType<typeof import("./supabase/apiAdapter").createSupabaseApiAdapter>;
   getSupabase?: () => import("@supabase/supabase-js").SupabaseClient;
   config: { appVersion: string; updatesUrl?: string };
   logger: { info: (m: string, d?: unknown) => void; warn: (m: string, d?: unknown) => void; error: (m: string, e?: unknown) => void };
@@ -281,7 +308,7 @@ export async function registerIpcHandlers(deps: {
           created_by: userId,
           offer_number: opts.offerNumber ?? null,
           offer_number_status: opts.offerNumberStatus ?? "TEMP",
-          status: opts.status ?? "DRAFT",
+          status: mapOfferStatusForSupabase(opts.status ?? "DRAFT"),
           payload: {},
           totals: {},
         },
@@ -464,30 +491,10 @@ export async function registerIpcHandlers(deps: {
       });
 
       if (result.ok) {
-        const adminEmail = (getConfig().seed?.adminInitialEmail ?? "").trim().toLowerCase();
-        if (adminEmail && result.user.email.trim().toLowerCase() === adminEmail && result.user.role !== "ADMIN") {
-          db.prepare("UPDATE users SET role = 'ADMIN' WHERE LOWER(TRIM(email)) = ?").run(adminEmail);
-          result.user = { ...result.user, role: "ADMIN" };
-        }
-        // After Supabase login: sync users, then resolve effective role (self-heal if Supabase ADMIN vs stale local)
-        let roleForSession = result.user.role;
+        // Role only from Supabase (no local DB read/write for role – avoids SQLITE_CONSTRAINT_FOREIGNKEY and stale role).
+        const roleForSession = normalizeRole(result.user.role);
         if (getSupabase) {
-          const syncResult = await syncUsersFromBackend();
-          if (syncResult.ok) {
-            const localRow = db.prepare("SELECT role FROM users WHERE email = ?").get(emailNorm) as { role: string } | undefined;
-            logger.info("[auth] role from local DB before repair", { email: emailNorm, localRole: localRow?.role ?? null });
-            const supabaseRole = result.user.role;
-            if (supabaseRole === "ADMIN" && localRow && normalizeRole(localRow.role) !== "ADMIN") {
-              db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").run("ADMIN", new Date().toISOString(), emailNorm);
-              logger.info("[auth] repairing local role from X to Y", { email: emailNorm, from: localRow.role, to: "ADMIN" });
-              const afterRow = db.prepare("SELECT role FROM users WHERE email = ?").get(emailNorm) as { role: string };
-              roleForSession = normalizeRole(afterRow.role);
-              logger.info("[auth] role from local DB after repair", { email: emailNorm, localRole: afterRow.role, effectiveRole: roleForSession });
-            } else if (localRow) {
-              roleForSession = normalizeRole(localRow.role);
-              logger.info("[auth] role from local DB after sync", { email: emailNorm, localRole: localRow.role, effectiveRole: roleForSession });
-            }
-          }
+          void syncUsersFromBackend().catch(() => {});
         }
         const userForSession: SessionUser = { id: result.user.id, email: result.user.email, role: roleForSession, displayName: result.user.displayName ?? null };
         let supabaseAccessToken: string | null = null;
@@ -651,95 +658,84 @@ export async function registerIpcHandlers(deps: {
   /** Typed empty pricing for engine and IPC. No unknown[]. */
   const EMPTY_PRICING_DATA: PricingEngineData = { cennik: [], dodatki: [], standard: [] };
   const EMPTY_PRICING = { version: 0, lastUpdated: "", ...EMPTY_PRICING_DATA };
-  type PricingSource = "pricing_cache" | "local_tables" | "fallback_json" | "empty";
+  type PricingSource = "supabase";
 
-  function toPricingEngineData(
-    base?: { cennik?: unknown[]; dodatki?: unknown[]; standard?: unknown[] } | null
-  ): PricingEngineData {
-    return {
-      cennik: Array.isArray(base?.cennik) ? (base.cennik as CennikRow[]) : [],
-      dodatki: Array.isArray(base?.dodatki) ? (base.dodatki as DodatkiRow[]) : [],
-      standard: Array.isArray(base?.standard) ? (base.standard as StandardRow[]) : [],
-    };
+  /** FINAL: system key for variant is only `variant`. Keep wariant_hali only as legacy field. */
+  function normalizeVariantKey(v: unknown): string {
+    return String(v ?? "").trim();
   }
 
+  function withVariant<T extends Record<string, unknown>>(row: T): T & { variant: string } {
+    const variant = normalizeVariantKey((row as { variant?: unknown }).variant ?? (row as { wariant_hali?: unknown }).wariant_hali);
+    return { ...row, variant };
+  }
+
+  // DEPRECATED (local cache): toPricingEngineData removed from active pricing flow.
+
   ipcMain.handle("planlux:getPricingCache", async () => {
-    const safeEmpty = (source: PricingSource) => ({
-      ok: true as const,
+    const safeError = (error: string) => ({
+      ok: false as const,
+      error,
       data: { ...EMPTY_PRICING },
       pricingData: { ...EMPTY_PRICING_DATA },
-      source,
+      source: "supabase" as const,
     });
-    const safeError = (error: string) => {
-      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
-        logger.info("[variants][ipc] source=empty", { error });
-      }
-      return {
-        ok: false as const,
-        error,
-        data: { ...EMPTY_PRICING },
-        pricingData: { ...EMPTY_PRICING_DATA },
-        source: "empty" as const,
-      };
-    };
     try {
-      const { getCachedBase, loadBaseFromLocalTables, saveBase } = await import("../src/infra/db");
-      const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
-      const db = getDb();
-      let base = getCachedBase(db);
-      let source: PricingSource = "pricing_cache";
-      if (!base || !base.cennik?.length) {
-        let local = loadBaseFromLocalTables(db);
-        if (!local || local.cennik.length === 0) {
-          const seeded = seedBaseIfEmpty(db);
-          if (seeded) {
-            logger.info("[getPricingCache] cache empty, ran seedBaseIfEmpty");
-            local = loadBaseFromLocalTables(db);
-          }
-        }
-        if (local && local.cennik.length > 0) {
-          try {
-            saveBase(db, local);
-            base = local;
-            source = "local_tables";
-          } catch (e) {
-            logger.warn("[getPricingCache] saveBase failed after local load", e);
-            base = local;
-            source = "local_tables";
-          }
-        }
+      // Supabase-only pricing source of truth:
+      // pricing_surface + addons_surcharges + standard_included
+      const relational = await apiClient.getRelationalPricing();
+      if (!relational) {
+        logger.warn("[supabase][pricing] getRelationalPricing returned null");
+        return safeError("Brak połączenia z serwerem. Aplikacja wymaga internetu.");
       }
-      if (!base || !base.cennik?.length) {
-        logger.warn("[getPricingCache] no pricing data (cache and local tables empty), returning empty structure");
-        if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
-          const cacheRows = db.prepare("SELECT COUNT(1) as c FROM pricing_cache").get() as { c: number };
-          const surfaceRows = db.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c: number };
-          logger.info("[variants][main] getPricingCache empty", { pricing_cache_rows: cacheRows?.c ?? 0, pricing_surface_rows: surfaceRows?.c ?? 0 });
-          logger.info("[variants][ipc] source=empty");
-        }
-        return safeEmpty("empty");
+
+      logger.info("[pricing][supabase] loaded pricing rows", { count: relational.cennik.length });
+      logger.info("[pricing][supabase] loaded addon rows", { count: relational.dodatki.length });
+      logger.info("[pricing][supabase] loaded standard rows", { count: relational.standard.length });
+
+      // Enforce single system key: `variant` (keep legacy fields but never key logic by them).
+      const pricingData: PricingEngineData = {
+        cennik: relational.cennik.map((r: CennikRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as CennikRow),
+        dodatki: relational.dodatki.map((r: DodatkiRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as DodatkiRow),
+        standard: relational.standard.map((r: StandardRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as StandardRow),
+      };
+
+      try {
+        const cennikVariants = [...new Set(pricingData.cennik.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const addonVariants = [...new Set(pricingData.dodatki.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const standardVariants = [...new Set(pricingData.standard.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const missingAddons = cennikVariants.filter((v) => !addonVariants.includes(v));
+        const missingStandard = cennikVariants.filter((v) => !standardVariants.includes(v));
+        logger.info("[pricing][supabase] addon sample", pricingData.dodatki[0] ?? null);
+        logger.info("[pricing][supabase] standard sample", pricingData.standard[0] ?? null);
+        logger.info("[pricing][supabase] addon variants", { count: addonVariants.length, sample: addonVariants.slice(0, 15) });
+        logger.info("[pricing][supabase] standard variants", { count: standardVariants.length, sample: standardVariants.slice(0, 15) });
+        logger.info("[pricing][supabase] variants missing addons", { count: missingAddons.length, sample: missingAddons.slice(0, 15) });
+        logger.info("[pricing][supabase] variants missing standard", { count: missingStandard.length, sample: missingStandard.slice(0, 15) });
+      } catch (e) {
+        logger.warn("[pricing][supabase] variants diagnostic failed", { error: e instanceof Error ? e.message : String(e) });
       }
-      const pricingData = toPricingEngineData(base);
-      const cennik = pricingData.cennik;
-      const variantIds = [...new Set(cennik.map((r) => String(r?.wariant_hali ?? (r as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
-      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
-        logger.info("[variants][main] getPricingCache", {
-          pricing_cache_rows: 1,
-          cennik_entries: cennik.length,
-          unique_variants: variantIds.length,
-          sample_variants: variantIds.slice(0, 5),
-        });
-        logger.info("[variants][ipc] source=" + source);
-      }
+
+      const variantIds = [
+        ...new Set(
+          pricingData.cennik
+            .map((r) => String((r as unknown as { variant?: string; wariant_hali?: string }).variant ?? (r as unknown as { wariant_hali?: string }).wariant_hali ?? "").trim())
+            .filter(Boolean)
+        ),
+      ];
+      logger.info("[pricing] getPricingCache");
+      logger.info("[pricing] cennik_entries", { count: pricingData.cennik.length });
+      logger.info("[pricing] unique_variants", { count: variantIds.length, sample_variants: variantIds.slice(0, 10) });
+
       return {
         ok: true,
-        data: { version: base.version, lastUpdated: base.lastUpdated, ...pricingData },
+        data: { version: relational.version, lastUpdated: relational.lastUpdated, ...pricingData },
         pricingData,
-        source,
+        source: "supabase" as const,
       };
     } catch (e) {
       logger.error("getPricingCache failed", e);
-      return safeError(String(e));
+      return safeError("Brak połączenia z serwerem. Aplikacja wymaga internetu.");
     }
   });
 
@@ -769,10 +765,8 @@ export async function registerIpcHandlers(deps: {
       const user = getSession();
       let remoteVersion: number | null = null;
       try {
-        if (apiClient?.getMeta) {
-          const metaRes = await apiClient.getMeta();
-          if (metaRes?.meta?.version != null) remoteVersion = Number(metaRes.meta.version);
-        }
+        const rel = await apiClient.getRelationalPricing();
+        if (rel?.version != null) remoteVersion = Number(rel.version);
       } catch {
         // ignore
       }
@@ -869,69 +863,30 @@ export async function registerIpcHandlers(deps: {
     }
   }));
 
+  // DEPRECATED: base_pricing/configSync/local pricing cache (Supabase-only final architecture).
   ipcMain.handle("base:sync", wrap("base:sync", async () => {
-    try {
-      const { syncConfig } = await import("../src/services/configSync");
-      const { getCachedBase } = await import("../src/infra/db");
-      const { createOutboxStorage } = await import("../src/db/outboxStorage");
-      const { flushOutbox } = await import("@planlux/shared");
-      const db = getDb();
-      const result = await syncConfig(db, logger, apiClient);
-      const base = getCachedBase(db);
-      if (result.status === "synced" || result.status === "unchanged" || result.status === "offline") {
-        flushOutbox({
-          api: apiClient,
-          storage: createOutboxStorage(db as Parameters<typeof createOutboxStorage>[0]),
-          isOnline: () => true,
-          sendEmail: createSendEmailForFlush(getDb),
-        }).then((r) => {
-          if (r.processed > 0) logger.info("[outbox] flush after sync", { processed: r.processed });
-          if (r.failed > 0) logger.warn("[outbox] flush had failures", { failed: r.failed, operationType: r.firstError?.operationType, reason: r.firstError?.message ?? r.firstError?.code ?? "see outbox.last_error" });
-        }).catch((e) => logger.error("[outbox] flush after sync failed", e instanceof Error ? e.message : String(e)));
-      }
-      const data =
-        base && Array.isArray(base.cennik) && base.cennik.length > 0
-          ? { version: base.version, lastUpdated: base.lastUpdated, ...toPricingEngineData(base) }
-          : { ...EMPTY_PRICING };
-      if (process.env.LOG_LEVEL === "debug" || process.env.PLANLUX_VARIANTS_DEBUG === "1") {
-        const pd = toPricingEngineData(base);
-        const variantIds = [...new Set(pd.cennik.map((r) => String(r?.wariant_hali ?? "").trim()).filter(Boolean))];
-        logger.info("[variants][main] base:sync result", {
-          status: result.status,
-          cennik_entries: pd.cennik.length,
-          unique_variants: variantIds.length,
-          sample_variants: variantIds.slice(0, 5),
-        });
-      }
-      return {
-        ok: result.status !== "error",
-        status: result.status,
-        version: result.version ?? data.version,
-        lastUpdated: result.lastUpdated ?? base?.lastUpdated ?? data.lastUpdated,
-        data,
-        pricingData: base ? toPricingEngineData(base) : { ...EMPTY_PRICING_DATA },
-        error: result.error,
-      };
-    } catch (e) {
-      logger.error("base:sync failed", e);
-      return {
-        ok: false,
-        status: "error" as const,
-        data: { ...EMPTY_PRICING },
-        pricingData: { ...EMPTY_PRICING_DATA },
-        error: String(e),
-      };
-    }
+    return {
+      ok: false,
+      status: "error" as const,
+      error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.",
+    };
   }));
 
   ipcMain.handle("planlux:calculatePrice", async (_, input: unknown) => {
     try {
       const { calculatePrice } = await import("@planlux/shared");
-      const { getCachedBase } = await import("../src/infra/db");
-      const db = getDb();
-      const base = getCachedBase(db);
-      if (!base || !Array.isArray(base.cennik)) return { ok: false, error: "Brak bazy cennika. Połącz się z internetem i uruchom synchronizację." };
-      const data: PricingEngineData = toPricingEngineData(base);
+      const relational = await apiClient.getRelationalPricing();
+      if (!relational) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
+
+      logger.info("[pricing][supabase] loaded pricing rows", { count: relational.cennik.length });
+      logger.info("[pricing][supabase] loaded addon rows", { count: relational.dodatki.length });
+      logger.info("[pricing][supabase] loaded standard rows", { count: relational.standard.length });
+
+      const data: PricingEngineData = {
+        cennik: relational.cennik.map((r: CennikRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as CennikRow),
+        dodatki: relational.dodatki.map((r: DodatkiRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as DodatkiRow),
+        standard: relational.standard.map((r: StandardRow) => withVariant(r as unknown as Record<string, unknown>) as unknown as StandardRow),
+      };
       const inp = input as {
         variantHali: string;
         widthM: number;
@@ -946,6 +901,25 @@ export async function registerIpcHandlers(deps: {
       };
       const areaM2 = inp.widthM * inp.lengthM;
       const perimeterMb = 2 * (inp.widthM + inp.lengthM);
+      const heightM = inp.heightM ?? 0;
+      logger.info("[pricing][calculate] selected variant", {
+        variantHali: inp.variantHali,
+        width: inp.widthM,
+        length: inp.lengthM,
+        height: heightM,
+        area: areaM2,
+      });
+      const selectedVariant = String(inp.variantHali ?? "").trim();
+      const matchingCennikRows = data.cennik.filter(
+        (r) =>
+          String((r as unknown as { variant?: string }).variant ?? (r as unknown as { wariant_hali?: string }).wariant_hali ?? "").trim() === selectedVariant
+      );
+      logger.info("[pricing][calculate] matching cennik rows", { count: matchingCennikRows.length });
+      const variantInCennik = matchingCennikRows.length > 0;
+      if (!variantInCennik && inp.variantHali) {
+        logger.warn("[pricing] variant not found in cennik", { variantHali: inp.variantHali });
+        return { ok: false, error: "Wybrany wariant nie istnieje w aktualnym cenniku (Supabase)." };
+      }
       const result = calculatePrice(data, {
         ...inp,
         areaM2,
@@ -1300,36 +1274,7 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** DEV ONLY: bootstrap user from legacy app_users into Supabase Auth + profiles via Edge Function create-user. */
-  ipcMain.handle(
-    "planlux:authBootstrapFromAppUsers",
-    async (
-      _,
-      payload: {
-        email: string;
-        password: string;
-      }
-    ) => {
-      const appConfig = getConfig();
-      if (appConfig.mode !== "dev") {
-        return { ok: false, error: "Bootstrap użytkowników z app_users jest dostępny tylko w trybie dev." };
-      }
-      try {
-        requireRole(["ADMIN"]);
-      } catch (e) {
-        return { ok: false, error: e instanceof Error ? e.message : "Brak uprawnień ADMIN" };
-      }
-      if (!getSupabase) return { ok: false, error: "Supabase not configured" };
-      const email = (payload.email ?? "").trim().toLowerCase();
-      const password = payload.password ?? "";
-      if (!email) return { ok: false, error: "Email jest wymagany" };
-      if (!password) return { ok: false, error: "Hasło jest wymagane" };
-
-      const { bootstrapUserFromAppUsers } = await import("./auth/authSupabase");
-      const result = await bootstrapUserFromAppUsers(getSupabase(), email, password);
-      return result;
-    }
-  );
+  // app_users is deprecated and detached from active auth flow (Supabase Auth + profiles only).
 
   /** Admin: aktualizuj użytkownika. Wymaga roli ADMIN. */
   ipcMain.handle("planlux:updateUser", async (_, targetUserId: string, payload: { email?: string; displayName?: string; role?: string; password?: string }) => {
@@ -1407,54 +1352,46 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getOffers", wrap("planlux:getOffers", async () => {
     const user = requireAuth();
-    const db = getDb();
+    if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
+    const supabase = getSupabase();
     const seeAll = user.role === "ADMIN" || user.role === "SZEF";
-    const rows = seeAll
-      ? db.prepare("SELECT * FROM offers ORDER BY created_at DESC LIMIT 200").all()
-      : db.prepare("SELECT * FROM offers WHERE user_id = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
-    return { ok: true, data: rows };
+    const q = supabase.from("offers").select("*").order("created_at", { ascending: false }).limit(200);
+    const { data, error } = seeAll ? await q : await q.eq("user_id", user.id);
+    if (error) {
+      logger.error("[supabase][offers] getOffers failed", { message: error.message });
+      return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
+    }
+    return { ok: true, data: data ?? [] };
   }));
 
   ipcMain.handle("planlux:saveOffer", wrap("planlux:saveOffer", async (_, offer: unknown) => {
     try {
-      const db = getDb();
-      const o = offer as {
-        id: string;
-        userId: string;
-        clientName: string;
-        clientEmail?: string;
-        clientPhone?: string;
-        widthM: number;
-        lengthM: number;
-        heightM?: number;
-        areaM2: number;
-        variantHali: string;
-        variantNazwa?: string;
-        totalPln: number;
-        clientJson?: string;
-        hallJson?: string;
-        pricingJson?: string;
+      const user = requireAuth();
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
+      const supabase = getSupabase();
+      const o = offer as Record<string, unknown>;
+      const id = String(o.id ?? "");
+      if (!id) return { ok: false, error: "Brak ID oferty" };
+      // Supabase is the only source of truth for offers.
+      const payload = {
+        id,
+        user_id: String(o.userId ?? user.id),
+        client_name: String(o.clientName ?? ""),
+        client_email: o.clientEmail ?? null,
+        client_phone: o.clientPhone ?? null,
+        width_m: Number(o.widthM ?? 0),
+        length_m: Number(o.lengthM ?? 0),
+        height_m: o.heightM != null ? Number(o.heightM) : null,
+        area_m2: Number(o.areaM2 ?? 0),
+        variant: String(o.variant ?? o.variantHali ?? ""),
+        total_pln: Number(o.totalPln ?? 0),
+        updated_at: new Date().toISOString(),
       };
-      db.prepare(
-        `INSERT OR REPLACE INTO offers (id, user_id, client_name, client_email, client_phone, width_m, length_m, height_m, area_m2, variant_hali, variant_nazwa, total_pln, base_row_json, additions_json, standard_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
-      ).run(
-        o.id,
-        o.userId,
-        o.clientName,
-        o.clientEmail ?? null,
-        o.clientPhone ?? null,
-        o.widthM,
-        o.lengthM,
-        o.heightM ?? null,
-        o.areaM2,
-        o.variantHali,
-        o.variantNazwa ?? null,
-        o.totalPln,
-        o.pricingJson ?? "{}",
-        "[]",
-        "[]"
-      );
+      const { error } = await supabase.from("offers").upsert(payload, { onConflict: "id" });
+      if (error) {
+        logger.error("[supabase][offers] saveOffer failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
+      }
       return { ok: true };
     } catch (e) {
       logger.error("saveOffer failed", e);
@@ -2207,52 +2144,39 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:createOffer", wrap("planlux:createOffer", async (_, minimalData?: { clientName?: string; widthM?: number; lengthM?: number }) => {
     try {
       const user = requireAuth();
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
+      const supabase = getSupabase();
       const { getDeviceId } = await import("./deviceId");
       const deviceId = getDeviceId();
       const tempNumber = generateTempOfferNumber(deviceId);
 
       const offerId = uuid();
-      const db = getDb();
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
-      if (tables.length === 0) return { ok: true, offerId, offerNumber: tempNumber, isTemp: true };
-
       const clientName = (minimalData?.clientName ?? "").trim();
       const w = minimalData?.widthM ?? 0;
       const l = minimalData?.lengthM ?? 0;
       const areaM2 = w * l || 0;
-      const isCompany = /sp\.|s\.a\.|z o\.o\.|s\.c\.|s\.r\.o\./i.test(clientName);
-      let clientFirstName = "";
-      let clientLastName = "";
-      let companyName = "";
-      if (isCompany) companyName = clientName;
-      else {
-        const parts = clientName.split(/\s+/).filter(Boolean);
-        clientFirstName = parts[0] ?? "";
-        clientLastName = parts.slice(1).join(" ") ?? "";
-      }
       const nowIso = new Date().toISOString();
-      const hasStatus = (db.prepare("PRAGMA table_info(offers_crm)").all() as Array<{ name: string }>).some((c) => c.name === "offer_number_status");
-      if (hasStatus) {
-        db.prepare(
-          `INSERT INTO offers_crm (id, offer_number, offer_number_status, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
-           VALUES (?, ?, 'TEMP', ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
-        ).run(offerId, tempNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
-      } else {
-        db.prepare(
-          `INSERT INTO offers_crm (id, offer_number, user_id, status, client_first_name, client_last_name, company_name, nip, phone, email, variant_hali, width_m, length_m, height_m, area_m2, hall_summary, base_price_pln, additions_total_pln, total_pln, standard_snapshot, addons_snapshot, note_html, version, created_at, updated_at)
-           VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, '', '', '', 'T18_T35_DACH', ?, ?, NULL, ?, '', 0, 0, 0, '[]', '[]', '', 1, ?, ?)`
-        ).run(offerId, tempNumber, user.id, clientFirstName, clientLastName, companyName, w, l, areaM2, nowIso, nowIso);
+
+      const { error } = await supabase.from("offers").insert({
+        id: offerId,
+        user_id: user.id,
+        offer_number: tempNumber,
+        offer_number_status: "TEMP",
+        status: mapOfferStatusForSupabase("IN_PROGRESS"),
+        client_name: clientName,
+        variant: "T18_T35_DACH",
+        width_m: w,
+        length_m: l,
+        area_m2: areaM2,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+      if (error) {
+        logger.error("[supabase][offers] createOffer failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
       }
 
-      await syncOfferToSupabase(offerId, user.id, { offerNumber: tempNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
-
-      const auditTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_audit'").all() as Array<{ name: string }>;
-      if (auditTables.length > 0) {
-        db.prepare("INSERT INTO offer_audit (id, offer_id, user_id, type, payload_json) VALUES (?, ?, ?, 'CREATE_OFFER', ?)").run(
-          uuid(), offerId, user.id, JSON.stringify({ offerNumber: tempNumber, clientName, widthM: w, lengthM: l })
-        );
-      }
-      logger.info("[crm] createOffer ok", { offerId, offerNumber: tempNumber });
+      logger.info("[supabase][offers] createOffer ok", { offerId, offerNumber: tempNumber });
       return { ok: true, offerId, offerNumber: tempNumber, isTemp: true };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
@@ -2267,22 +2191,23 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:getNextOfferNumber", async () => {
     try {
       const user = requireAuth();
-      const db = getDb();
-      const row = db.prepare("SELECT display_name, email FROM users WHERE id = ? AND active = 1").get(user.id) as
-        | { display_name: string | null; email?: string }
-        | undefined;
-      const initial = getSalesInitial(row ? { displayName: row.display_name ?? undefined, email: row.email } : null);
-      const year = new Date().getFullYear();
       try {
-        const hasTable = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offer_counters'").get() as { name?: string } | undefined)?.name === "offer_counters";
-        if (hasTable) {
-          const plxNumber = getNextOfferNumberLocal(db, "PLX", year, initial);
-          logger.info("[offer] getNextOfferNumber local PLX", { offerNumber: plxNumber });
-          return { ok: true, offerNumber: plxNumber };
+        // Central numbering is handled by Supabase (offer_counters / RPC).
+        const initial = getSalesInitial({ displayName: user.displayName ?? undefined, email: user.email });
+        const year = new Date().getFullYear();
+        const result = await apiClient.reserveOfferNumber({
+          id: uuid(),
+          userId: user.id,
+          initial,
+          year,
+        });
+        if (result?.ok && result.offerNumber) {
+          logger.info("[supabase][offers] reserveOfferNumber ok", { offerNumber: result.offerNumber });
+          return { ok: true, offerNumber: result.offerNumber, isTemp: false };
         }
-        logger.warn("[offer] offer_counters table missing, using TEMP fallback");
+        logger.warn("[supabase][offers] reserveOfferNumber failed, TEMP fallback", { error: (result as { error?: string })?.error });
       } catch (e) {
-        logger.warn("[offer] offer_counters failed, using TEMP fallback", e);
+        logger.warn("[supabase][offers] reserveOfferNumber threw, TEMP fallback", e);
       }
       const { getDeviceId } = await import("./deviceId");
       const deviceId = getDeviceId();
@@ -2564,44 +2489,50 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: lista ofert z offers_crm. SALESPERSON → filtr user_id; BOSS/ADMIN → wszystkie. */
+  /** CRM: lista ofert z Supabase public.offers. SALESPERSON → filtr user_id; BOSS/ADMIN → wszystkie. */
   ipcMain.handle("planlux:getOffersCrm", async (_, params?: { statusFilter?: string; searchQuery?: string }) => {
     try {
       const user = requireAuth();
-      const db = getDb();
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='offers_crm'").all() as Array<{ name: string }>;
-      if (tables.length === 0) return { ok: true, offers: [] };
-      const statusFilter = params?.statusFilter ?? "all";
-      const searchQuery = params?.searchQuery ?? "";
-      let sql = "SELECT id, offer_number, status, user_id, client_first_name, client_last_name, company_name, nip, phone, variant_hali, width_m, length_m, area_m2, total_pln, created_at, pdf_generated_at, emailed_at, realized_at FROM offers_crm";
-      const args: unknown[] = [];
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", offers: [] };
+      const supabase = getSupabase();
+      const rawStatusFilter = (params?.statusFilter ?? "all").toLowerCase();
+      const searchQuery = (params?.searchQuery ?? "").trim();
       const seeAll = user.role === "ADMIN" || user.role === "SZEF";
-      if (!seeAll) {
-        sql += " WHERE user_id = ?";
-        args.push(user.id);
+
+      let q = supabase.from("offers").select("*").order("created_at", { ascending: false }).limit(200);
+      if (!seeAll) q = q.eq("user_id", user.id);
+      if (rawStatusFilter !== "all") {
+        const appStatus = rawStatusFilter === "in_progress" ? "IN_PROGRESS" : rawStatusFilter.toUpperCase();
+        const supabaseStatus = mapOfferStatusForSupabase(appStatus);
+        if (process.env.LOG_LEVEL === "debug") {
+          logger.info("[supabase][offers] getOffersCrm statusFilter", {
+            inputTab: rawStatusFilter,
+            appStatus,
+            supabaseStatus,
+          });
+        }
+        q = q.eq("status", supabaseStatus);
       }
-      if (statusFilter !== "all") {
-        sql += (args.length > 0 ? " AND" : " WHERE") + " status = ?";
-        args.push(statusFilter.toUpperCase());
+      if (searchQuery) {
+        // Simple search: offer_number or client_name.
+        q = q.or(`offer_number.ilike.%${searchQuery}%,client_name.ilike.%${searchQuery}%`);
       }
-      if (searchQuery?.trim()) {
-        const q = `%${searchQuery.trim()}%`;
-        sql += (args.length > 0 ? " AND" : " WHERE") + " (offer_number LIKE ? OR client_first_name LIKE ? OR client_last_name LIKE ? OR company_name LIKE ? OR nip LIKE ? OR phone LIKE ?)";
-        args.push(q, q, q, q, q, q);
+      const { data, error } = await q;
+      if (error) {
+        logger.error("[supabase][offers] getOffersCrm failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", offers: [] };
       }
-      sql += " ORDER BY created_at DESC LIMIT 200";
-      const rows = db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
-      const offers = rows.map((r) => ({
+      const offers = (data ?? []).map((r: Record<string, unknown>) => ({
         id: r.id,
-        offerNumber: r.offer_number,
-        status: r.status,
+        offerNumber: r.offer_number ?? "",
+        status: mapSupabaseStatusToApp(r.status as string | undefined),
         userId: r.user_id ?? "",
-        clientFirstName: r.client_first_name ?? "",
-        clientLastName: r.client_last_name ?? "",
-        companyName: r.company_name ?? "",
+        clientFirstName: "",
+        clientLastName: "",
+        companyName: r.client_company ?? "",
         nip: r.nip ?? "",
-        phone: r.phone ?? "",
-        variantHali: r.variant_hali ?? "",
+        phone: r.client_phone ?? r.phone ?? "",
+        variantHali: r.variant ?? "",
         widthM: r.width_m ?? 0,
         lengthM: r.length_m ?? 0,
         areaM2: r.area_m2 ?? 0,
@@ -2797,39 +2728,43 @@ export async function registerIpcHandlers(deps: {
   /** CRM: szczegóły oferty (pełne dane). Owner lub BOSS/ADMIN ma dostęp. */
   ipcMain.handle("planlux:getOfferDetails", wrap("planlux:getOfferDetails", async (_, offerId: string) => {
     const user = requireAuth();
-    const db = getDb();
-    if (!canAccessOffer(db, offerId, user.id)) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
-    const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
-    if (!row) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
+    if (!getSupabase) throw new AppError("OFFLINE", "Brak połączenia z serwerem. Aplikacja wymaga internetu.", { expose: true });
+    const supabase = getSupabase();
+    const { data: row, error } = await supabase.from("offers").select("*").eq("id", offerId).maybeSingle();
+    if (error || !row) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
+    const ownerOk = (row as { user_id?: string }).user_id === user.id;
+    const seeAll = user.role === "ADMIN" || user.role === "SZEF";
+    if (!ownerOk && !seeAll) throw new AppError("OFFER_NOT_FOUND", "Oferta nie znaleziona", { expose: true });
+
     const offer = {
-      id: row.id,
-      offerNumber: row.offer_number,
-      userId: row.user_id,
-      status: row.status,
-      createdAt: row.created_at,
-      pdfGeneratedAt: row.pdf_generated_at ?? null,
-      emailedAt: row.emailed_at ?? null,
-      realizedAt: row.realized_at ?? null,
-      clientFirstName: row.client_first_name ?? "",
-      clientLastName: row.client_last_name ?? "",
-      companyName: row.company_name ?? "",
-      nip: row.nip ?? "",
-      phone: row.phone ?? "",
-      email: row.email ?? "",
-      variantHali: row.variant_hali ?? "",
-      widthM: row.width_m ?? 0,
-      lengthM: row.length_m ?? 0,
-      heightM: row.height_m ?? null,
-      areaM2: row.area_m2 ?? 0,
-      hallSummary: row.hall_summary ?? "",
-      basePricePln: row.base_price_pln ?? 0,
-      additionsTotalPln: row.additions_total_pln ?? 0,
-      totalPln: row.total_pln ?? 0,
-      standardSnapshot: row.standard_snapshot ?? "[]",
-      addonsSnapshot: row.addons_snapshot ?? "[]",
-      noteHtml: row.note_html ?? "",
-      version: row.version ?? 1,
-      updatedAt: row.updated_at ?? "",
+      id: (row as Record<string, unknown>).id,
+      offerNumber: (row as Record<string, unknown>).offer_number ?? "",
+      userId: (row as Record<string, unknown>).user_id ?? "",
+      status: mapSupabaseStatusToApp((row as Record<string, unknown>).status as string | undefined),
+      createdAt: (row as Record<string, unknown>).created_at ?? "",
+      pdfGeneratedAt: (row as Record<string, unknown>).pdf_generated_at ?? null,
+      emailedAt: (row as Record<string, unknown>).emailed_at ?? null,
+      realizedAt: (row as Record<string, unknown>).realized_at ?? null,
+      clientFirstName: "",
+      clientLastName: "",
+      companyName: (row as Record<string, unknown>).client_company ?? "",
+      nip: (row as Record<string, unknown>).nip ?? "",
+      phone: (row as Record<string, unknown>).client_phone ?? "",
+      email: (row as Record<string, unknown>).client_email ?? "",
+      variantHali: (row as Record<string, unknown>).variant ?? "",
+      widthM: (row as Record<string, unknown>).width_m ?? 0,
+      lengthM: (row as Record<string, unknown>).length_m ?? 0,
+      heightM: (row as Record<string, unknown>).height_m ?? null,
+      areaM2: (row as Record<string, unknown>).area_m2 ?? 0,
+      hallSummary: (row as Record<string, unknown>).hall_summary ?? "",
+      basePricePln: (row as Record<string, unknown>).base_price_pln ?? 0,
+      additionsTotalPln: (row as Record<string, unknown>).additions_total_pln ?? 0,
+      totalPln: (row as Record<string, unknown>).total_pln ?? 0,
+      standardSnapshot: (row as Record<string, unknown>).standard_snapshot ?? "[]",
+      addonsSnapshot: (row as Record<string, unknown>).addons_snapshot ?? "[]",
+      noteHtml: (row as Record<string, unknown>).note_html ?? "",
+      version: (row as Record<string, unknown>).version ?? 1,
+      updatedAt: (row as Record<string, unknown>).updated_at ?? "",
     };
     return { ok: true, offer };
   }));
@@ -2861,9 +2796,39 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:getEmailHistoryForOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
-      const db = getDb();
-      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
-      const emails = getEmailHistoryForOfferData(db as EmailHistoryDb, offerId, logger);
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", emails: [] };
+      const supabase = getSupabase();
+
+      // Access check via offers (Supabase-only)
+      const { data: offerRow } = await supabase.from("offers").select("id,user_id").eq("id", offerId).maybeSingle();
+      const ownerOk = (offerRow as { user_id?: string } | null)?.user_id === user.id;
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
+      if (!ownerOk && !seeAll) return { ok: false, error: "Oferta nie znaleziona", emails: [] };
+
+      const { data, error } = await supabase
+        .from("email_history")
+        .select("*")
+        .eq("offer_id", offerId)
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      if (error) {
+        logger.error("[supabase][email_history] getEmailHistoryForOffer failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", emails: [] };
+      }
+
+      const emails = (data ?? []).map((r: Record<string, unknown>) => ({
+        id: r.id,
+        offerId: r.offer_id ?? null,
+        userId: r.user_id ?? null,
+        from: r.from_email ?? r.from_addr ?? "",
+        to: r.to_email ?? r.to_addr ?? "",
+        subject: r.subject ?? "",
+        status: String(r.status ?? "").toLowerCase(),
+        sentAt: r.sent_at ?? null,
+        createdAt: r.created_at ?? null,
+        errorMessage: r.error_message ?? r.error ?? null,
+      }));
       return { ok: true, emails };
     } catch (e) {
       logger.error("[crm] getEmailHistoryForOffer failed", e);
@@ -2875,19 +2840,32 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:getPdfsForOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
-      const db = getDb();
-      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
-      const hasOfferId = (db.prepare("PRAGMA table_info(pdfs)").all() as Array<{ name: string }>).some((c) => c.name === "offer_id");
-      if (!hasOfferId) return { ok: true, pdfs: [] };
-      const pdfRows = db.prepare(
-        "SELECT id, file_name, file_path, status, created_at FROM pdfs WHERE offer_id = ? ORDER BY created_at DESC"
-      ).all(offerId) as Array<{ id: string; file_name: string; file_path: string; status: string; created_at: string }>;
-      const pdfs = pdfRows.map((r) => ({
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", pdfs: [] };
+      const supabase = getSupabase();
+
+      const { data: offerRow } = await supabase.from("offers").select("id,user_id").eq("id", offerId).maybeSingle();
+      const ownerOk = (offerRow as { user_id?: string } | null)?.user_id === user.id;
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
+      if (!ownerOk && !seeAll) return { ok: false, error: "Oferta nie znaleziona", pdfs: [] };
+
+      const { data, error } = await supabase
+        .from("pdf_history")
+        .select("*")
+        .eq("offer_id", offerId)
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      if (error) {
+        logger.error("[supabase][pdf_history] getPdfsForOffer failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", pdfs: [] };
+      }
+
+      const pdfs = (data ?? []).map((r: Record<string, unknown>) => ({
         id: r.id,
-        fileName: r.file_name,
-        filePath: r.file_path,
-        status: r.status,
-        createdAt: r.created_at,
+        fileName: r.file_name ?? r.filename ?? "",
+        filePath: r.file_path ?? r.path ?? "",
+        status: r.status ?? "",
+        createdAt: r.created_at ?? "",
       }));
       return { ok: true, pdfs };
     } catch (e) {
@@ -3219,32 +3197,37 @@ export async function registerIpcHandlers(deps: {
   ipcMain.handle("planlux:loadOfferForEdit", async (_, offerId: string) => {
     try {
       const user = requireAuth();
-      const db = getDb();
-      if (!canAccessOffer(db, offerId, user.id)) return { ok: false, error: "Oferta nie znaleziona", draft: null };
-      const row = db.prepare("SELECT * FROM offers_crm WHERE id = ?").get(offerId) as Record<string, unknown> | undefined;
-      if (!row) return { ok: false, error: "Oferta nie znaleziona", draft: null };
-      const clientName = [row.client_first_name, row.client_last_name].filter(Boolean).join(" ") || (row.company_name as string) || "";
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", draft: null };
+      const supabase = getSupabase();
+      const { data: row, error } = await supabase.from("offers").select("*").eq("id", offerId).maybeSingle();
+      if (error || !row) return { ok: false, error: "Oferta nie znaleziona", draft: null };
+      const ownerOk = (row as { user_id?: string }).user_id === user.id;
+      const seeAll = user.role === "ADMIN" || user.role === "SZEF";
+      if (!ownerOk && !seeAll) return { ok: false, error: "Oferta nie znaleziona", draft: null };
+
+      const clientName = String((row as Record<string, unknown>).client_name ?? "");
       const addons = (() => {
         try {
-          const arr = JSON.parse((row.addons_snapshot as string) || "[]") as Array<{ nazwa?: string; name?: string; ilosc?: number; quantity?: number }>;
+          const raw = (row as Record<string, unknown>).addons_snapshot ?? "[]";
+          const arr = typeof raw === "string" ? (JSON.parse(raw) as Array<{ nazwa?: string; name?: string; ilosc?: number; quantity?: number }>) : [];
           return arr.map((a) => ({ nazwa: a.nazwa ?? a.name ?? "", ilosc: a.ilosc ?? a.quantity ?? 1 }));
         } catch {
           return [];
         }
       })();
       const draft = {
-        draftId: row.id,
-        variantHali: row.variant_hali ?? "T18_T35_DACH",
-        widthM: String(row.width_m ?? ""),
-        lengthM: String(row.length_m ?? ""),
-        heightM: row.height_m != null ? String(row.height_m) : "",
+        draftId: (row as Record<string, unknown>).id,
+        variantHali: (row as Record<string, unknown>).variant ?? "T18_T35_DACH",
+        widthM: String((row as Record<string, unknown>).width_m ?? ""),
+        lengthM: String((row as Record<string, unknown>).length_m ?? ""),
+        heightM: (row as Record<string, unknown>).height_m != null ? String((row as Record<string, unknown>).height_m) : "",
         clientName: clientName || (row.company_name as string) || "",
-        clientNip: row.nip ?? "",
-        clientEmail: row.email ?? "",
-        clientPhone: row.phone ?? "",
+        clientNip: (row as Record<string, unknown>).nip ?? "",
+        clientEmail: (row as Record<string, unknown>).client_email ?? "",
+        clientPhone: (row as Record<string, unknown>).client_phone ?? "",
         addons,
         pdfOverrides: {},
-        offerNumber: row.offer_number ?? "",
+        offerNumber: (row as Record<string, unknown>).offer_number ?? "",
         offerNumberLocked: true,
         updatedAt: new Date().toISOString(),
         lastPreviewAt: null,
@@ -3316,14 +3299,15 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getPdfs", async () => {
     try {
-      const user = requireRole(["ADMIN", "SZEF"]);
-      const db = getDb();
-      const rows = db.prepare(
-        `SELECT p.id, p.user_id, p.offer_id, p.client_name, p.variant_hali, p.file_name, p.file_path, p.status, p.created_at,
-          u.display_name as user_display_name
-         FROM pdfs p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT 100`
-      ).all();
-      return { ok: true, data: rows };
+      requireRole(["ADMIN", "SZEF"]);
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
+      const supabase = getSupabase();
+      const { data, error } = await supabase.from("pdf_history").select("*").order("created_at", { ascending: false }).limit(200);
+      if (error) {
+        logger.error("[supabase][pdf_history] getPdfs failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
+      }
+      return { ok: true, data: data ?? [] };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
@@ -3335,21 +3319,15 @@ export async function registerIpcHandlers(deps: {
 
   ipcMain.handle("planlux:getEmails", async () => {
     try {
-      const user = requireRole(["ADMIN", "SZEF"]);
-      const db = getDb();
-      const hasEmailHistory = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='email_history'").all() as Array<{ name: string }>).length > 0;
-      if (hasEmailHistory) {
-        const rows = db.prepare(
-          `SELECT eh.id, eh.offer_id, eh.user_id, eh.from_email, eh.to_email, eh.subject, eh.sent_at, eh.status, eh.error_message, eh.created_at,
-            u.display_name as user_display_name
-           FROM email_history eh
-           LEFT JOIN users u ON eh.user_id = u.id
-           ORDER BY eh.created_at DESC LIMIT 100`
-        ).all();
-        return { ok: true, data: rows };
+      requireRole(["ADMIN", "SZEF"]);
+      if (!getSupabase) return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
+      const supabase = getSupabase();
+      const { data, error } = await supabase.from("email_history").select("*").order("created_at", { ascending: false }).limit(200);
+      if (error) {
+        logger.error("[supabase][email_history] getEmails failed", { message: error.message });
+        return { ok: false, error: "Brak połączenia z serwerem. Aplikacja wymaga internetu.", data: [] };
       }
-      const rows = db.prepare("SELECT * FROM emails ORDER BY created_at DESC LIMIT 100").all();
-      return { ok: true, data: rows };
+      return { ok: true, data: data ?? [] };
     } catch (e) {
       if (e instanceof Error && (e.message === "Unauthorized" || e.message === "Forbidden")) {
         return { ok: false, error: e.message };
@@ -4582,6 +4560,64 @@ console.log("[IPC] handler registered: planlux:checkInternet");
   /** App version (Electron app.getVersion()). */
   ipcMain.handle("planlux:app:getVersion", async () => {
     return { ok: true, version: app.getVersion() };
+  });
+
+  /** Diagnostics: write a line to planlux.log from renderer. */
+  ipcMain.handle("planlux:logToFile", (_, payload: { level?: string; message: string; data?: unknown }) => {
+    const { writeLogLine } = require("./logger");
+    const level = (payload?.level === "warn" || payload?.level === "error" || payload?.level === "debug" ? payload.level : "info") as "info" | "warn" | "error" | "debug";
+    writeLogLine(level, payload?.message ?? "", payload?.data);
+    return { ok: true };
+  });
+
+  /** Diagnostics panel: app version, user role, db path, pricing stats, last sync, seed DB path. */
+  ipcMain.handle("planlux:getDiagnosticsPanelData", async () => {
+    try {
+      const { getCachedBase } = await import("../src/infra/db");
+      const { getConfigSyncStatus } = await import("../src/services/configSync");
+      const { getLogPath } = await import("./logger");
+      const { getSeedDbPath } = await import("../src/infra/seedDb");
+      const db = getDb();
+      const base = getCachedBase(db);
+      const cennik = base?.cennik ?? [];
+      const variantIds = [...new Set(cennik.map((r) => String((r as { wariant_hali?: string }).wariant_hali ?? "").trim()).filter(Boolean))];
+      const syncStatus = getConfigSyncStatus();
+      const user = getSession();
+      const seedPath = getDbPath ? getSeedDbPath({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath ?? "", appPath: app.getAppPath(), dirname: __dirname }) : null;
+      return {
+        ok: true,
+        appVersion: app.getVersion(),
+        userRole: user?.role ?? "—",
+        dbPath: getDbPath?.() ?? "—",
+        pricingEntries: cennik.length,
+        uniqueVariants: variantIds.length,
+        lastSyncStatus: typeof syncStatus?.status === "string" ? syncStatus.status : "—",
+        seedDbUsed: seedPath ?? "—",
+        logPath: getLogPath() ?? "—",
+      };
+    } catch (e) {
+      logger.error("getDiagnosticsPanelData failed", e);
+      return { ok: false, error: String(e) };
+    }
+  });
+
+  /** Open userData folder (where planlux.log lives) for export logs. */
+  ipcMain.handle("planlux:openLogsFolder", async () => {
+    try {
+      const userData = app.getPath("userData");
+      await shell.openPath(userData);
+      return { ok: true, path: userData };
+    } catch (e) {
+      const ser = serializeError(e);
+      logger.warn("[diagnostics] openLogsFolder failed", { message: ser.message });
+      return { ok: false, error: ser.message };
+    }
+  });
+
+  /** Return path to planlux.log for display in diagnostics panel. */
+  ipcMain.handle("planlux:getLogPath", async () => {
+    const { getLogPath } = await import("./logger");
+    return { ok: true, path: getLogPath() ?? "" };
   });
 
   /** Open URL in default external browser. */

@@ -64,7 +64,7 @@ const defaultVariants: Array<{ id: string; name: string }> = [
   { id: "T22_T35_POL", name: "Hala T22 + T35 pełna" },
 ];
 
-/** Jedno źródło prawdy: cennik → lista wariantów do UI. Odrzuca rekordy bez wariant_hali, deduplikuje, mapuje na { id, name }. */
+/** Jedno źródło prawdy: pricingData → lista wariantów do UI. Klucz systemowy = `variant`. */
 function normalizeVariantsFromPricing(pricingData: {
   cennik?: unknown[];
   dodatki?: unknown[];
@@ -73,12 +73,12 @@ function normalizeVariantsFromPricing(pricingData: {
   if (!pricingData?.cennik || !Array.isArray(pricingData.cennik) || pricingData.cennik.length === 0) {
     return { variants: defaultVariants, source: "defaultVariants" };
   }
-  const rows = pricingData.cennik as Array<{ wariant_hali?: string; variant?: string; Nazwa?: string; name?: string }>;
+  const rows = pricingData.cennik as Array<{ variant?: string; name?: string; hall_name?: string; Nazwa?: string; wariant_hali?: string }>;
   const byId = new Map<string, { id: string; name: string }>();
   for (const r of rows) {
-    const id = String(r?.wariant_hali ?? r?.variant ?? "").trim();
+    const id = String(r?.variant ?? r?.wariant_hali ?? "").trim();
     if (!id) continue;
-    if (!byId.has(id)) byId.set(id, { id, name: String(r?.Nazwa ?? r?.name ?? id) });
+    if (!byId.has(id)) byId.set(id, { id, name: String(r?.name ?? r?.hall_name ?? r?.Nazwa ?? id) });
   }
   const variants = [...byId.values()];
   if (variants.length === 0) return { variants: defaultVariants, source: "defaultVariants" };
@@ -226,6 +226,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       fallbackReason?: "AREA_ABOVE_MAX" | "AREA_BELOW_MIN" | "AREA_GAP";
       fallbackInfo?: { area_min_m2: number; area_max_m2: number };
     };
+    additions?: unknown[];
+    standardInPrice?: unknown[];
+    automaticSurcharges?: Array<{ name: string; condition: string; areaM2: number; ratePerM2: number; total: number }>;
   } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -266,28 +269,40 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     if (newNum) showToast(`Numer zsynchronizowany: ${newNum}`);
   }, [showToast]);
 
+  // Supabase-only: no silent local retry loop for empty pricing.
   const pricingLoadRetryDoneRef = useRef(false);
   const loadPricing = useCallback(async (isRetry = false) => {
     const r = ((await api("planlux:getPricingCache")) ?? {}) as {
       ok?: boolean;
-      data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
-      pricingData?: { cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
-      reason?: string;
+      error?: string;
+      data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] } | null;
+      pricingData?: { cennik: unknown[]; dodatki: unknown[]; standard: unknown[] } | null;
       source?: string;
     };
+    if (!r.ok) {
+      setPricingData(null);
+      showToast(r.error ?? "Brak połączenia z serwerem. Aplikacja wymaga internetu.");
+      return;
+    }
     const raw = r.data ?? r.pricingData;
     const data = raw && Array.isArray(raw.cennik) ? raw : EMPTY_PRICING_DATA;
     setPricingData(data);
+    const count = Array.isArray(data.cennik) ? data.cennik.length : 0;
+    const { variants: v, source } = normalizeVariantsFromPricing(data);
+    try {
+      api("planlux:logToFile", {
+        level: "info",
+        message: "[variants][renderer] pricingDataReceived",
+        data: { pricingDataReceived: true, cennikCount: count, variantsCount: v.length, source: (r as { source?: string }).source ?? source, isRetry },
+      }).catch(() => {});
+    } catch {
+      // ignore
+    }
     if (import.meta.env?.DEV && typeof window !== "undefined") {
-      const count = Array.isArray(data.cennik) ? data.cennik.length : 0;
-      const { variants: v, source } = normalizeVariantsFromPricing(data);
       console.info("[variants][renderer] loadPricing", { pricingDataLoaded: true, cennikCount: count, variantsCount: v.length, source: (r as { source?: string }).source ?? source, isRetry });
     }
-    if (!isRetry && Array.isArray(data.cennik) && data.cennik.length === 0 && !pricingLoadRetryDoneRef.current) {
-      pricingLoadRetryDoneRef.current = true;
-      setTimeout(() => loadPricing(true), 500);
-    }
-  }, [api]);
+    // Supabase-only: no silent retries that mask offline. UI gets a clear error from IPC.
+  }, [api, showToast]);
 
   useEffect(() => {
     loadPricing();
@@ -328,34 +343,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }
   }, [online, draft.offerNumber, runSyncOfferNumber]);
 
+  // Supabase-only pricing: no base:sync (no offline mode, no local cache as source of truth).
   const pricingMissingToastShownRef = useRef(false);
-  useEffect(() => {
-    const autoSync = async () => {
-      setSyncing(true);
-      setSyncError(null);
-      try {
-        const r = (await api("base:sync")) as {
-          ok: boolean;
-          status: "synced" | "offline" | "unchanged" | "error";
-          version?: number;
-          lastUpdated?: string;
-          data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
-          error?: string;
-        };
-        setSyncStatus(r.status ?? null);
-        const data = r.data && Array.isArray(r.data.cennik) ? r.data : EMPTY_PRICING_DATA;
-        setPricingData(data);
-        if (!r.ok && r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
-      } catch (e) {
-        setSyncStatus("error");
-        setSyncError(e instanceof Error ? e.message : "Błąd synchronizacji");
-        setPricingData(EMPTY_PRICING_DATA);
-      } finally {
-        setSyncing(false);
-      }
-    };
-    autoSync();
-  }, [api]);
 
   useEffect(() => {
     if (!syncing && pricingData == null && !pricingMissingToastShownRef.current) {
@@ -368,25 +357,12 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     setSyncing(true);
     setSyncError(null);
     try {
-      const r = (await api("base:sync")) as {
-        ok: boolean;
-        status: "synced" | "offline" | "unchanged" | "error";
-        version?: number;
-        lastUpdated?: string;
-        data?: { version?: number; lastUpdated?: string; cennik: unknown[]; dodatki: unknown[]; standard: unknown[] };
-        error?: string;
-      };
-      setSyncStatus(r.status ?? null);
-      const data = r.data && Array.isArray(r.data.cennik) ? r.data : EMPTY_PRICING_DATA;
-      setPricingData(data);
-      if (!r.ok && r.status === "error") setSyncError(r.error ?? "Błąd synchronizacji");
-      if (r.status === "synced") showToast("Baza zaktualizowana");
-      else if (r.status === "unchanged") showToast("Baza aktualna");
-      else if (r.status === "offline") showToast("Offline – używam lokalnej bazy");
-      else if (r.status === "error") showToast(r.error ?? "Błąd synchronizacji");
+      await loadPricing(false);
+      setSyncStatus("synced");
+      showToast("Cennik pobrany z serwera");
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
       setSyncStatus("error");
-      const msg = e instanceof Error ? e.message : "Błąd sync";
       setSyncError(msg);
       showToast(msg);
     } finally {
@@ -412,25 +388,59 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     if (typeof window === "undefined") return;
     const cennikCount = Array.isArray(pricingData?.cennik) ? pricingData.cennik.length : 0;
     const inList = variants.some((v) => v.id === draft.variantHali);
-    console.info("[variants][renderer] state", {
-      pricingDataReceived: pricingData != null,
-      cennikCount,
-      variantsCount: variants.length,
-      selectedVariant: draft.variantHali,
-      selectedVariantInList: inList,
-      source: variantsSource,
-    });
-  }, [pricingData, variants.length, draft.variantHali, variantsSource]);
+    try {
+      api("planlux:logToFile", {
+        level: "info",
+        message: "[variants][renderer] state",
+        data: {
+          pricingDataReceived: pricingData != null,
+          cennikCount,
+          variantsCount: variants.length,
+          selectedVariant: draft.variantHali,
+          selectedVariantInList: inList,
+          source: variantsSource,
+        },
+      }).catch(() => {});
+    } catch {
+      // ignore
+    }
+    if (import.meta.env?.DEV) {
+      console.info("[variants][renderer] state", {
+        pricingDataReceived: pricingData != null,
+        cennikCount,
+        variantsCount: variants.length,
+        selectedVariant: draft.variantHali,
+        selectedVariantInList: inList,
+        source: variantsSource,
+      });
+    }
+  }, [api, pricingData, variants.length, draft.variantHali, variantsSource]);
 
   const standardOptions =
-    (pricingData?.standard as Array<{ wariant_hali: string; element: string; uwagi?: string }> | undefined)
-      ?.filter((s) => s?.wariant_hali === variantHali)
+    (pricingData?.standard as Array<{ variant?: string; wariant_hali?: string; element: string; uwagi?: string }> | undefined)
+      ?.filter((s) => String(s?.variant ?? s?.wariant_hali ?? "").trim() === String(variantHali ?? "").trim())
       .map((s) => ({ name: String(s.element), description: String(s.uwagi ?? "") }))
       .filter((s) => s.name.trim() !== "") ?? [];
 
   const rawAddonsForVariant =
-    (pricingData?.dodatki as Array<{ wariant_hali: string; nazwa: string; stawka?: number | string; jednostka?: string }> | undefined)
-      ?.filter((d) => d?.wariant_hali === variantHali) ?? [];
+    (pricingData?.dodatki as Array<{ variant?: string; wariant_hali?: string; nazwa: string; stawka?: number | string; jednostka?: string }> | undefined)
+      ?.filter((d) => String(d?.variant ?? d?.wariant_hali ?? "").trim() === String(variantHali ?? "").trim()) ?? [];
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const selectedVariant = String(variantHali ?? "").trim();
+    const matchingAddonsCount = rawAddonsForVariant.length;
+    const matchingStandardCount = standardOptions.length;
+    try {
+      api("planlux:logToFile", {
+        level: "info",
+        message: "[variants][renderer] match addons/standard",
+        data: { selectedVariant, matchingAddonsCount, matchingStandardCount },
+      }).catch(() => {});
+    } catch {
+      // ignore
+    }
+  }, [api, variantHali, rawAddonsForVariant.length, standardOptions.length]);
 
   const sectionalGateRow = rawAddonsForVariant.find((d) =>
     /dodatkowa\s*brama\s*segmentowa|bramy\s*segmentowe|brama\s*segmentowa/i.test(String(d.nazwa ?? ""))
@@ -531,19 +541,23 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
         lineTotal: gutterTotalPrice,
       });
     }
+    const hasAutomaticSurcharges = (result?.automaticSurcharges?.length ?? 0) > 0;
     for (const a of result?.additions ?? []) {
       const nazwa = String((a as { nazwa?: string }).nazwa ?? "");
       if (/dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(nazwa)) {
-        const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
-        const qty = line.ilosc ?? 0;
-        const total = line.total ?? 0;
-        list.push({
-          label: "Dopłata za wysokość",
-          quantity: qty,
-          unit: "mkw",
-          price: line.stawka ?? 0,
-          lineTotal: total,
-        });
+        if (!hasAutomaticSurcharges) {
+          const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
+          const qty = line.ilosc ?? 0;
+          const total = line.total ?? 0;
+          list.push({
+            label: "Dopłata za wysokość",
+            quantity: qty,
+            unit: "mkw",
+            price: line.stawka ?? 0,
+            lineTotal: total,
+          });
+        }
+        continue;
       }
       if (/dopłata\s*do\s*płyty\s*80|doplata\s*do\s*plyty\s*80/i.test(nazwa)) {
         const line = a as { nazwa?: string; ilosc?: number; jednostka?: string; stawka?: number; total?: number };
@@ -569,18 +583,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     return list;
   })();
 
-  /** Dopłata za wysokość – do wyświetlenia w sekcji „Dodatki specjalne” tylko dla T18_T35_DACH gdy aktywna */
+  /** Dopłata za wysokość – do wyświetlenia w sekcji „Dodatki specjalne” (z result.additions lub result.automaticSurcharges) */
   const heightSurchargeDisplay =
-    variantHali === "T18_T35_DACH"
-      ? (() => {
-          const line = (result?.additions ?? []).find((a) =>
-            /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(String((a as { nazwa?: string }).nazwa ?? ""))
-          ) as { nazwa?: string; total?: number } | undefined;
-          return line != null && line.total != null && line.total > 0
-            ? { label: "Dopłata za wysokość", amount: line.total }
-            : null;
-        })()
-      : null;
+    (() => {
+      const auto = result?.automaticSurcharges?.find((s) => /wysokość|wysokosc/i.test(s.name));
+      if (auto && auto.total > 0) return { label: auto.name, amount: auto.total };
+      const line = (result?.additions ?? []).find((a) =>
+        /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(String((a as { nazwa?: string }).nazwa ?? ""))
+      ) as { nazwa?: string; total?: number } | undefined;
+      return line != null && line.total != null && line.total > 0 ? { label: "Dopłata za wysokość", amount: line.total } : null;
+    })();
 
   /** Po zmianie wariantu: zostaw tylko dodatki/standardy dostępne dla tego wariantu; wyczyść bramy jeśli wariant nie ma bramy segmentowej. */
   useEffect(() => {
@@ -1414,6 +1426,19 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                   {(result.totalAdditions ?? 0) > 0 && (
                     <div>Dodatki: {new Intl.NumberFormat("pl-PL").format(result.totalAdditions)} zł</div>
                   )}
+                </div>
+              )}
+              {result.automaticSurcharges && result.automaticSurcharges.length > 0 && (
+                <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 12 }}>
+                  <div style={{ fontWeight: tokens.font.weight.medium, marginBottom: 4 }}>Automatyczne dopłaty:</div>
+                  <ul style={{ margin: 0, paddingLeft: 20 }}>
+                    {result.automaticSurcharges.map((s, i) => (
+                      <li key={i} style={{ marginBottom: 4 }}>
+                        {s.name}
+                        {s.condition ? ` (${s.condition})` : ""}: {new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(s.areaM2)} m² × {new Intl.NumberFormat("pl-PL").format(s.ratePerM2)} zł = {new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(s.total)} zł
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
               <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>

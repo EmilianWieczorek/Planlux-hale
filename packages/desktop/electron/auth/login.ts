@@ -1,6 +1,6 @@
 /**
- * Online-first login with offline fallback. Uses net/online, auth/password, auth/session.
- * Returns normalized { ok, data?, error?: { code, message } } and keeps legacy { user, mustChangePassword } for UI.
+ * Supabase-only login (online required).
+ * No offline mode. Local SQLite is NOT a source of truth for auth; at most it's a technical store for FK integrity.
  */
 
 import { normalizeRoleRbac } from "@planlux/shared";
@@ -16,6 +16,7 @@ export const AUTH_BACKEND_ERROR = "AUTH_BACKEND_ERROR";
 export const AUTH_UNKNOWN_ERROR = "AUTH_UNKNOWN_ERROR";
 export const AUTH_SESSION_EXPIRED = "AUTH_SESSION_EXPIRED";
 export const AUTH_USER_NOT_IN_SUPABASE_AUTH = "AUTH_USER_NOT_IN_SUPABASE_AUTH";
+export const AUTH_ONLINE_REQUIRED = "AUTH_ONLINE_REQUIRED";
 
 export type LoginSuccess = {
   ok: true;
@@ -134,132 +135,50 @@ export async function performLogin(
   const emailNorm = email.trim().toLowerCase();
   const db = deps.getDb();
 
+  // Hard requirement: Supabase-only login (no backendLogin, no offline fallback).
+  if (!deps.supabaseLogin) {
+    return { ok: false, code: AUTH_BACKEND_ERROR, message: "Supabase login is not configured" };
+  }
+
+  // Best-effort connectivity check (for clearer error).
   const state = await getOnlineState({
     timeoutMs: deps.onlineTimeoutMs ?? 2000,
     backendUrl: deps.backendUrl,
   });
-
-  const tryOffline = (): LoginResult => {
-    const row = db.prepare("SELECT * FROM users WHERE email = ? AND active = 1").get(emailNorm) as UserRow | undefined;
-    if (!row) return { ok: false, code: AUTH_OFFLINE_USER_NOT_FOUND, message: "Zaloguj się przy połączeniu z internetem (brak danych offline)." };
-    if (row.password_unavailable === 1) {
-      return { ok: false, code: AUTH_OFFLINE_REQUIRES_ONLINE_LOGIN_ONCE, message: "Zaloguj się raz online, aby aktywować tryb offline." };
-    }
-    if (!verifyPassword(password, row)) return { ok: false, code: AUTH_INVALID_CREDENTIALS, message: "Nieprawidłowy email lub hasło" };
-    if (isLegacyHash(row)) {
-      const upgraded = hashPassword(password);
-      const hasPua = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).some((c) => c.name === "password_unavailable");
-      db.prepare("UPDATE users SET password_hash = ?, password_salt = ?, password_algo_version = ? WHERE id = ?").run(upgraded.hash, upgraded.salt, upgraded.version, row.id);
-    }
-    const role = normalizeRoleRbac(row.role);
-    if (process.env.LOG_LEVEL === "debug" || process.env.NODE_ENV !== "production") {
-      console.log("[auth] role from local DB (offline fallback)", { email: emailNorm, rowRole: row.role, effectiveRole: role });
-    }
-    const user: SessionUser = {
-      id: row.id,
-      email: row.email,
-      role,
-      displayName: row.display_name ?? null,
-    };
-    return {
-      ok: true,
-      user,
-      mustChangePassword: row.must_change_password === 1,
-    };
-  };
-
-  if (state === "online") {
-    try {
-      const loginResult = deps.supabaseLogin
-        ? await deps.supabaseLogin(emailNorm, password)
-        : await deps.backendLogin(deps.backendUrl, emailNorm, password);
-      if (loginResult.ok && loginResult.user) {
-        const backendUser = loginResult.user;
-        const role = normalizeRoleRbac(backendUser.role ?? "HANDLOWIEC");
-        if (process.env.LOG_LEVEL === "debug" || process.env.NODE_ENV !== "production") {
-          console.log("[auth] role from backend (online)", { email: emailNorm, backendRole: backendUser.role, effectiveRole: role });
-        }
-        const displayName = (backendUser.name ?? "").trim() || null;
-        const hashed = hashPassword(password);
-        const now = new Date().toISOString();
-        const backendUserId = (backendUser as { id?: string }).id;
-        const userId = backendUserId ?? deps.uuid();
-        ensureLocalUserExists(db, {
-          id: userId,
-          email: emailNorm,
-          display_name: displayName,
-          role,
-          password_hash: hashed.hash,
-          created_at: now,
-        });
-        if (process.env.LOG_LEVEL === "debug") {
-          console.log("[login] ensured local user", { id: userId, email: emailNorm, role });
-        }
-        const colNames = (db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
-        const hasLastSynced = colNames.includes("last_synced_at");
-        const hasPasswordUnavail = colNames.includes("password_unavailable");
-        const roleDb = roleForDb(db, role);
-        const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm) as { id: string } | undefined;
-        const userIdFinal = existing?.id ?? userId;
-        if (existing) {
-          if (hasPasswordUnavail) {
-            if (hasLastSynced) {
-              db.prepare(
-                "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, password_unavailable = 0, last_online_login_at = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
-              ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, now, emailNorm);
-            } else {
-              db.prepare(
-                "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, password_unavailable = 0, last_online_login_at = ?, updated_at = ? WHERE email = ?"
-              ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
-            }
-          } else if (hasLastSynced) {
-            db.prepare(
-              "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, updated_at = ?, last_synced_at = ? WHERE email = ?"
-            ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, now, emailNorm);
-          } else {
-            db.prepare(
-              "UPDATE users SET role = ?, display_name = ?, active = 1, password_hash = ?, password_salt = ?, password_algo_version = ?, updated_at = ? WHERE email = ?"
-            ).run(roleDb, displayName, hashed.hash, hashed.salt, hashed.version, now, emailNorm);
-          }
-        } else {
-          if (hasPasswordUnavail) {
-            const vals = hasLastSynced
-              ? "?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?, ?, ?"
-              : "?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?, ?";
-            const insertSql =
-              "INSERT INTO users (id, email, password_hash, password_salt, password_algo_version, password_unavailable, last_online_login_at, role, display_name, active, created_at, updated_at" +
-              (hasLastSynced ? ", last_synced_at) VALUES (" + vals + ")" : ") VALUES (" + vals + ")");
-            if (hasLastSynced) {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, roleDb, displayName, now, now, now);
-            } else {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, hashed.salt, hashed.version, now, roleDb, displayName, now, now);
-            }
-          } else {
-            const vals = hasLastSynced ? "?, ?, ?, ?, ?, 1, ?, ?, ?" : "?, ?, ?, ?, ?, 1, ?, ?";
-            const insertSql =
-              "INSERT INTO users (id, email, password_hash, role, display_name, active, created_at, updated_at" +
-              (hasLastSynced ? ", last_synced_at) VALUES (" + vals + ")" : ") VALUES (" + vals + ")");
-            if (hasLastSynced) {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, roleDb, displayName, now, now, now);
-            } else {
-              db.prepare(insertSql).run(userId, emailNorm, hashed.hash, roleDb, displayName, now, now);
-            }
-          }
-        }
-        const user: SessionUser = { id: userIdFinal, email: emailNorm, role, displayName };
-        const row = db.prepare("SELECT must_change_password FROM users WHERE id = ?").get(userIdFinal) as { must_change_password?: number };
-        return { ok: true, user, mustChangePassword: row?.must_change_password === 1 };
-      }
-      const backendError = (loginResult as { error?: string }).error ?? "Nieprawidłowy email lub hasło";
-      return { ok: false, code: AUTH_INVALID_CREDENTIALS, message: backendError };
-    } catch (err) {
-      if (err instanceof AppError) return { ok: false, code: err.code, message: err.message };
-      if (isNetworkError(err)) return tryOffline();
-      return { ok: false, code: AUTH_BACKEND_ERROR, message: err instanceof Error ? err.message : String(err) };
-    }
+  if (state !== "online") {
+    return { ok: false, code: AUTH_ONLINE_REQUIRED, message: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
   }
 
-  if (state === "offline" || state === "unknown") return tryOffline();
+  try {
+    const loginResult = await deps.supabaseLogin(emailNorm, password);
+    if (!loginResult.ok || !loginResult.user) {
+      const errMsg = ("error" in loginResult && loginResult.error ? loginResult.error : undefined) ?? "Nieprawidłowy email lub hasło";
+      return { ok: false, code: AUTH_INVALID_CREDENTIALS, message: errMsg };
+    }
 
-  return tryOffline();
+    const u = loginResult.user;
+    const role = normalizeRoleRbac(u.role ?? "HANDLOWIEC");
+    const displayName = (u.name ?? "").trim() || null;
+
+    // Technical: keep local FK integrity (pdfs/offers tables reference users). Not used for auth decisions.
+    const hashed = hashPassword(password);
+    const now = new Date().toISOString();
+    ensureLocalUserExists(db, {
+      id: u.id,
+      email: emailNorm,
+      display_name: displayName,
+      role,
+      password_hash: hashed.hash,
+      created_at: now,
+    });
+
+    const user: SessionUser = { id: u.id, email: emailNorm, role, displayName };
+    return { ok: true, user, mustChangePassword: false };
+  } catch (err) {
+    if (err instanceof AppError) return { ok: false, code: err.code, message: err.message };
+    if (isNetworkError(err)) {
+      return { ok: false, code: AUTH_ONLINE_REQUIRED, message: "Brak połączenia z serwerem. Aplikacja wymaga internetu." };
+    }
+    return { ok: false, code: AUTH_UNKNOWN_ERROR, message: err instanceof Error ? err.message : String(err) };
+  }
 }

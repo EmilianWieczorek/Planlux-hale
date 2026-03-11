@@ -1,5 +1,5 @@
 /**
- * Logger: levels, file output (userData/logs/app.log), rotation, redaction.
+ * Logger: levels, file output (userData/planlux.log), rotation to planlux.old.log, redaction.
  * No secrets in logs. Use after app.getPath('userData') is available.
  */
 
@@ -10,46 +10,61 @@ import { redact } from "./redact";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
-const MAX_FILE_BYTES = 5 * 1024 * 1024;
-const MAX_BACKUPS = 3;
-const LOG_DIR = "logs";
-const LOG_FILE = "app.log";
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5MB
+const LOG_FILE = "planlux.log";
+const LOG_FILE_OLD = "planlux.old.log";
 
-let logDir: string | null = null;
+let logPath: string | null = null;
 let fileStream: fs.WriteStream | null = null;
 let minLevel: LogLevel = "info";
 
 export function initLogger(userDataPath: string, opts?: { level?: LogLevel }): void {
   try {
-    logDir = path.join(userDataPath, LOG_DIR);
-    fs.mkdirSync(logDir, { recursive: true });
+    logPath = path.join(userDataPath, LOG_FILE);
     minLevel =
       opts?.level ??
       (process.env.LOG_LEVEL as LogLevel) ??
       (process.env.PLANLUX_LOG_LEVEL as LogLevel) ??
       (process.env.NODE_ENV === "production" ? "warn" : "info");
-  } catch (e) {
-    logDir = null;
+  } catch {
+    logPath = null;
   }
+}
+
+/** Returns current log file path for diagnostics/export. */
+export function getLogPath(): string | null {
+  return logPath;
 }
 
 function shouldLog(level: LogLevel): boolean {
   return LEVEL_ORDER[level] >= LEVEL_ORDER[minLevel];
 }
 
-function getStream(): fs.WriteStream | null {
-  if (!logDir) return null;
-  if (fileStream) return fileStream;
+function ensureRotate(): void {
+  if (!logPath) return;
   try {
-    const logPath = path.join(logDir, LOG_FILE);
-    const stat = fs.existsSync(logPath) ? fs.statSync(logPath) : null;
-    if (stat && stat.size >= MAX_FILE_BYTES) {
-      for (let i = MAX_BACKUPS - 1; i >= 1; i--) {
-        const from = path.join(logDir, i === 1 ? LOG_FILE : `${LOG_FILE}.${i - 1}`);
-        const to = path.join(logDir, `${LOG_FILE}.${i}`);
-        if (fs.existsSync(from)) fs.renameSync(from, to);
+    if (fs.existsSync(logPath)) {
+      const stat = fs.statSync(logPath);
+      if (stat.size >= MAX_FILE_BYTES) {
+        const oldPath = path.join(path.dirname(logPath), LOG_FILE_OLD);
+        if (fileStream) {
+          fileStream.end();
+          fileStream = null;
+        }
+        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+        fs.renameSync(logPath, oldPath);
       }
     }
+  } catch {
+    // ignore
+  }
+}
+
+function getStream(): fs.WriteStream | null {
+  if (!logPath) return null;
+  if (fileStream) return fileStream;
+  try {
+    ensureRotate();
     fileStream = fs.createWriteStream(logPath, { flags: "a" });
     return fileStream;
   } catch {
@@ -65,8 +80,19 @@ function format(level: string, scope: string, msg: string, meta?: unknown, corre
   return `${ts} [${level.toUpperCase()}]${scopePart}${cid} ${msg}${metaPart}\n`;
 }
 
+/** Write a line to planlux.log from any process (e.g. renderer via IPC). Level and message only. */
+export function writeLogLine(level: LogLevel, message: string, data?: unknown): void {
+  if (!shouldLog(level)) return;
+  const line = format(level, "", message, data);
+  if (level === "error") console.error(line.trim());
+  else if (level === "warn") console.warn(line.trim());
+  else if (process.env.NODE_ENV !== "production" || process.env.VITE_DEV_SERVER_URL) console.log(line.trim());
+  getStream()?.write(line);
+}
+
 export type LoggerInstance = {
   child(scope: string): LoggerInstance;
+  log(msg: string, meta?: unknown): void;
   debug(msg: string, meta?: unknown): void;
   info(msg: string, meta?: unknown): void;
   warn(msg: string, meta?: unknown): void;
@@ -77,6 +103,12 @@ function create(scope: string): LoggerInstance {
   return {
     child(childScope: string) {
       return create(scope ? `${scope}:${childScope}` : childScope);
+    },
+    log(msg: string, meta?: unknown) {
+      if (!shouldLog("info")) return;
+      const line = format("info", scope, msg, meta);
+      if (process.env.NODE_ENV !== "production" || process.env.VITE_DEV_SERVER_URL) console.log(line.trim());
+      getStream()?.write(line);
     },
     debug(msg: string, meta?: unknown) {
       if (!shouldLog("debug")) return;

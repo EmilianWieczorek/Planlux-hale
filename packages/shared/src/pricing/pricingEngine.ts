@@ -12,6 +12,7 @@ import type {
   AdditionLine,
   StandardLine,
   PricingResult,
+  AutomaticSurchargeItem,
   CennikRowNormalized,
   DodatkiRowNormalized,
   StandardRowNormalized,
@@ -281,8 +282,8 @@ function computeAdvancedAdditions(
     }
   }
 
-  /** Dopłata za wysokość: automatyczna gdy wysokość wpada w zakres. Gdy jednostka mkw/m²: powierzchnia hali × stawka. */
-  if (input.heightM != null && input.areaM2 != null && input.areaM2 > 0) {
+  /** Dopłata za wysokość z cennika: pomijana gdy heightM >= 7 – wtedy stosowana jest automatyczna dopłata 40 zł/m² w calculatePrice (niewidoczna). */
+  if (input.heightM != null && input.areaM2 != null && input.areaM2 > 0 && input.heightM < 7) {
     const doplata = forVariant.find(
       (d) =>
         /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(d.nazwa) &&
@@ -375,17 +376,21 @@ export function calculatePrice(
   const dodatki = normalizeDodatki(data.dodatki);
   const standard = normalizeStandard(data.standard);
 
+  /** Powierzchnia do wyceny ceny bazowej: max 1200 m². Rzeczywista areaM2 pozostaje w formularzu i PDF. */
+  const pricingArea = Math.min(input.areaM2, 1200);
+
   if (process.env.LOG_LEVEL === "debug") {
     const uniqueVariants = new Set(cennik.map((r) => r.wariant_hali).filter(Boolean));
     // eslint-disable-next-line no-console
     console.debug("[pricing] input", {
       variantHali: input.variantHali,
       areaM2: input.areaM2,
+      pricingArea,
       cennikRows: cennik.length,
       groupedVariants: uniqueVariants.size,
     });
   }
-  const base = matchBaseRow(cennik, input.variantHali, input.areaM2);
+  const base = matchBaseRow(cennik, input.variantHali, pricingArea);
 
   if (!base.matched) {
     return {
@@ -413,7 +418,49 @@ export function calculatePrice(
   const totalAdditions =
     additions.reduce((sum, a) => sum + a.total, 0) +
     standardChargeExtra.reduce((sum, s) => sum + (s.total ?? 0), 0);
-  const totalPln = base.totalBase + totalAdditions;
+  let totalPln = base.totalBase + totalAdditions;
+
+  /** Dopłata za wysokość ściany bocznej ≥ 7 m: 40 zł/m² całej powierzchni. Wyświetlana w UI jako automatyczna dopłata. */
+  const sideWallHeightSurcharge =
+    input.heightM != null && input.heightM >= 7 && input.areaM2 != null && input.areaM2 > 0
+      ? Math.round(input.areaM2 * 40)
+      : 0;
+  totalPln += sideWallHeightSurcharge;
+
+  const automaticSurcharges: AutomaticSurchargeItem[] = [];
+  if (sideWallHeightSurcharge > 0) {
+    automaticSurcharges.push({
+      name: "Dopłata za wysokość ściany bocznej",
+      condition: "wysokość ≥ 7 m",
+      areaM2: input.areaM2,
+      ratePerM2: 40,
+      total: sideWallHeightSurcharge,
+    });
+  } else {
+    const heightAddon = additions.find((a) => /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(a.nazwa));
+    if (heightAddon) {
+      const areaM2 = heightAddon.jednostka === "m²" || /mkw|m\s*²/i.test(heightAddon.jednostka) ? heightAddon.ilosc : input.areaM2;
+      automaticSurcharges.push({
+        name: heightAddon.nazwa,
+        condition: (heightAddon.warunek ?? "").trim() || "wysokość w zakresie",
+        areaM2,
+        ratePerM2: heightAddon.stawka,
+        total: heightAddon.total,
+      });
+    }
+  }
+
+  if (process.env.LOG_LEVEL === "debug") {
+    // eslint-disable-next-line no-console
+    console.debug("[pricing] result", {
+      areaM2: input.areaM2,
+      pricingArea,
+      basePrice: base.totalBase,
+      sideWallHeightSurcharge,
+      totalPrice: totalPln,
+      automaticSurchargesCount: automaticSurcharges.length,
+    });
+  }
 
   return {
     success: true,
@@ -422,6 +469,7 @@ export function calculatePrice(
     standardInPrice,
     totalAdditions,
     totalPln,
+    automaticSurcharges: automaticSurcharges.length > 0 ? automaticSurcharges : undefined,
   };
 }
 
@@ -454,7 +502,7 @@ export function runPricingSelfTest(): boolean {
     return false;
   }
 
-  // Area above max -> fallback to largest range
+  // Area above max: pricing area capped at 1200 → normal match in 1001–2000 range, base = 80*1200
   const r2 = calculatePrice(data, {
     variantHali: "V1",
     widthM: 50,
@@ -463,16 +511,12 @@ export function runPricingSelfTest(): boolean {
     selectedAdditions: [],
   });
   if (!r2.success || !r2.base.matched) {
-    console.error("Self-test fail: above max should still succeed with fallback", r2);
+    console.error("Self-test fail: 2500 m² capped to 1200 should succeed", r2);
     return false;
   }
   const base2 = r2.base as BasePriceResult;
-  if (!base2.fallbackUsed || base2.fallbackReason !== "AREA_ABOVE_MAX") {
-    console.error("Self-test fail: expected fallback AREA_ABOVE_MAX", r2);
-    return false;
-  }
-  if (base2.fallbackInfo?.area_max_m2 !== 2000 || base2.cenaPerM2 !== 80) {
-    console.error("Self-test fail: should use 80 zł/m² from 1001–2000 range", r2);
+  if (base2.cenaPerM2 !== 80 || base2.totalBase !== 96000) {
+    console.error("Self-test fail: pricingArea 1200 → 80 zł/m², totalBase 80*1200=96000", r2);
     return false;
   }
 
@@ -552,6 +596,30 @@ export function runPricingSelfTest(): boolean {
   }
   if ((r6.base as BasePriceResult).cenaPerM2 !== 4000 || (r6.base as BasePriceResult).totalBase !== 400_000) {
     console.error("Self-test fail: string cena 4000 * 100 = 400000", r6);
+    return false;
+  }
+
+  // Side wall height surcharge: heightM >= 7 → 40 zł/m², not a visible addon
+  const r7 = calculatePrice(data, {
+    variantHali: "V1",
+    widthM: 25,
+    lengthM: 40,
+    areaM2: 1000,
+    heightM: 7,
+    selectedAdditions: [],
+  });
+  if (!r7.success || !r7.base.matched) {
+    console.error("Self-test fail: height surcharge case should succeed", r7);
+    return false;
+  }
+  const expectedBase = 90 * 1000;
+  const expectedSurcharge = 1000 * 40;
+  if ((r7.base as BasePriceResult).totalBase !== expectedBase || r7.additions.some((a) => /wysokość|wysokosc/i.test(a.nazwa))) {
+    console.error("Self-test fail: base 90*1000, no height addon line", r7);
+    return false;
+  }
+  if (r7.totalPln !== expectedBase + expectedSurcharge) {
+    console.error("Self-test fail: totalPln should be base + 40000 surcharge", { totalPln: r7.totalPln, expected: expectedBase + expectedSurcharge });
     return false;
   }
 

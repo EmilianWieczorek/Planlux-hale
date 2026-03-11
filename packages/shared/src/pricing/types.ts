@@ -94,6 +94,15 @@ export interface StandardLine {
   total?: number;
 }
 
+/** Automatyczna dopłata (np. za wysokość ściany) – do wyświetlenia w sekcji „Automatyczne dopłaty”, nie jako ręczny dodatek. */
+export interface AutomaticSurchargeItem {
+  name: string;
+  condition: string;
+  areaM2: number;
+  ratePerM2: number;
+  total: number;
+}
+
 export interface PricingResult {
   success: boolean;
   base: BasePriceResultType;
@@ -101,6 +110,8 @@ export interface PricingResult {
   standardInPrice: StandardLine[];
   totalAdditions: number;
   totalPln: number;
+  /** Dopłaty automatyczne (np. za wysokość) – do pokazania w UI, nie w liście „Dodatki płatne”. */
+  automaticSurcharges?: AutomaticSurchargeItem[];
   errorMessage?: string;
 }
 

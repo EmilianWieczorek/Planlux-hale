@@ -1,27 +1,32 @@
 /**
- * Seed DB – gotowa baza pricingu dostarczana z aplikacją.
- * Przy pierwszym uruchomieniu lub pustym/uszkodzonym pricingu odtwarzamy dane tylko z tabel pricingowych.
- * Nie nadpisujemy ofert, użytkowników ani sesji.
+ * Seed DB – gotowa baza SQLite dostarczana z aplikacją.
+ * Model: BAD DB → REPLACE WITH FRESH SEED DB (copy whole file).
+ * Nie naprawiamy częściowo – podmieniamy całą bazę na seed.
  */
 
 import path from "path";
 import fs from "fs";
 
 type Db = ReturnType<typeof import("better-sqlite3")>;
-type Logger = { info: (msg: string, meta?: Record<string, unknown>) => void; warn: (msg: string, e?: unknown) => void };
+type Logger = { info: (msg: string, meta?: Record<string, unknown>) => void; warn: (msg: string, e?: unknown) => void; error?: (msg: string, e?: unknown) => void };
 
 const SEED_DB_FILENAME = "planlux_seed.db";
 
+export interface ValidationResult {
+  ok: boolean;
+  reason?: string;
+  details?: Record<string, unknown>;
+}
+
 /**
  * Ścieżka do seed DB w zależności od środowiska.
- * - Packaged: process.resourcesPath/assets/db/planlux_seed.db
- * - Dev (run from dist): __dirname = dist/infra, assets w dist/assets lub packages/desktop/assets
+ * Packaged: process.resourcesPath/assets/db/planlux_seed.db
+ * Dev: appPath/assets/db lub dirname relative.
  */
 export function getSeedDbPath(options: {
   isPackaged: boolean;
   resourcesPath: string;
   appPath: string;
-  /** dist/infra when running from dist/electron/main.js → dist is parent of electron */
   dirname: string;
 }): string | null {
   const { isPackaged, resourcesPath, appPath, dirname } = options;
@@ -42,111 +47,109 @@ export function getSeedDbPath(options: {
 }
 
 /**
- * Odtwarza tylko warstwę pricingu w istniejącej bazie użytkownika z seed DB.
- * Nie dotyka tabel: users, offers, pdfs, emails, outbox, activity, sessions.
- * Kopiuje/ nadpisuje: config_sync_meta (id=1), pricing_cache, pricing_surface, addons_surcharges, standard_included.
+ * Waliduje lokalną bazę. Baza jest NIEPOPRAWNA jeśli:
+ * - brak tabel pricing_cache / pricing_surface
+ * - pricing_cache puste
+ * - pricing_surface ma 0 rekordów
+ * - cennik nie parsuje się lub nie jest tablicą
+ * - cennik nie ma żadnego wariantu (wariant_hali)
  */
-export function restorePricingFromSeedDb(userDb: Db, seedPath: string, logger: Logger): boolean {
-  let seedDb: Db | null = null;
+export function validateLocalDatabase(database: Db): ValidationResult {
   try {
-    const Database = require("better-sqlite3");
-    seedDb = new Database(seedPath, { readonly: true });
-  } catch (e) {
-    logger.warn("[seed-db] could not open seed database", e);
-    return false;
-  }
-
-  const s = seedDb;
-  if (!s) return false;
-
-  try {
-    const hasSeedCache = (s.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_cache'").get() as { name?: string } | undefined)?.name === "pricing_cache";
-    if (!hasSeedCache) {
-      logger.warn("[seed-db] seed database has no pricing_cache table");
-      return false;
+    const hasCache = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_cache'").get() as { name?: string } | undefined)?.name === "pricing_cache";
+    if (!hasCache) {
+      return { ok: false, reason: "missing_pricing_cache_table", details: {} };
     }
 
-    const seedRow = s.prepare(
-      "SELECT pricing_version, last_updated, cennik_json, dodatki_json, standard_json FROM pricing_cache ORDER BY pricing_version DESC LIMIT 1"
-    ).get() as { pricing_version: number; last_updated: string; cennik_json: string; dodatki_json: string; standard_json: string } | undefined;
-    if (!seedRow) {
-      logger.warn("[seed-db] seed pricing_cache is empty");
-      return false;
+    const hasSurface = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined)?.name === "pricing_surface";
+    if (!hasSurface) {
+      return { ok: false, reason: "missing_pricing_surface_table", details: {} };
     }
 
-    userDb.exec("DELETE FROM pricing_cache");
-    userDb.prepare(
-      `INSERT INTO pricing_cache (pricing_version, last_updated, cennik_json, dodatki_json, standard_json, fetched_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
-    ).run(
-      seedRow.pricing_version,
-      seedRow.last_updated,
-      seedRow.cennik_json,
-      seedRow.dodatki_json,
-      seedRow.standard_json
-    );
-
-    const hasSurface = (userDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined)?.name === "pricing_surface";
-    if (hasSurface) {
-      userDb.prepare("DELETE FROM pricing_surface").run();
-      const surfaceRows = s.prepare("SELECT data_json FROM pricing_surface").all() as Array<{ data_json: string }>;
-      const insSurface = userDb.prepare("INSERT INTO pricing_surface (data_json) VALUES (?)");
-      for (const r of surfaceRows) {
-        insSurface.run(r.data_json);
-      }
+    const cacheRow = database.prepare(
+      "SELECT cennik_json, dodatki_json, standard_json FROM pricing_cache ORDER BY pricing_version DESC LIMIT 1"
+    ).get() as { cennik_json?: string; dodatki_json?: string; standard_json?: string } | undefined;
+    if (!cacheRow) {
+      return { ok: false, reason: "pricing_cache_empty", details: {} };
     }
 
-    const hasAddons = (userDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='addons_surcharges'").get() as { name?: string } | undefined)?.name === "addons_surcharges";
-    if (hasAddons) {
-      userDb.prepare("DELETE FROM addons_surcharges").run();
-      const addonsRows = s.prepare("SELECT data_json FROM addons_surcharges").all() as Array<{ data_json: string }>;
-      const insAddons = userDb.prepare("INSERT INTO addons_surcharges (data_json) VALUES (?)");
-      for (const r of addonsRows) {
-        insAddons.run(r.data_json);
-      }
-    }
-
-    const hasStandard = (userDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='standard_included'").get() as { name?: string } | undefined)?.name === "standard_included";
-    if (hasStandard) {
-      userDb.prepare("DELETE FROM standard_included").run();
-      const standardRows = s.prepare("SELECT data_json FROM standard_included").all() as Array<{ data_json: string }>;
-      const insStandard = userDb.prepare("INSERT INTO standard_included (data_json) VALUES (?)");
-      for (const r of standardRows) {
-        insStandard.run(r.data_json);
-      }
-    }
-
-    const hasMeta = (userDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config_sync_meta'").get() as { name?: string } | undefined)?.name === "config_sync_meta";
-    if (hasMeta) {
-      userDb.prepare("INSERT OR REPLACE INTO config_sync_meta (id, version, last_synced_at) VALUES (1, ?, ?)").run(seedRow.pricing_version, seedRow.last_updated);
-    }
-
-    let seedVersion: number | null = null;
+    let cennik: unknown[];
     try {
-      const meta = s.prepare("SELECT seed_version FROM seed_meta WHERE id = 1").get() as { seed_version?: number } | undefined;
-      seedVersion = meta?.seed_version ?? null;
+      const parsed = JSON.parse(cacheRow.cennik_json ?? "[]");
+      if (!Array.isArray(parsed)) {
+        return { ok: false, reason: "cennik_not_array", details: {} };
+      }
+      cennik = parsed;
     } catch {
-      // seed_meta may not exist in older seed files
+      return { ok: false, reason: "cennik_json_invalid", details: {} };
     }
-    s.close();
 
-    logger.info("[seed-db] pricing restored from seed database", {
-      cennik_json_length: seedRow.cennik_json.length,
-      seed_version: seedVersion ?? "unknown",
+    if (cennik.length === 0) {
+      return { ok: false, reason: "cennik_empty", details: {} };
+    }
+
+    const hasVariant = cennik.some((r: unknown) => {
+      const row = r as Record<string, unknown> | null;
+      if (!row || typeof row !== "object") return false;
+      const id = String(row.wariant_hali ?? row.variant ?? "").trim();
+      return id.length > 0;
     });
-    return true;
-  } catch (e) {
-    logger.warn("[seed-db] restore from seed failed", e);
-    try {
-      s.close();
-    } catch {
-      // ignore
+    if (!hasVariant) {
+      return { ok: false, reason: "no_variants_in_cennik", details: { cennikCount: cennik.length } };
     }
-    return false;
+
+    const surfaceCount = (database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number })?.c ?? 0;
+    if (surfaceCount === 0) {
+      return { ok: false, reason: "pricing_surface_empty", details: {} };
+    }
+
+    return { ok: true };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "validation_error",
+      details: { error: e instanceof Error ? e.message : String(e) },
+    };
   }
 }
 
 /**
- * Zwraca wersję seed z pliku seed DB (bez otwierania user DB).
+ * Kopiuje plik seed DB do docelowej ścieżki (np. userData/planlux-hale.db).
+ */
+export function copySeedToPath(seedPath: string, destPath: string): void {
+  fs.copyFileSync(seedPath, destPath);
+}
+
+/**
+ * Tworzy backup uszkodzonej bazy (planlux-hale.db.broken-YYYYMMDD-HHMMSS.bak),
+ * usuwa aktywną bazę i kopiuje seed w jej miejsce.
+ */
+export function backupAndReplaceWithSeed(dbPath: string, seedPath: string, logger: Logger): void {
+  const dir = path.dirname(dbPath);
+  const base = path.basename(dbPath);
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15).replace("T", "-");
+  const backupPath = path.join(dir, `${base}.broken-${stamp}.bak`);
+  if (fs.existsSync(dbPath)) {
+    try {
+      fs.copyFileSync(dbPath, backupPath);
+      logger.info("[seed-db] backup created: " + backupPath);
+    } catch (e) {
+      logger.warn("[seed-db] backup failed", e);
+    }
+    try {
+      fs.unlinkSync(dbPath);
+    } catch (e) {
+      logger.warn("[seed-db] delete old db failed", e);
+      throw e;
+    }
+  }
+  copySeedToPath(seedPath, dbPath);
+  logger.info("[seed-db] copied seed database");
+  logger.info("[seed-db] replaced with fresh seed database");
+}
+
+/**
+ * Zwraca wersję seed z pliku seed DB (tabela seed_meta), lub null.
  */
 export function getSeedVersionFromFile(seedPath: string): number | null {
   let conn: Db | null = null;

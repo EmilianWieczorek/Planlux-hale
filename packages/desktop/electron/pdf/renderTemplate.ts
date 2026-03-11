@@ -59,21 +59,28 @@ function linesToHtml(text: string): string {
 
 /**
  * Replace placeholders: escape text fields; inject raw HTML for *Html fields.
+ * Canonical names: clientName, clientPhone, clientEmail, clientNip, clientAddressOrInstall.
+ * Legacy aliases (client_name, phone, email, nip, address) map to same values so old templates still work.
  */
 function buildReplacements(p: OfferPdfPayload): Record<string, string> {
+  const clientName = escapeHtml(p.clientName ?? "");
+  const clientNip = escapeHtml(p.clientNip ?? "");
+  const clientEmail = escapeHtml(p.clientEmail ?? "");
+  const clientPhone = escapeHtml(p.clientPhone ?? "");
+  const clientAddressOrInstall = escapeHtml(p.clientAddressOrInstall ?? "–");
   return {
     "{{offerNumber}}": escapeHtml(p.offerNumber),
     "{{offerDate}}": escapeHtml(p.offerDate),
     "{{sellerName}}": escapeHtml(p.sellerName),
     "{{sellerEmail}}": p.sellerEmail ? escapeHtml(p.sellerEmail) : "",
     "{{sellerPhone}}": p.sellerPhone ? escapeHtml(p.sellerPhone) : "",
-    "{{clientName}}": escapeHtml(p.clientName),
+    "{{clientName}}": clientName,
     "{{companyName}}": escapeHtml(p.companyName ?? ""),
     "{{personName}}": escapeHtml(p.personName ?? ""),
-    "{{clientAddressOrInstall}}": escapeHtml(p.clientAddressOrInstall ?? "–"),
-    "{{clientNip}}": escapeHtml(p.clientNip ?? ""),
-    "{{clientEmail}}": escapeHtml(p.clientEmail ?? ""),
-    "{{clientPhone}}": escapeHtml(p.clientPhone ?? ""),
+    "{{clientAddressOrInstall}}": clientAddressOrInstall,
+    "{{clientNip}}": clientNip,
+    "{{clientEmail}}": clientEmail,
+    "{{clientPhone}}": clientPhone,
     "{{variantName}}": escapeHtml(p.variantName),
     "{{widthM}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.widthM),
     "{{lengthM}}": new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(p.lengthM),
@@ -94,6 +101,13 @@ function buildReplacements(p: OfferPdfPayload): Record<string, string> {
         ? p.addonsPillsHtml
         : '<span class="pill">Brak dodatków</span>',
     "{{standardListHtml}}": p.standardListHtml,
+    // Legacy aliases – same values as canonical so old template copies still fill
+    "{{client_name}}": clientName,
+    "{{phone}}": clientPhone,
+    "{{email}}": clientEmail,
+    "{{nip}}": clientNip,
+    "{{address}}": clientAddressOrInstall,
+    "{{clientAddress}}": clientAddressOrInstall,
   };
 }
 
@@ -272,11 +286,12 @@ export function renderPdfTemplateHtml(
   let effectiveConfig = config;
   if (editor && !page2Only) {
     const p1 = editor.page1;
-    if (p1.offerNumber !== undefined) effectivePayload.offerNumber = p1.offerNumber;
-    if (p1.clientName !== undefined) effectivePayload.clientName = p1.clientName;
-    if (p1.nip !== undefined) effectivePayload.clientNip = p1.nip;
-    if (p1.email !== undefined) effectivePayload.clientEmail = p1.email;
-    if (p1.phone !== undefined) effectivePayload.clientPhone = p1.phone;
+    if (p1.offerNumber !== undefined && String(p1.offerNumber).trim() !== "") effectivePayload.offerNumber = p1.offerNumber;
+    /* Override client fields only when editor has non-empty values. Default merge gives page1 with "" so we must not overwrite payload with empty. */
+    if (p1.clientName !== undefined && String(p1.clientName).trim() !== "") effectivePayload.clientName = p1.clientName;
+    if (p1.nip !== undefined && String(p1.nip).trim() !== "") effectivePayload.clientNip = p1.nip;
+    if (p1.email !== undefined && String(p1.email).trim() !== "") effectivePayload.clientEmail = p1.email;
+    if (p1.phone !== undefined && String(p1.phone).trim() !== "") effectivePayload.clientPhone = p1.phone;
     if (p1.leadText !== undefined) {
       effectiveConfig = { ...config, heroSubtitle: p1.leadText };
     }
@@ -327,6 +342,12 @@ export function renderPdfTemplateHtml(
     }
   }
   html = html.replace(/\{\{\s*addonsPillsHtml\s*\}\}/g, addonsPills);
+
+  const missingPlaceholders = html.match(/\{\{[^}]+\}\}/g);
+  if (missingPlaceholders?.length) {
+    const unique = [...new Set(missingPlaceholders)].sort();
+    console.warn("[pdf] missing placeholders after replacement:", unique);
+  }
 
   html = html.replace(
     /<link\s+rel="stylesheet"\s+href="styles\.css"\s*\/?>/i,

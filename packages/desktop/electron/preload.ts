@@ -17,6 +17,10 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:getPricingCache",
   "planlux:getConfigSyncStatus",
   "planlux:diagnostics",
+  "planlux:logToFile",
+  "planlux:getDiagnosticsPanelData",
+  "planlux:openLogsFolder",
+  "planlux:getLogPath",
   "planlux:testSupabaseConnection",
   "planlux:testEndToEnd",
   "planlux:syncPricing",
@@ -76,7 +80,6 @@ const ALLOWED_CHANNELS = new Set([
   "planlux:email:retryNow",
   "planlux:email:historyList",
   "planlux:debugEmailTables",
-  "base:sync",
   "pdf:generate",
   "planlux:generatePdf",
   "planlux:generatePdfPreview",
@@ -170,7 +173,6 @@ const planlux = {
 };
 
 const api = {
-  syncBase: () => safeInvoke("base:sync"),
   generatePdf: (payload: unknown) => safeInvoke("pdf:generate", payload),
   pdfGenerate: (offerData: unknown) => safeInvoke("pdf:generate", offerData),
   sendEmail: (data: unknown) => safeInvoke("planlux:sendEmail", data),

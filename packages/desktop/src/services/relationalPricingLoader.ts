@@ -33,6 +33,32 @@ function firstStr(row: Record<string, unknown>, ...keys: string[]): string | und
   return undefined;
 }
 
+/** Get first non-empty string from row; tries each key then case-insensitive match on row keys (PostgREST returns lowercase). */
+function rowStr(row: Record<string, unknown>, ...keys: string[]): string {
+  for (const k of keys) {
+    let v = row[k];
+    if (v == null || String(v).trim() === "") {
+      const rowKey = Object.keys(row).find((rk) => rk.toLowerCase() === k.toLowerCase());
+      v = rowKey != null ? row[rowKey] : undefined;
+    }
+    if (v != null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+
+function rowNum(row: Record<string, unknown>, fallback: number, ...keys: string[]): number {
+  for (const k of keys) {
+    const rowKey = Object.keys(row).find((rk) => rk.toLowerCase() === k.toLowerCase()) ?? k;
+    const v = row[rowKey];
+    if (v != null && (typeof v === "number" || (typeof v === "string" && v.trim() !== ""))) return toNum(v, fallback);
+  }
+  return fallback;
+}
+
+function logReject(table: "addons_surcharges" | "standard_included", rowKeys: string[], reason: string): void {
+  console.warn("[pricing][supabase] row rejected", { table, rowKeys, reason });
+}
+
 /** Normalized surface row (pricing_surface) with optional spec fields for PDF. */
 export interface NormalizedSurfaceRow {
   variant: string;
@@ -156,44 +182,75 @@ export function hallVariantsToCennik(hallVariants: HallVariant[]): CennikRow[] {
   return cennik;
 }
 
-/** Normalize addons row (column-based or data_json). */
-function normalizeAddonsRow(row: Record<string, unknown>): { wariant_hali: string; nazwa: string; stawka: number; jednostka: string } | null {
+/**
+ * Normalize addons_surcharges row. Primary mapping from real Supabase columns; legacy as fallback.
+ * Supabase: variant, hall_name, addon_name, price, currency, unit, condition, addon_type, calculation_mode, display_name.
+ */
+function normalizeAddonsRow(row: Record<string, unknown>): (Omit<DodatkiRow, "Nr" | "Nazwa"> & { warunek?: string; warunek_type?: string }) | null {
+  const rowKeys = Object.keys(row);
   if (row.data_json != null && typeof row.data_json === "string") {
     try {
       return normalizeAddonsRow(JSON.parse(row.data_json) as Record<string, unknown>);
     } catch {
+      logReject("addons_surcharges", rowKeys, "invalid data_json");
       return null;
     }
   }
   if (row.data_json != null && typeof row.data_json === "object" && row.data_json !== null) {
     return normalizeAddonsRow(row.data_json as Record<string, unknown>);
   }
-  const wariant_hali = str(row.wariant_hali ?? row.variant ?? row.hall_name);
-  const nazwa = str(row.nazwa ?? row.addon_name ?? row.name);
-  const stawka = toNum(row.stawka ?? row.price, 0);
-  const jednostka = str(row.jednostka ?? row.unit ?? "szt");
-  if (!wariant_hali || !nazwa) return null;
-  return { wariant_hali, nazwa, stawka, jednostka };
+  const wariant_hali = rowStr(row, "variant", "wariant_hali", "hall_variant", "hall_name", "hallVariant", "hall_key", "hallKey");
+  const nazwa = rowStr(row, "addon_name", "display_name", "nazwa", "name");
+  const stawka = rowNum(row, 0, "price", "stawka");
+  const jednostka = rowStr(row, "unit", "jednostka") || "szt";
+  const warunek = rowStr(row, "condition", "warunek") || undefined;
+  const warunek_type = rowStr(row, "addon_type", "warunek_type") || undefined;
+
+  if (!wariant_hali) {
+    logReject("addons_surcharges", rowKeys, "missing variant (required)");
+    return null;
+  }
+  if (!nazwa) {
+    logReject("addons_surcharges", rowKeys, "missing addon_name/display_name/nazwa (required)");
+    return null;
+  }
+  const out = { wariant_hali, nazwa, stawka, jednostka, warunek, warunek_type };
+  return out as (Omit<DodatkiRow, "Nr" | "Nazwa"> & { warunek?: string; warunek_type?: string });
 }
 
-/** Normalize standard row (column-based or data_json). */
-function normalizeStandardRow(row: Record<string, unknown>): { wariant_hali: string; element: string; ilosc: number; wartosc_ref: number } | null {
+/**
+ * Normalize standard_included row. Primary mapping from real Supabase columns; legacy as fallback.
+ * Supabase: variant, element, qty, unit, reference_value, currency, price_unit, notes.
+ */
+function normalizeStandardRow(row: Record<string, unknown>): (Omit<StandardRow, "Nr" | "stawka" | "Jednostka"> & { ilosc: number; wartosc_ref: number }) | null {
+  const rowKeys = Object.keys(row);
   if (row.data_json != null && typeof row.data_json === "string") {
     try {
       return normalizeStandardRow(JSON.parse(row.data_json) as Record<string, unknown>);
     } catch {
+      logReject("standard_included", rowKeys, "invalid data_json");
       return null;
     }
   }
   if (row.data_json != null && typeof row.data_json === "object" && row.data_json !== null) {
     return normalizeStandardRow(row.data_json as Record<string, unknown>);
   }
-  const wariant_hali = str(row.wariant_hali ?? row.variant);
-  const element = str(row.element ?? row.name);
-  const ilosc = toNum(row.ilosc ?? row.qty, 1);
-  const wartosc_ref = toNum(row.wartosc_ref ?? row.ref_value, 0);
-  if (!wariant_hali || !element) return null;
-  return { wariant_hali, element, ilosc, wartosc_ref };
+  const wariant_hali = rowStr(row, "variant", "wariant_hali", "hall_variant");
+  const element = rowStr(row, "element", "name");
+  const ilosc = rowNum(row, 1, "qty", "ilosc");
+  const jednostka = rowStr(row, "unit", "jednostka") || undefined;
+  const wartosc_ref = rowNum(row, 0, "reference_value", "wartosc_ref", "ref_value");
+  const uwagi = rowStr(row, "notes", "uwagi") || undefined;
+
+  if (!wariant_hali) {
+    logReject("standard_included", rowKeys, "missing variant (required)");
+    return null;
+  }
+  if (!element) {
+    logReject("standard_included", rowKeys, "missing element (required)");
+    return null;
+  }
+  return { wariant_hali, element, ilosc, wartosc_ref, jednostka, uwagi };
 }
 
 export interface RelationalPricingResult {
@@ -229,17 +286,30 @@ export async function fetchRelationalPricing(supabase: SupabaseClient): Promise<
     return null;
   }
 
+  // Load ALL addons/standard rows – no .eq("variant") or selectedVariant filter. Filtering happens in renderer/engine.
   try {
     const { data: addonsData, error: addonsError } = await supabase.from("addons_surcharges").select("*");
+    const rawAddonsCount = (addonsData ?? []).length;
+    console.warn("[pricing][supabase] raw addons query", {
+      rawAddonsCount,
+      rawAddonsError: addonsError ? { message: addonsError.message, code: (addonsError as { code?: string }).code } : null,
+      firstRawAddonRow: addonsData?.[0] ?? null,
+    });
     if (!addonsError) addonsRows = (addonsData ?? []).map((r) => r as Record<string, unknown>);
-  } catch {
-    // optional
+  } catch (e) {
+    console.warn("[pricing][supabase] raw addons exception", e);
   }
   try {
     const { data: stdData, error: stdError } = await supabase.from("standard_included").select("*");
+    const rawStandardCount = (stdData ?? []).length;
+    console.warn("[pricing][supabase] raw standard query", {
+      rawStandardCount,
+      rawStandardError: stdError ? { message: stdError.message, code: (stdError as { code?: string }).code } : null,
+      firstRawStandardRow: stdData?.[0] ?? null,
+    });
     if (!stdError) standardRows = (stdData ?? []).map((r) => r as Record<string, unknown>);
-  } catch {
-    // optional
+  } catch (e) {
+    console.warn("[pricing][supabase] raw standard exception", e);
   }
 
   const normalizedSurface = surfaceRows
@@ -274,25 +344,43 @@ export async function fetchRelationalPricing(supabase: SupabaseClient): Promise<
     console.info("[variants][main] relational loader mapped entries:", cennik.length, "unique variants:", uniqueVariants.length);
   }
 
-  const dodatki: DodatkiRow[] = addonsRows
-    .map((r) => normalizeAddonsRow(r))
-    .filter((r): r is NonNullable<typeof r> => r != null)
-    .map((r) => ({
-      wariant_hali: r.wariant_hali,
-      nazwa: r.nazwa,
-      stawka: r.stawka,
-      jednostka: r.jednostka,
-    }));
+  const normalizedAddons: Array<Omit<DodatkiRow, "Nr" | "Nazwa"> & { warunek?: string; warunek_type?: string }> = [];
+  for (const r of addonsRows) {
+    const n = normalizeAddonsRow(r);
+    if (n) {
+      if (normalizedAddons.length === 0) {
+        console.warn("[pricing][supabase] normalized addon sample", n);
+      }
+      normalizedAddons.push(n);
+    }
+  }
+  const dodatki: DodatkiRow[] = normalizedAddons.map((r) => ({
+    wariant_hali: r.wariant_hali,
+    nazwa: r.nazwa,
+    stawka: r.stawka,
+    jednostka: r.jednostka,
+    ...(r.warunek != null && r.warunek !== "" && { warunek: r.warunek }),
+    ...(r.warunek_type != null && r.warunek_type !== "" && { warunek_type: r.warunek_type }),
+  }));
 
-  const standard: StandardRow[] = standardRows
-    .map((r) => normalizeStandardRow(r))
-    .filter((r): r is NonNullable<typeof r> => r != null)
-    .map((r) => ({
-      wariant_hali: r.wariant_hali,
-      element: r.element,
-      ilosc: r.ilosc,
-      wartosc_ref: r.wartosc_ref,
-    }));
+  const normalizedStandards: Array<Omit<StandardRow, "Nr" | "stawka" | "Jednostka"> & { ilosc: number; wartosc_ref: number }> = [];
+  for (const r of standardRows) {
+    const n = normalizeStandardRow(r);
+    if (n) {
+      if (normalizedStandards.length === 0) {
+        console.warn("[pricing][supabase] normalized standard sample", n);
+      }
+      normalizedStandards.push(n);
+    }
+  }
+  const standard: StandardRow[] = normalizedStandards.map((r) => ({
+    wariant_hali: r.wariant_hali,
+    element: r.element,
+    ilosc: r.ilosc,
+    wartosc_ref: r.wartosc_ref,
+    ...(r.jednostka != null && r.jednostka !== "" && { jednostka: r.jednostka }),
+    ...(r.uwagi != null && r.uwagi !== "" && { uwagi: r.uwagi }),
+  }));
 
   if (DEBUG) {
     console.debug("[relationalPricing] fetchRelationalPricing", {

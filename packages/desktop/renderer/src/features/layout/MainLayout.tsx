@@ -17,6 +17,7 @@ import { OfertyView } from "../oferty/OfertyView";
 import { DashboardView } from "../dashboard/DashboardView";
 import { AdminPanel } from "../admin/AdminPanel";
 import { ClearDataDialog } from "./ClearDataDialog";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { offerDraftStore } from "../../state/offerDraftStore";
 import { tokens } from "../../theme/tokens";
 import { canAccessAdminPanel, isUpdateAvailable, isBelowMinSupported } from "@planlux/shared";
@@ -120,6 +121,19 @@ export function MainLayout({ user, onLogout, api }: Props) {
   const [emailText, setEmailText] = useState("");
   const [emailSending, setEmailSending] = useState(false);
   const [emailSnackbar, setEmailSnackbar] = useState<{ message: string; severity: "success" | "info" | "error" } | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+
+  /** Ukryty panel diagnostyczny: Ctrl+Shift+D */
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        setDiagnosticsOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const canAccessAdmin = canAccessAdminPanel(user.role);
   const isBossOrAdmin = canAccessAdmin; // single source: ADMIN/SZEF see admin panel and all offers
@@ -497,6 +511,11 @@ export function MainLayout({ user, onLogout, api }: Props) {
         )}
         {tab === "admin" && canAccessAdmin && <AdminPanel api={api} currentUser={user} />}
       </main>
+      <DiagnosticsPanel
+        open={diagnosticsOpen}
+        onClose={() => setDiagnosticsOpen(false)}
+        api={api}
+      />
     </div>
   );
 }

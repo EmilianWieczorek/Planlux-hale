@@ -9,7 +9,6 @@ import path from "path";
 import fs from "fs";
 import Database from "better-sqlite3";
 import { SCHEMA_SQL, flushOutbox } from "@planlux/shared";
-import type { ApiClient } from "@planlux/shared";
 import { registerIpcHandlers } from "./ipc"; // IPC handlers registered in whenReady before createWindow()
 import { config } from "../src/config";
 import { getConfig, getBackendUrl, requireSupabase, sanitizeConfigForLog } from "./config";
@@ -32,8 +31,13 @@ const dbPath = e2eConfig.isE2E
 
 let mainWindow: BrowserWindow | null = null;
 let db: ReturnType<typeof Database> | null = null;
+/** Ustawiane przed pierwszym getDb(); używane do replace flow (copy seed gdy brak/ invalid DB). */
+let seedPathForRecovery: string | null = null;
+/** Tylko jedna próba podmiany na start – ochrona przed pętlą. */
+let replaceAttempted = false;
 
-let apiClient: ApiClient;
+type SupabaseApiClient = ReturnType<typeof import("./supabase/apiAdapter").createSupabaseApiAdapter>;
+let apiClient: SupabaseApiClient;
 
 function runMigrations(database: ReturnType<typeof Database>) {
   // Migracja users_roles_3: CHECK (ADMIN, BOSS, SALESPERSON) – idempotentna, bez cichego skip.
@@ -378,38 +382,91 @@ COMMIT;
   }
 }
 
-function getDb() {
-  if (!db) {
-    if (process.env.FORCE_RESET_DB === "true") {
-      const toDelete = path.normalize(dbPath);
-      if (fs.existsSync(toDelete)) {
-        try {
-          fs.rmSync(toDelete, { force: true });
-          logger.info("[DEV] Deleted local DB: " + toDelete);
-        } catch (e) {
-          logger.warn("[DEV] Failed to delete local DB", { path: toDelete, error: e instanceof Error ? e.message : String(e) });
-        }
-      }
-    }
-    db = new Database(dbPath);
-    db.exec(SCHEMA_SQL);
-    runMigrations(db);
-    db.exec("PRAGMA foreign_keys = ON");
-    try {
-      const hasPdfs = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pdfs'").get() as { name?: string } | undefined)?.name === "pdfs";
-      if (hasPdfs) {
-        const r = db.prepare("DELETE FROM pdfs WHERE offer_id IS NULL OR offer_id = ''").run();
-        if (r.changes > 0) logger.info("[db] cleanup: removed pdfs rows with null/empty offer_id", { count: r.changes });
-      }
-    } catch (e) {
-      logger.warn("[db] pdfs cleanup skipped", e);
-    }
-    if (process.env.NODE_ENV !== "production") {
+function getDb(): ReturnType<typeof Database> {
+  if (db) return db;
+
+  if (process.env.FORCE_RESET_DB === "true") {
+    const toDelete = path.normalize(dbPath);
+    if (fs.existsSync(toDelete)) {
       try {
-        dumpFkInfo(db);
+        fs.rmSync(toDelete, { force: true });
+        logger.info("[DEV] Deleted local DB: " + toDelete);
       } catch (e) {
-        logger.warn("[db] dumpFkInfo failed", e);
+        logger.warn("[DEV] Failed to delete local DB", { path: toDelete, error: e instanceof Error ? e.message : String(e) });
       }
+    }
+  }
+
+  const seedPath = seedPathForRecovery;
+  if (!fs.existsSync(dbPath) && seedPath) {
+    const { copySeedToPath } = require("../src/infra/seedDb");
+    copySeedToPath(seedPath, dbPath);
+    logger.info("[seed-db] local db missing, copied seed database");
+  }
+
+  try {
+    db = new Database(dbPath);
+  } catch (openErr) {
+    if (seedPath && fs.existsSync(seedPath)) {
+      const { backupAndReplaceWithSeed } = require("../src/infra/seedDb");
+      if (fs.existsSync(dbPath)) {
+        backupAndReplaceWithSeed(dbPath, seedPath, logger);
+      } else {
+        const { copySeedToPath } = require("../src/infra/seedDb");
+        copySeedToPath(seedPath, dbPath);
+      }
+      db = new Database(dbPath);
+    } else {
+      throw openErr;
+    }
+  }
+
+  db.exec(SCHEMA_SQL);
+  runMigrations(db);
+  db.exec("PRAGMA foreign_keys = ON");
+
+  const { validateLocalDatabase, backupAndReplaceWithSeed, copySeedToPath } = require("../src/infra/seedDb");
+  logger.info("[seed-db] validating local database");
+  const validation = validateLocalDatabase(db);
+  if (!validation.ok) {
+    logger.info("[seed-db] validation failed: " + (validation.reason ?? "unknown"), validation.details ?? {});
+    logger.info("[seed-db] local db invalid");
+    if (seedPath && !replaceAttempted) {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      db = null;
+      backupAndReplaceWithSeed(dbPath, seedPath, logger);
+      replaceAttempted = true;
+      logger.info("[seed-db] running migrations after replacement");
+      return getDb();
+    }
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+    db = null;
+    throw new Error("Local database invalid after replace with seed. " + (validation.reason ?? ""));
+  }
+  logger.info("[seed-db] local database valid");
+
+  try {
+    const hasPdfs = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pdfs'").get() as { name?: string } | undefined)?.name === "pdfs";
+    if (hasPdfs) {
+      const r = db.prepare("DELETE FROM pdfs WHERE offer_id IS NULL OR offer_id = ''").run();
+      if (r.changes > 0) logger.info("[db] cleanup: removed pdfs rows with null/empty offer_id", { count: r.changes });
+    }
+  } catch (e) {
+    logger.warn("[db] pdfs cleanup skipped", e);
+  }
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      dumpFkInfo(db);
+    } catch (e) {
+      logger.warn("[db] dumpFkInfo failed", e);
     }
   }
   return db;
@@ -619,6 +676,17 @@ async function runStartup(): Promise<void> {
 
   const electronCfg = getConfig();
   initLogger(app.getPath("userData"), { level: electronCfg.logging.level });
+  process.on("uncaughtException", (err) => {
+    logger.error("[error] uncaughtException", { message: err?.message, stack: err?.stack });
+  });
+  process.on("unhandledRejection", (reason, promise) => {
+    logger.error("[error] unhandledRejection", { reason: String(reason), promise: String(promise) });
+  });
+
+  logger.info("[app] starting Planlux Hale");
+  logger.info("[app] version", { version: app.getVersion() });
+  logger.info("[app] userData path", { userData: app.getPath("userData") });
+
   requireSupabase(electronCfg);
   const { createSupabaseClient } = await import("./supabase/client");
   const { createSupabaseApiAdapter } = await import("./supabase/apiAdapter");
@@ -626,7 +694,7 @@ async function runStartup(): Promise<void> {
   apiClient = createSupabaseApiAdapter({
     supabase,
     supabaseUrl: electronCfg.supabase?.url,
-  }) as unknown as ApiClient;
+  });
 
   logger.info("[app] started", {
     version: app.getVersion(),
@@ -635,162 +703,23 @@ async function runStartup(): Promise<void> {
   });
   logger.info("[app] config", sanitizeConfigForLog(electronCfg));
 
+  const { getSeedDbPath } = await import("../src/infra/seedDb");
+  seedPathForRecovery = e2eConfig.isE2E
+    ? null
+    : getSeedDbPath({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath || "",
+        appPath: app.getAppPath(),
+        dirname: __dirname,
+      });
+
   const database = getDb();
   logger.info("[bootstrap] migrations complete");
 
-  // Ensure pricing tables exist (defensive: create if missing).
-  try {
-    const hasSurface = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pricing_surface'").get() as { name?: string } | undefined;
-    const hasAddons = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='addons_surcharges'").get() as { name?: string } | undefined;
-    const hasStandard = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='standard_included'").get() as { name?: string } | undefined;
-    if (!hasSurface?.name || !hasAddons?.name || !hasStandard?.name) {
-      database.exec(`
-        CREATE TABLE IF NOT EXISTS config_sync_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL DEFAULT 0, last_synced_at TEXT DEFAULT NULL);
-        INSERT OR IGNORE INTO config_sync_meta (id, version) VALUES (1, 0);
-        CREATE TABLE IF NOT EXISTS pricing_surface (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS addons_surcharges (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS standard_included (id INTEGER PRIMARY KEY AUTOINCREMENT, data_json TEXT NOT NULL);
-      `);
-      logger.info("[bootstrap] created missing pricing tables");
-    }
-  } catch (e) {
-    logger.warn("[bootstrap] ensure pricing tables failed", e);
-  }
+  // Pricing is loaded on-demand from Supabase via IPC (no local pricing seed/sync/cache at startup).
 
-  const { getSeedDbPath, restorePricingFromSeedDb, getSeedVersionFromFile } = await import("../src/infra/seedDb");
-  const { seedBaseIfEmpty } = await import("../src/infra/seedBase");
-  const { loadBaseFromLocalTables, saveBase, getCachedBase } = await import("../src/infra/db");
-
-  const seedPath = getSeedDbPath({
-    isPackaged: app.isPackaged,
-    resourcesPath: process.resourcesPath || "",
-    appPath: app.getAppPath(),
-    dirname: __dirname,
-  });
-  let restoredFromSeedThisRun = false;
-  if (seedPath) {
-    logger.info("[seed-db] seed database found");
-    const surfaceCount = (database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number } | undefined)?.c ?? 0;
-    const cacheRow = getCachedBase(database);
-    const cacheEmpty = !cacheRow || !cacheRow.cennik?.length;
-    if (surfaceCount === 0 || cacheEmpty) {
-      logger.info("[seed-db] local pricing empty, restoring from seed");
-      const restored = restorePricingFromSeedDb(database, seedPath, logger);
-      if (restored) {
-        restoredFromSeedThisRun = true;
-        const ver = getSeedVersionFromFile(seedPath);
-        if (ver != null) logger.info("[seed-db] seed version = " + String(ver));
-      }
-    }
-  }
-
-  const seeded = seedBaseIfEmpty(database);
-  if (seeded) logger.info("[bootstrap] seeding database");
-
-  try {
-    const pricingSurfaceCount =
-      database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c?: number } | undefined;
-    const addonsCount =
-      database.prepare("SELECT COUNT(1) as c FROM addons_surcharges").get() as { c?: number } | undefined;
-    const standardCount =
-      database.prepare("SELECT COUNT(1) as c FROM standard_included").get() as { c?: number } | undefined;
-    logger.info("[bootstrap] local pricing tables", {
-      seeded,
-      pricing_surface: pricingSurfaceCount?.c ?? 0,
-      addons_surcharges: addonsCount?.c ?? 0,
-      standard_included: standardCount?.c ?? 0,
-    });
-    if ((pricingSurfaceCount?.c ?? 0) === 0) {
-      const reseeded = seedBaseIfEmpty(database);
-      if (reseeded) {
-        const after = loadBaseFromLocalTables(database);
-        if (after && after.cennik.length > 0) {
-          saveBase(database, after);
-          logger.info("[bootstrap] reseeded pricing cache because database was empty");
-        }
-      }
-    }
-  } catch (e) {
-    logger.warn("[bootstrap] pricing tables count failed", e);
-  }
-
-  const { getLocalVersion } = await import("../src/infra/db");
-  if (getLocalVersion(database) === 0) {
-    const cachePath = path.join(app.getPath("userData"), "pricing_cache.json");
-    try {
-      if (fs.existsSync(cachePath)) {
-        fs.unlinkSync(cachePath);
-        logger.info("[configSync] removed stale pricing_cache.json");
-      }
-    } catch (e) {
-      logger.warn("[configSync] remove pricing_cache.json failed", e);
-    }
-  }
-
-  let syncSucceeded = false;
-  try {
-    const { syncConfig } = await import("../src/services/configSync");
-    await syncConfig(database, logger, apiClient);
-    syncSucceeded = true;
-    logger.info("[bootstrap] pricing sync success");
-    if (restoredFromSeedThisRun) logger.info("[seed-db] sync updated local pricing after seed");
-  } catch (e) {
-    logger.warn("[configSync] startup sync failed – app continues with local data", e);
-  }
-
-  // Ensure pricing_cache is never empty: fill from local tables, seed DB, seed script, or default-pricing.json.
-  let cacheRow = getCachedBase(database);
-  if (!cacheRow || !cacheRow.cennik?.length) {
-    let local = loadBaseFromLocalTables(database);
-    if (!local || local.cennik.length === 0) {
-      const reseeded = seedBaseIfEmpty(database);
-      if (reseeded) logger.info("[bootstrap] re-ran seed (cache empty after sync)");
-      local = loadBaseFromLocalTables(database);
-    }
-    if ((!local || local.cennik.length === 0) && seedPath) {
-      const restored = restorePricingFromSeedDb(database, seedPath, logger);
-      if (restored) local = loadBaseFromLocalTables(database);
-    }
-    if ((!local || local.cennik.length === 0) && !syncSucceeded) {
-      const defaultPath = path.join(app.getAppPath(), "assets", "default-pricing.json");
-      const defaultPathResources = path.join(process.resourcesPath || "", "assets", "default-pricing.json");
-      const defaultPathDev = path.join(__dirname, "..", "assets", "default-pricing.json");
-      for (const p of [defaultPathResources, defaultPath, defaultPathDev]) {
-        const normalized = path.normalize(p);
-        if (fs.existsSync(normalized)) {
-          try {
-            const raw = fs.readFileSync(normalized, "utf-8");
-            const data = JSON.parse(raw) as { version?: number; lastUpdated?: string; cennik?: unknown[]; dodatki?: unknown[]; standard?: unknown[] };
-            if (Array.isArray(data.cennik) && data.cennik.length > 0) {
-              const base = {
-                version: data.version ?? 1,
-                lastUpdated: data.lastUpdated ?? new Date().toISOString(),
-                cennik: data.cennik,
-                dodatki: Array.isArray(data.dodatki) ? data.dodatki : [],
-                standard: Array.isArray(data.standard) ? data.standard : [],
-              };
-              saveBase(database, base);
-              logger.info("[bootstrap] fallback pricing loaded", { from: normalized, cennik: base.cennik.length });
-              local = base;
-              break;
-            }
-          } catch (e) {
-            logger.warn("[bootstrap] load default-pricing.json failed", { path: normalized, error: e instanceof Error ? e.message : String(e) });
-          }
-        }
-      }
-    }
-    if (local && local.cennik.length > 0) {
-      try {
-        saveBase(database, local);
-        logger.info("[bootstrap] filled pricing_cache from local/seed", { cennik: local.cennik.length, dodatki: local.dodatki.length, standard: local.standard.length });
-      } catch (e) {
-        logger.warn("[bootstrap] saveBase after fallback failed", e);
-      }
-    } else if (!cacheRow?.cennik?.length) {
-      logger.error("[bootstrap] pricing_cache still empty after sync and seed – variants/standards/addons will not load");
-    }
-  }
+  // Pricing source of truth is Supabase (pricing_surface/addons_surcharges/standard_included).
+  // No local sync or local fallback at startup.
 
   if (app.isPackaged) {
     try {
@@ -808,18 +737,7 @@ async function runStartup(): Promise<void> {
   }
 
   try {
-    const cacheRow = getCachedBase(database);
-    const cacheCount = database.prepare("SELECT COUNT(1) as c FROM pricing_cache").get() as { c: number };
-    const surfaceCount = database.prepare("SELECT COUNT(1) as c FROM pricing_surface").get() as { c: number };
-    const cennik = cacheRow && Array.isArray(cacheRow.cennik) ? cacheRow.cennik : [];
-    const variantIds = [...new Set((cennik as Array<{ wariant_hali?: string; variant?: string }>).map((r) => String(r?.wariant_hali ?? r?.variant ?? "").trim()).filter(Boolean))];
-    logger.info("[variants][main] bootstrap_done", {
-      pricing_cache_rows: cacheCount?.c ?? 0,
-      pricing_surface_rows: surfaceCount?.c ?? 0,
-      cennik_entries: cennik.length,
-      unique_variants: variantIds.length,
-      sample_variants: variantIds.slice(0, 5),
-    });
+    logger.info("[variants][main] bootstrap_done", { pricing_source: "supabase" });
   } catch (e) {
     logger.warn("[variants][main] bootstrap_done log failed", e);
   }
