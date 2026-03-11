@@ -50,6 +50,20 @@ function normalizeStandard(rows: StandardRow[]): StandardRowNormalized[] {
 }
 
 /**
+ * Najwyższy dostępny próg powierzchni (area_max_m2) dla wariantu w cenniku.
+ * Używane do ograniczenia pricingArea: cena bazowa nie jest liczona od powierzchni większej niż ten próg.
+ */
+function getMaxSupportedArea(cennik: CennikRowNormalized[], variantHali: string): number {
+  const rows = cennik.filter((r) => r.wariant_hali === variantHali);
+  if (rows.length === 0) return 0;
+  let max = 0;
+  for (const r of rows) {
+    if (r.area_max_m2 > max) max = r.area_max_m2;
+  }
+  return max;
+}
+
+/**
  * Match base price for one variant by area only.
  * Inputs: variant, widthM, lengthM → areaM2 = widthM * lengthM.
  * Returns matched row or fallback (AREA_ABOVE_MAX / AREA_BELOW_MIN / AREA_GAP), or no-match when zero rows for variant.
@@ -376,21 +390,46 @@ export function calculatePrice(
   const dodatki = normalizeDodatki(data.dodatki);
   const standard = normalizeStandard(data.standard);
 
-  /** Powierzchnia do wyceny ceny bazowej: max 1200 m². Rzeczywista areaM2 pozostaje w formularzu i PDF. */
-  const pricingArea = Math.min(input.areaM2, 1200);
+  const realArea = input.areaM2;
+  const maxSupportedArea = getMaxSupportedArea(cennik, input.variantHali);
+  const pricingArea =
+    maxSupportedArea > 0 ? Math.min(realArea, maxSupportedArea) : realArea;
+  const areaPricingCapped = realArea > pricingArea;
+  const areaPricingCapValue = areaPricingCapped ? maxSupportedArea : undefined;
 
   if (process.env.LOG_LEVEL === "debug") {
-    const uniqueVariants = new Set(cennik.map((r) => r.wariant_hali).filter(Boolean));
     // eslint-disable-next-line no-console
-    console.debug("[pricing] input", {
-      variantHali: input.variantHali,
-      areaM2: input.areaM2,
+    console.debug("[pricing][calculate] area diagnostics", {
+      realArea,
+      maxSupportedArea,
       pricingArea,
-      cennikRows: cennik.length,
-      groupedVariants: uniqueVariants.size,
+      areaPricingCapped,
+    });
+    if (areaPricingCapped) {
+      // eslint-disable-next-line no-console
+      console.debug("[pricing][calculate] capped area applied", {
+        areaM2Actual: realArea,
+        areaM2Pricing: pricingArea,
+        areaPricingCapValue,
+      });
+    }
+  }
+  if (maxSupportedArea === 0 && cennik.filter((r) => r.wariant_hali === input.variantHali).length === 0) {
+    // eslint-disable-next-line no-console
+    console.warn("[pricing][calculate] no rows for variant, cannot determine maxSupportedArea", {
+      variantHali: input.variantHali,
     });
   }
+
   const base = matchBaseRow(cennik, input.variantHali, pricingArea);
+  if (process.env.LOG_LEVEL === "debug" && base.matched) {
+    const br = base as BasePriceResult;
+    // eslint-disable-next-line no-console
+    console.debug("[pricing][calculate] selected pricing threshold", {
+      areaM2Pricing: pricingArea,
+      tier: br.row ? { areaMin: br.row.area_min_m2, areaMax: br.row.area_max_m2, cenaPerM2: br.cenaPerM2 } : undefined,
+    });
+  }
 
   if (!base.matched) {
     return {
@@ -400,6 +439,10 @@ export function calculatePrice(
       standardInPrice: [],
       totalAdditions: 0,
       totalPln: 0,
+      areaM2Actual: realArea,
+      areaM2Pricing: pricingArea,
+      areaPricingCapped: areaPricingCapped || undefined,
+      areaPricingCapValue,
       errorMessage: formatNoMatchMessage(base),
     };
   }
@@ -470,6 +513,10 @@ export function calculatePrice(
     totalAdditions,
     totalPln,
     automaticSurcharges: automaticSurcharges.length > 0 ? automaticSurcharges : undefined,
+    areaM2Actual: realArea,
+    areaM2Pricing: pricingArea,
+    areaPricingCapped: areaPricingCapped || undefined,
+    areaPricingCapValue,
   };
 }
 
@@ -502,7 +549,7 @@ export function runPricingSelfTest(): boolean {
     return false;
   }
 
-  // Area above max: pricing area capped at 1200 → normal match in 1001–2000 range, base = 80*1200
+  // Area above max: pricing area capped to maxSupportedArea (2000 for V1) → normal match, base = 80*2000
   const r2 = calculatePrice(data, {
     variantHali: "V1",
     widthM: 50,
@@ -511,12 +558,16 @@ export function runPricingSelfTest(): boolean {
     selectedAdditions: [],
   });
   if (!r2.success || !r2.base.matched) {
-    console.error("Self-test fail: 2500 m² capped to 1200 should succeed", r2);
+    console.error("Self-test fail: 2500 m² capped to max tier should succeed", r2);
     return false;
   }
   const base2 = r2.base as BasePriceResult;
-  if (base2.cenaPerM2 !== 80 || base2.totalBase !== 96000) {
-    console.error("Self-test fail: pricingArea 1200 → 80 zł/m², totalBase 80*1200=96000", r2);
+  if (base2.cenaPerM2 !== 80 || base2.totalBase !== 160000) {
+    console.error("Self-test fail: pricingArea capped to 2000 → 80 zł/m², totalBase 80*2000=160000", r2);
+    return false;
+  }
+  if (!r2.areaPricingCapped || r2.areaM2Actual !== 2500 || r2.areaM2Pricing !== 2000 || r2.areaPricingCapValue !== 2000) {
+    console.error("Self-test fail: area diagnostics for capped case", r2);
     return false;
   }
 

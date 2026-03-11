@@ -229,6 +229,10 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     additions?: unknown[];
     standardInPrice?: unknown[];
     automaticSurcharges?: Array<{ name: string; condition: string; areaM2: number; ratePerM2: number; total: number }>;
+    areaM2Actual?: number;
+    areaM2Pricing?: number;
+    areaPricingCapped?: boolean;
+    areaPricingCapValue?: number;
   } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -1408,7 +1412,19 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           )}
           {result?.success && (
             <>
-              {result.base?.matched && result.base?.fallbackUsed && result.base?.fallbackInfo && (
+              {result.areaPricingCapped && result.areaPricingCapValue != null && (
+                <div
+                  style={{
+                    ...styles.diag,
+                    backgroundColor: tokens.color.warning ? `${tokens.color.warning}12` : "#fef9e7",
+                    borderLeft: `4px solid ${tokens.color.warning ?? "#b8860b"}`,
+                    color: tokens.color.text ?? "#1a1a1a",
+                  }}
+                >
+                  Powierzchnia hali przekracza maksymalny próg cennika {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m². Cena bazowa została obliczona według progu {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m².
+                </div>
+              )}
+              {result.base?.matched && result.base?.fallbackUsed && result.base?.fallbackInfo && !result.areaPricingCapped && (
                 <div style={styles.diag}>
                   {result.base.fallbackReason === "AREA_ABOVE_MAX" &&
                     `Uwaga: powierzchnia przekracza zakres cennika. Zastosowano stawkę z najwyższego progu (do ${result.base.fallbackInfo.area_max_m2} m²).`}
@@ -1420,6 +1436,12 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
               )}
               {(result.base?.matched && (result.base.totalBase != null || (result.totalAdditions ?? 0) > 0)) && (
                 <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>
+                  {result.areaM2Actual != null && (
+                    <div>Powierzchnia hali: {new Intl.NumberFormat("pl-PL").format(result.areaM2Actual)} m²</div>
+                  )}
+                  {result.areaPricingCapped && result.areaM2Pricing != null && (
+                    <div>Powierzchnia do ceny bazowej: {new Intl.NumberFormat("pl-PL").format(result.areaM2Pricing)} m² (maks. próg cennika)</div>
+                  )}
                   {result.base.totalBase != null && (
                     <div>Cena bazowa: {new Intl.NumberFormat("pl-PL").format(result.base.totalBase)} zł</div>
                   )}

@@ -112,6 +112,14 @@ export interface PricingResult {
   totalPln: number;
   /** Dopłaty automatyczne (np. za wysokość) – do pokazania w UI, nie w liście „Dodatki płatne”. */
   automaticSurcharges?: AutomaticSurchargeItem[];
+  /** Rzeczywista powierzchnia hali (width × length). */
+  areaM2Actual?: number;
+  /** Powierzchnia użyta do doboru rekordu bazowego cennika (capped do max progu wariantu). */
+  areaM2Pricing?: number;
+  /** true gdy powierzchnia wejściowa przekracza maks. próg cennika i cena bazowa liczona z progu. */
+  areaPricingCapped?: boolean;
+  /** Wartość progu (m²), gdy areaPricingCapped === true. */
+  areaPricingCapValue?: number;
   errorMessage?: string;
 }
 
