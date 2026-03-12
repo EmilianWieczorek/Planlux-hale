@@ -323,6 +323,9 @@ body.pdf-export{
   max-width: 100%;
 }
 .plx-offer .pills{ display:flex; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.plx-offer .list{ margin: 0; padding-left: 18px; list-style-type: disc; }
+.plx-offer .list li{ margin-bottom: 6px; font-size: 11px; line-height: 1.35; color: var(--ink); }
+.plx-offer .list li.muted{ color: var(--muted, #666); }
 .plx-offer .pill{
   display:inline-flex;
   align-items:center;

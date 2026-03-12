@@ -7,6 +7,7 @@
 import { mergePdfOverrides, type PdfOverrides } from "./pdfOverrides";
 import type { GeneratePdfPayload } from "@planlux/shared";
 import { formatStandardLabel } from "../features/kalkulator/formatStandardLabel";
+import { isRendererDebug } from "../utils/env";
 
 export type OfferStatus = "DRAFT" | "READY_TO_SEND" | "SENT" | "ACCEPTED" | "REJECTED";
 
@@ -58,11 +59,21 @@ export interface OfferDraft {
    * STANDARD HALI (informacyjny, nie wpływa na cenę) – nowy stan UI.
    * Źródło: standard_included (w praktyce: pricingData.standard z cache).
    */
-  selectedStandards?: Array<{ name: string; description: string }>;
+  selectedStandards?: Array<{ name: string; description: string; widthM?: string; heightM?: string; qty?: number }>;
   /** Legacy: dodatki przekazywane do calculatePrice (nazwa + ilosc). */
   addons: Array<{ nazwa: string; ilosc: number }>;
   /** Legacy: snapshot standardów do trybu CHARGE_EXTRA (stary UI). Pozostawione dla kompatybilności, ale UI już go nie używa. */
   standardSnapshot: Array<{ element: string; pricingMode: "INCLUDED_FREE" | "CHARGE_EXTRA" }>;
+  /**
+   * STANDARD: Brama segmentowa (w cenie). Jedno źródło prawdy dla wymiarów i ilości.
+   * Inline editor w STANDARD HALI czyta i zapisuje tutaj.
+   */
+  segmentGateStandard?: {
+    selected: boolean;
+    widthM: number;
+    heightM: number;
+    qty: number;
+  };
   /**
    * STANDARD: System rynnowy (sterowany ze Standardów).
    * enabled jest pochodne od selectedStandards (czy użytkownik dodał pozycję "system rynnowy"),
@@ -120,6 +131,7 @@ function createEmptyDraft(): OfferDraft {
     clientPhone: "",
     selectedAddons: [],
     selectedStandards: [],
+    segmentGateStandard: { selected: false, widthM: 4, heightM: 4, qty: 1 },
     addons: [],
     standardSnapshot: [],
     gutterStandard: { pricingMode: "INCLUDED", calcMode: "BY_LENGTH", sides: 2 },
@@ -298,7 +310,7 @@ export const offerDraftStore = {
   setClientNip: (v: string) => setState((s) => ({ ...s, clientNip: v })),
   setClientEmail: (v: string) => setState((s) => ({ ...s, clientEmail: v })),
   setClientPhone: (v: string) => setState((s) => ({ ...s, clientPhone: v })),
-  setSelectedStandards: (v: Array<{ name: string; description: string }>) =>
+  setSelectedStandards: (v: Array<{ name: string; description: string; widthM?: string; heightM?: string }>) =>
     setState((s) => ({ ...s, selectedStandards: v })),
   setSelectedAddons: (v: Array<{ name: string; price: number; unit?: string; quantity: number; optionKey?: string }>) =>
     setState((s) => ({
@@ -307,6 +319,8 @@ export const offerDraftStore = {
       // keep legacy shape in sync for calculatePrice (no pricing data needed there)
       addons: v.map((a) => ({ nazwa: a.name, ilosc: a.quantity })),
     })),
+  setSegmentGateStandard: (v: OfferDraft["segmentGateStandard"]) =>
+    setState((s) => ({ ...s, segmentGateStandard: v ?? s.segmentGateStandard })),
   setGutterStandard: (v: OfferDraft["gutterStandard"]) =>
     setState((s) => ({ ...s, gutterStandard: v ?? s.gutterStandard })),
   setAddons: (v: Array<{ nazwa: string; ilosc: number }>) => setState((s) => ({ ...s, addons: v })),
@@ -408,6 +422,26 @@ export const offerDraftStore = {
       clientName: loaded.clientName ?? state.clientName ?? "",
       selectedStandards: (loaded.selectedStandards ?? state.selectedStandards) as OfferDraft["selectedStandards"],
       selectedAddons,
+      segmentGateStandard: (() => {
+        const loadedSeg = loaded.segmentGateStandard as OfferDraft["segmentGateStandard"] | undefined;
+        if (loadedSeg && typeof loadedSeg.selected === "boolean") {
+          return {
+            selected: loadedSeg.selected,
+            widthM: Number(loadedSeg.widthM) || 4,
+            heightM: Number(loadedSeg.heightM) || 4,
+            qty: Math.max(1, Math.floor(Number(loadedSeg.qty) || 1)),
+          };
+        }
+        const standards = (loaded.selectedStandards ?? state.selectedStandards) as OfferDraft["selectedStandards"];
+        const gate = standards?.find((s) => /brama\s*segmentowa/i.test(String(s?.name)));
+        if (gate) {
+          const w = gate.widthM != null && String(gate.widthM).trim() !== "" ? Number(String(gate.widthM).replace(",", ".")) : 4;
+          const h = gate.heightM != null && String(gate.heightM).trim() !== "" ? Number(String(gate.heightM).replace(",", ".")) : 4;
+          const q = typeof gate.qty === "number" && gate.qty >= 1 ? gate.qty : 1;
+          return { selected: true, widthM: Number.isFinite(w) && w > 0 ? w : 4, heightM: Number.isFinite(h) && h > 0 ? h : 4, qty: Math.max(1, Math.floor(q)) };
+        }
+        return state.segmentGateStandard ?? { selected: false, widthM: 4, heightM: 4, qty: 1 };
+      })(),
       addons: Array.isArray(legacyAddons) ? legacyAddons.map((a) => ({ nazwa: String(a.nazwa ?? ""), ilosc: Number(a.ilosc ?? 0) || 0 })).filter((a) => a.nazwa) : state.addons,
       standardSnapshot: loaded.standardSnapshot ?? state.standardSnapshot,
       gutterStandard: (loaded.gutterStandard ?? state.gutterStandard) as OfferDraft["gutterStandard"],
@@ -456,6 +490,7 @@ export function buildPayloadFromDraft(
   opts?: { sellerName?: string }
 ): GeneratePdfPayload {
   const d = offerDraftStore.getState();
+  const isDebugLog = isRendererDebug();
   const w = parseFloat(d.widthM) || 0;
   const l = parseFloat(d.lengthM) || 0;
   const h = d.heightM ? parseFloat(d.heightM) : undefined;
@@ -487,33 +522,51 @@ export function buildPayloadFromDraft(
           return `System rynnowy: ${mbLabel}, ${sidesLabel}, ${calcLabel}, ${modeLabel}${priceLabel}`;
         })()
       : null;
-  // Standardy w PDF tylko gdy użytkownik faktycznie coś wybrał w dropdownie.
-  // Brak wyboru => pusta lista (bez fallbacku do wyników wyceny).
-  const standardInPrice =
-    selectedStandards.length > 0
-      ? [
-          ...selectedStandards.map((s) => ({
-            element: formatStandardLabel(String(s.name).trim()),
-            ilosc: 1,
-            jednostka: "szt",
-            wartoscRef: 0,
-            pricingMode: "INCLUDED_FREE",
-            uwagi: s.description ? String(s.description) : undefined,
-          })),
-          ...(gutterUwagi
-            ? [
-                {
-                  element: "System rynnowy",
-                  ilosc: 1,
-                  jednostka: "",
-                  wartoscRef: 0,
-                  pricingMode: "INCLUDED_FREE",
-                  uwagi: gutterUwagi,
-                },
-              ]
-            : []),
-        ]
-      : [];
+  function normalizeAddonDisplayKey(label: string): string {
+    return String(label ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  // Standardy w PDF. Brama segmentowa z segmentGateStandard (jedno źródło prawdy), reszta z selectedStandards.
+  const segmentGate = d.segmentGateStandard;
+  const standardInPrice = (() => {
+    const raw: Array<{ element: string; ilosc: number; jednostka: string; wartoscRef: number; pricingMode: "INCLUDED_FREE"; uwagi?: string }> = [];
+    if (segmentGate?.selected && segmentGate.widthM > 0 && segmentGate.heightM > 0) {
+      const dimsLabel = `${new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(segmentGate.widthM)} × ${new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(segmentGate.heightM)} m`;
+      raw.push({
+        element: `Brama segmentowa — ${dimsLabel}`,
+        ilosc: Math.max(1, Math.floor(segmentGate.qty)),
+        jednostka: "szt",
+        wartoscRef: 0,
+        pricingMode: "INCLUDED_FREE",
+      });
+    }
+    selectedStandards
+      .filter((s) => !/brama\s*segmentowa/i.test(String(s.name)))
+      .forEach((s) => {
+        const name = String(s.name).trim();
+        const isGutter = /system\s*rynnowy/i.test(name);
+        const element = isGutter ? "System rynnowy" : formatStandardLabel(name);
+        const qty = typeof s.qty === "number" && s.qty >= 1 ? Math.floor(s.qty) : 1;
+        raw.push({
+          element,
+          ilosc: qty,
+          jednostka: isGutter ? "" : "szt",
+          wartoscRef: 0,
+          pricingMode: "INCLUDED_FREE" as const,
+          uwagi: isGutter ? undefined : (s.description ? String(s.description) : undefined),
+        });
+      });
+    const seen = new Set<string>();
+    return raw.filter((item) => {
+      const key = normalizeAddonDisplayKey(item.element);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  })();
   return {
     userId,
     offerNumber: d.offerNumber?.trim() || "—",

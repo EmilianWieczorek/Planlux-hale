@@ -18,9 +18,12 @@ export function parseHeightCondition(condition: string | null | undefined): Heig
   if (!raw) return null;
   try {
     const normalized = raw.replace(/,/g, ".").replace(/\s+/g, " ");
-    const rangeMatch = normalized.match(
-      /^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)(?:\s*m)?$/i
-    );
+    /**
+     * Accept both pure ranges ("5.01-6 m") and prefixed strings from DB
+     * (e.g. "wysokość 5.01-6 m", "wysokosc 5.01–6 m").
+     * We extract the first "min-max" numeric range anywhere in the string.
+     */
+    const rangeMatch = normalized.match(/(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)(?:\s*m)?/i);
     if (rangeMatch) {
       const min = parseFloat(rangeMatch[1]);
       const max = parseFloat(rangeMatch[2]);

@@ -120,6 +120,8 @@ export interface PricingResult {
   areaPricingCapped?: boolean;
   /** Wartość progu (m²), gdy areaPricingCapped === true. */
   areaPricingCapValue?: number;
+  /** Stawka za 1 m² użyta do wyliczenia ceny bazowej (zł/m²). Do prezentacji w UI. */
+  baseUnitPriceApplied?: number;
   errorMessage?: string;
 }
 

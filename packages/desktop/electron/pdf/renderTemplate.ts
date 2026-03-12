@@ -100,7 +100,7 @@ function buildReplacements(p: OfferPdfPayload): Record<string, string> {
       p.addonsPillsHtml != null && String(p.addonsPillsHtml).trim() !== ""
         ? p.addonsPillsHtml
         : '<span class="pill">Brak dodatków</span>',
-    "{{standardListHtml}}": p.standardListHtml,
+    "{{standardListHtml}}": p.standardListHtml ?? "",
     // Legacy aliases – same values as canonical so old template copies still fill
     "{{client_name}}": clientName,
     "{{phone}}": clientPhone,

@@ -19,7 +19,7 @@ import type {
   FallbackReason,
 } from "./types";
 import { toNumber, normalizeJednostka } from "./normalize";
-import { heightInRange } from "./parseHeightCondition";
+import { heightInRange, parseHeightCondition } from "./parseHeightCondition";
 
 function normalizeCennik(rows: CennikRow[]): CennikRowNormalized[] {
   return rows.map((r) => ({
@@ -214,8 +214,8 @@ function computeAdditions(
   const forVariant = dodatki.filter((d) => d.wariant_hali === variantHali);
 
   for (const sel of input.selectedAdditions) {
-    // Dopłata za wysokość jest zawsze liczona w computeAdvancedAdditions jako powierzchnia × stawka (mkw). Nie dublować z selectedAdditions.
-    if (/dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(sel.nazwa ?? "")) continue;
+    // Dopłata za wysokość jest liczona per variant w computeAdvancedAdditions z addons_surcharges. Nie dublować z selectedAdditions.
+    if (isHeightSurchargeAddonName(sel.nazwa ?? "")) continue;
     const candidates = forVariant.filter((d) => d.nazwa === sel.nazwa);
     const def = candidates.find((d) =>
       satisfiesCondition(d.warunek_type, d.warunek_min, d.warunek_max, input.heightM)
@@ -242,6 +242,72 @@ function computeAdditions(
   }
 
   return lines;
+}
+
+/**
+ * Czy nazwa addona odpowiada dopłacie za wysokość ściany bocznej (addons_surcharges).
+ * Nie hardcodujemy jednej nazwy – dopasowujemy typowe z bazy, np. "Dopłata za wysokość", "Dopłata ściana boczna".
+ */
+function isHeightSurchargeAddonName(nazwa: string | undefined): boolean {
+  if (!nazwa || typeof nazwa !== "string") return false;
+  const n = nazwa.trim().toLowerCase();
+  return (
+    /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(nazwa) ||
+    /dopłata\s*ściana\s*boczna|doplata\s*sciana\s*boczna/i.test(nazwa) ||
+    /dopłata\s*za\s*wysokość\s*ściany|doplata\s*za\s*wysokosc\s*sciany/i.test(nazwa)
+  );
+}
+
+/**
+ * Dla dopłaty za wysokość: zwraca zakres { min, max } z addona (warunek lub warunek_min/max).
+ */
+function getHeightAddonRange(
+  d: DodatkiRowNormalized
+): { min: number; max: number } | null {
+  if (d.warunek_min != null && d.warunek_max != null && Number.isFinite(d.warunek_min) && Number.isFinite(d.warunek_max)) {
+    return { min: d.warunek_min, max: d.warunek_max };
+  }
+  const parsed = parseHeightCondition(d.warunek ?? "");
+  if (parsed?.min != null && parsed?.max != null) return { min: parsed.min, max: parsed.max };
+  return null;
+}
+
+/**
+ * Wybiera addon dopłaty za wysokość: dopasowanie do przedziału lub ostatni próg jako otwarty powyżej.
+ * Jeśli height > max górnej granicy wszystkich progów, używana jest stawka z ostatniego progu.
+ */
+function selectHeightSurchargeAddon(
+  heightAddons: DodatkiRowNormalized[],
+  heightM: number
+): { addon: DodatkiRowNormalized; fallbackToLastRange: boolean } | null {
+  if (heightAddons.length === 0 || heightM == null || !Number.isFinite(heightM)) return null;
+  const withRange = heightAddons
+    .map((d) => ({ addon: d, range: getHeightAddonRange(d) }))
+    .filter((x): x is { addon: DodatkiRowNormalized; range: { min: number; max: number } } => x.range != null);
+  if (withRange.length === 0) return null;
+  const sorted = [...withRange].sort((a, b) => a.range.max - b.range.max);
+  const minOfAll = Math.min(...sorted.map((x) => x.range.min));
+  if (heightM < minOfAll) return null;
+  const match = sorted.find((x) => heightM >= x.range.min && heightM <= x.range.max);
+  if (match) return { addon: match.addon, fallbackToLastRange: false };
+  const maxOfAll = sorted[sorted.length - 1].range.max;
+  if (heightM > maxOfAll) return { addon: sorted[sorted.length - 1].addon, fallbackToLastRange: true };
+  return null;
+}
+
+/**
+ * Znajduje rekord dopłaty za wysokość dla danego wariantu i wysokości.
+ * Tylko rekordy z addons_surcharges dla tego variant i addon_name = dopłata ściana boczna / za wysokość.
+ * Jeśli brak rekordów dla wariantu – zwraca null (brak dopłaty).
+ */
+function findHeightSurchargeForVariantAndHeight(
+  dodatki: DodatkiRowNormalized[],
+  variantHali: string,
+  heightM: number
+): { addon: DodatkiRowNormalized; fallbackToLastRange: boolean } | null {
+  const forVariant = dodatki.filter((d) => d.wariant_hali === variantHali);
+  const heightAddons = forVariant.filter((d) => isHeightSurchargeAddonName(d.nazwa));
+  return selectHeightSurchargeAddon(heightAddons, heightM);
 }
 
 /** Rynny mb, bramy segmentowe, dopłata za wysokość, ręczne dopłaty. */
@@ -296,14 +362,11 @@ function computeAdvancedAdditions(
     }
   }
 
-  /** Dopłata za wysokość z cennika: pomijana gdy heightM >= 7 – wtedy stosowana jest automatyczna dopłata 40 zł/m² w calculatePrice (niewidoczna). */
-  if (input.heightM != null && input.areaM2 != null && input.areaM2 > 0 && input.heightM < 7) {
-    const doplata = forVariant.find(
-      (d) =>
-        /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(d.nazwa) &&
-        heightInRange(input.heightM, d.warunek, d.warunek_min, d.warunek_max)
-    );
-    if (doplata) {
+  /** Dopłata za wysokość: wyłącznie z addons_surcharges dla aktualnego variant; ostatni próg open-ended. */
+  if (input.heightM != null && input.areaM2 != null && input.areaM2 > 0) {
+    const selected = findHeightSurchargeForVariantAndHeight(dodatki, variantHali, input.heightM);
+    if (selected) {
+      const { addon: doplata, fallbackToLastRange } = selected;
       const stawka = doplata.stawka;
       const j = normalizeJednostka(doplata.jednostka ?? "");
       const hallAreaM2 = input.areaM2;
@@ -311,13 +374,26 @@ function computeAdvancedAdditions(
       const ilosc = isMkw ? hallAreaM2 : 1;
       const total = isMkw ? Math.round(hallAreaM2 * stawka) : Math.round(stawka);
       const jednostka = isMkw ? "m²" : (doplata.jednostka ?? "szt");
+      const warunekDisplay = fallbackToLastRange ? `> ${getHeightAddonRange(doplata)?.max ?? "?"} m` : (doplata.warunek ?? "");
+      if (process.env.LOG_LEVEL === "debug") {
+        // eslint-disable-next-line no-console
+        console.debug("[pricing][height] height surcharge (per variant)", {
+          variant: variantHali,
+          height: input.heightM,
+          matchedAddonName: doplata.nazwa,
+          matchedCondition: doplata.warunek ?? "",
+          matchedRate: stawka,
+          fallbackToLastRange,
+          surchargeTotal: total,
+        });
+      }
       lines.push({
         nazwa: doplata.nazwa,
         stawka,
         jednostka,
         ilosc,
         total,
-        warunek: doplata.warunek,
+        warunek: warunekDisplay || doplata.warunek,
       });
     }
   }
@@ -447,6 +523,25 @@ export function calculatePrice(
     };
   }
 
+  const br = base as BasePriceResult;
+  /** Dla area > maxSupportedArea: stawka za m² z progu (np. 1200), ale cena bazowa = realArea × ta stawka (nie cap powierzchni). */
+  const effectiveTotalBase =
+    areaPricingCapped ? Math.round(realArea * br.cenaPerM2) : base.totalBase;
+  const baseUnitPriceApplied = br.cenaPerM2;
+
+  if (process.env.LOG_LEVEL === "debug") {
+    const basePriceForSourceArea = areaPricingCapped ? pricingArea * br.cenaPerM2 : base.totalBase;
+    // eslint-disable-next-line no-console
+    console.debug("[pricing][calculate] base price computation", {
+      realArea,
+      sourceAreaForRate: pricingArea,
+      basePriceForSourceArea,
+      unitPriceAt1200: br.cenaPerM2,
+      computedBasePrice: effectiveTotalBase,
+      areaPricingCapped,
+    });
+  }
+
   const perimeterMb = input.perimeterMb ?? 2 * (input.widthM + input.lengthM);
   const additions = [
     ...computeAdditions(dodatki, input.variantHali, input, input.areaM2),
@@ -461,36 +556,20 @@ export function calculatePrice(
   const totalAdditions =
     additions.reduce((sum, a) => sum + a.total, 0) +
     standardChargeExtra.reduce((sum, s) => sum + (s.total ?? 0), 0);
-  let totalPln = base.totalBase + totalAdditions;
+  let totalPln = effectiveTotalBase + totalAdditions;
 
-  /** Dopłata za wysokość ściany bocznej ≥ 7 m: 40 zł/m² całej powierzchni. Wyświetlana w UI jako automatyczna dopłata. */
-  const sideWallHeightSurcharge =
-    input.heightM != null && input.heightM >= 7 && input.areaM2 != null && input.areaM2 > 0
-      ? Math.round(input.areaM2 * 40)
-      : 0;
-  totalPln += sideWallHeightSurcharge;
-
+  /** Automatyczne dopłaty (np. za wysokość) – z addons, ostatni próg otwarty powyżej; prezentacja w UI. */
   const automaticSurcharges: AutomaticSurchargeItem[] = [];
-  if (sideWallHeightSurcharge > 0) {
+  const heightAddon = additions.find((a) => isHeightSurchargeAddonName((a as { nazwa?: string }).nazwa));
+  if (heightAddon) {
+    const areaM2 = heightAddon.jednostka === "m²" || /mkw|m\s*²/i.test(heightAddon.jednostka) ? heightAddon.ilosc : input.areaM2;
     automaticSurcharges.push({
-      name: "Dopłata za wysokość ściany bocznej",
-      condition: "wysokość ≥ 7 m",
-      areaM2: input.areaM2,
-      ratePerM2: 40,
-      total: sideWallHeightSurcharge,
+      name: heightAddon.nazwa,
+      condition: (heightAddon.warunek ?? "").trim() || "wysokość w zakresie",
+      areaM2,
+      ratePerM2: heightAddon.stawka,
+      total: heightAddon.total,
     });
-  } else {
-    const heightAddon = additions.find((a) => /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(a.nazwa));
-    if (heightAddon) {
-      const areaM2 = heightAddon.jednostka === "m²" || /mkw|m\s*²/i.test(heightAddon.jednostka) ? heightAddon.ilosc : input.areaM2;
-      automaticSurcharges.push({
-        name: heightAddon.nazwa,
-        condition: (heightAddon.warunek ?? "").trim() || "wysokość w zakresie",
-        areaM2,
-        ratePerM2: heightAddon.stawka,
-        total: heightAddon.total,
-      });
-    }
   }
 
   if (process.env.LOG_LEVEL === "debug") {
@@ -498,16 +577,18 @@ export function calculatePrice(
     console.debug("[pricing] result", {
       areaM2: input.areaM2,
       pricingArea,
-      basePrice: base.totalBase,
-      sideWallHeightSurcharge,
+      effectiveBasePrice: effectiveTotalBase,
       totalPrice: totalPln,
       automaticSurchargesCount: automaticSurcharges.length,
     });
   }
 
+  const baseForResult =
+    areaPricingCapped ? { ...base, totalBase: effectiveTotalBase } : base;
+
   return {
     success: true,
-    base,
+    base: baseForResult,
     additions,
     standardInPrice,
     totalAdditions,
@@ -517,6 +598,7 @@ export function calculatePrice(
     areaM2Pricing: pricingArea,
     areaPricingCapped: areaPricingCapped || undefined,
     areaPricingCapValue,
+    baseUnitPriceApplied,
   };
 }
 
@@ -549,7 +631,7 @@ export function runPricingSelfTest(): boolean {
     return false;
   }
 
-  // Area above max: pricing area capped to maxSupportedArea (2000 for V1) → normal match, base = 80*2000
+  // Area above max: stawka z progu 2000 m² (80 zł/m²), cena bazowa = realArea * 80 = 2500 * 80 = 200000
   const r2 = calculatePrice(data, {
     variantHali: "V1",
     widthM: 50,
@@ -558,16 +640,20 @@ export function runPricingSelfTest(): boolean {
     selectedAdditions: [],
   });
   if (!r2.success || !r2.base.matched) {
-    console.error("Self-test fail: 2500 m² capped to max tier should succeed", r2);
+    console.error("Self-test fail: 2500 m² above max tier should succeed", r2);
     return false;
   }
   const base2 = r2.base as BasePriceResult;
-  if (base2.cenaPerM2 !== 80 || base2.totalBase !== 160000) {
-    console.error("Self-test fail: pricingArea capped to 2000 → 80 zł/m², totalBase 80*2000=160000", r2);
+  if (base2.cenaPerM2 !== 80 || base2.totalBase !== 200000) {
+    console.error("Self-test fail: unit rate from 2000 m² tier (80 zł/m²), totalBase = 2500*80=200000", r2);
     return false;
   }
   if (!r2.areaPricingCapped || r2.areaM2Actual !== 2500 || r2.areaM2Pricing !== 2000 || r2.areaPricingCapValue !== 2000) {
     console.error("Self-test fail: area diagnostics for capped case", r2);
+    return false;
+  }
+  if (r2.baseUnitPriceApplied !== 80) {
+    console.error("Self-test fail: baseUnitPriceApplied should be 80", r2);
     return false;
   }
 
@@ -650,8 +736,13 @@ export function runPricingSelfTest(): boolean {
     return false;
   }
 
-  // Side wall height surcharge: heightM >= 7 → 40 zł/m², not a visible addon
-  const r7 = calculatePrice(data, {
+  // Height surcharge: last tier open-ended (height 7 > 6 → use rate from 5.01–6 m tier)
+  const dodatkiHeight: DodatkiRow[] = [
+    { wariant_hali: "V1", nazwa: "Dopłata za wysokość", stawka: 15, jednostka: "mkw", warunek: "4,61–5 m" },
+    { wariant_hali: "V1", nazwa: "Dopłata za wysokość", stawka: 40, jednostka: "mkw", warunek: "wysokość 5,01-6 m" },
+  ];
+  const dataHeight: PricingEngineData = { cennik: data.cennik, dodatki: dodatkiHeight, standard: [] };
+  const r7 = calculatePrice(dataHeight, {
     variantHali: "V1",
     widthM: 25,
     lengthM: 40,
@@ -665,8 +756,9 @@ export function runPricingSelfTest(): boolean {
   }
   const expectedBase = 90 * 1000;
   const expectedSurcharge = 1000 * 40;
-  if ((r7.base as BasePriceResult).totalBase !== expectedBase || r7.additions.some((a) => /wysokość|wysokosc/i.test(a.nazwa))) {
-    console.error("Self-test fail: base 90*1000, no height addon line", r7);
+  const heightAddition = r7.additions.find((a) => isHeightSurchargeAddonName((a as { nazwa?: string }).nazwa));
+  if ((r7.base as BasePriceResult).totalBase !== expectedBase || !heightAddition || heightAddition.total !== expectedSurcharge) {
+    console.error("Self-test fail: base 90*1000, height addon with 40 zł/m² for 1000 m²", r7);
     return false;
   }
   if (r7.totalPln !== expectedBase + expectedSurcharge) {

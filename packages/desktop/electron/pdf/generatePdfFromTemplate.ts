@@ -89,6 +89,16 @@ export interface PriceOverride {
 
 const SPEC_FALLBACK = "(brak danych)";
 
+function isAutomaticHeightSurchargeAddition(name: string | undefined): boolean {
+  const n = (name ?? "").trim();
+  if (!n) return false;
+  return (
+    /dopłata\s*za\s*wysokość|doplata\s*za\s*wysokosc/i.test(n) ||
+    /dopłata\s*ściana\s*boczna|doplata\s*sciana\s*boczna/i.test(n) ||
+    /dopłata\s*za\s*wysokość\s*ściany|doplata\s*za\s*wysokosc\s*sciany/i.test(n)
+  );
+}
+
 /**
  * Map payload z IPC (GeneratePdfPayload) na format szablonu (OfferPdfPayload).
  * Technical spec (Konstrukcja, Dach, Ściany):
@@ -145,7 +155,19 @@ export function mapOfferDataToPayload(
     <td class="right">${formatCurrency(basePrice)} zł</td>
   </tr>`;
 
-  const addonsTableRows = (pr.additions ?? [])
+  const pdfAdditions = (pr.additions ?? []).filter((a) => !isAutomaticHeightSurchargeAddition(a.nazwa));
+  const pdfFilteredAutomaticHeightSurcharge = (pr.additions ?? []).length !== pdfAdditions.length;
+  if (pdfFilteredAutomaticHeightSurcharge && process.env.LOG_LEVEL === "debug") {
+    // eslint-disable-next-line no-console
+    console.debug("[pdf] filtered automatic height surcharge from additions", {
+      variant: o.variantHali,
+      heightM: o.heightM,
+      pdfFilteredAutomaticHeightSurcharge: true,
+      filteredCount: (pr.additions ?? []).length - pdfAdditions.length,
+    });
+  }
+
+  const addonsTableRows = pdfAdditions
     .map(
       (a) =>
         `<tr><td>${escapeHtml(a.nazwa)}${a.warunek ? ` (${escapeHtml(a.warunek)})` : ""}</td><td>${a.ilosc} ${a.jednostka}</td><td>${formatCurrency(a.stawka)} zł</td><td class="right">${formatCurrency(a.total)} zł</td></tr>`
@@ -163,28 +185,62 @@ export function mapOfferDataToPayload(
 
   const breakdownRowsHtml = baseTableRow + addonsTableRows + standardChargeRows;
 
-  const addonsListHtml = (pr.additions ?? [])
+  const addonsListHtml = pdfAdditions
     .map((a) => `<li>${escapeHtml(a.nazwa)} – ${a.ilosc} ${a.jednostka} (${formatCurrency(a.total)} zł)</li>`)
     .join("");
 
+  function renderAddonTag(label: string): string {
+    return `<span class="pill"><span class="pill__dot"></span> ${escapeHtml(label)}</span>`;
+  }
+
+  function normalizeAddonDisplayKey(label: string): string {
+    return String(label ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  function formatStandardAddonLabel(s: { element: string; ilosc?: number; jednostka?: string }): string {
+    const unit = (s.jednostka && String(s.jednostka).trim() !== "" ? s.jednostka : "szt") as string;
+    if (unit === "") return s.element;
+    const qty = s.ilosc != null ? s.ilosc : 1;
+    return `${s.element} – ${qty} ${unit}`;
+  }
+
+  const paidAddonsPills =
+    pdfAdditions.length > 0
+      ? pdfAdditions.map((a) => renderAddonTag(a.nazwa)).join("")
+      : "";
+
+  const standardItems = (pr.standardInPrice ?? []).slice();
+  const standardSeen = new Set<string>();
+  const dedupedStandardItems = standardItems.filter((s) => {
+    const key = normalizeAddonDisplayKey(s.element);
+    if (standardSeen.has(key)) return false;
+    standardSeen.add(key);
+    return true;
+  });
+
+  const standardPills = dedupedStandardItems
+    .map((s) => renderAddonTag(formatStandardAddonLabel({ element: s.element, ilosc: s.ilosc, jednostka: s.jednostka })))
+    .join("");
+
   const addonsPillsHtml =
-    (pr.additions ?? []).length > 0
-      ? (pr.additions ?? [])
-          .map((a) => `<span class="pill"><span class="pill__dot"></span> ${escapeHtml(a.nazwa)}</span>`)
-          .join("")
+    paidAddonsPills || standardPills
+      ? paidAddonsPills + standardPills
       : '<span class="pill">Brak dodatków</span>';
 
-  const standardListHtml = (pr.standardInPrice ?? [])
-    .map((s) => {
-      const mode = (s as { pricingMode?: string }).pricingMode;
-      const total = (s as { total?: number }).total;
-      const suffix =
-        mode === "CHARGE_EXTRA" && total != null
-          ? ` – dolicz ${formatCurrency(total)} zł`
-          : " – w cenie";
-      return `<li>${escapeHtml(s.element)} – ${s.ilosc} ${s.jednostka} (wart. ref. ${formatCurrency(s.wartoscRef)} zł)${suffix}${s.uwagi ? " – " + escapeHtml(s.uwagi) : ""}</li>`;
-    })
-    .join("");
+  const standardListHtml = "";
+
+  if (process.env.LOG_LEVEL === "debug") {
+    // eslint-disable-next-line no-console
+    console.debug("[pdf] standards payload", {
+      count: (pr.standardInPrice ?? []).length,
+      first: (pr.standardInPrice ?? []).slice(0, 3).map((x) => ({ element: x.element, uwagi: (x as { uwagi?: string }).uwagi })),
+    });
+    // eslint-disable-next-line no-console
+    console.debug("[pdf] rendered standards", { htmlLength: standardListHtml.length });
+  }
 
   const clientAddressOrInstall = (o.clientAddress ?? input.clientAddressOrInstall ?? "").trim() || undefined;
   const clientNameDisplay = (o.personName || o.companyName || o.clientName || "Klient").trim();

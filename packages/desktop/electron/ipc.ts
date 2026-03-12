@@ -1710,10 +1710,11 @@ export async function registerIpcHandlers(deps: {
           nowIso,
           nowIso
         );
+        logger.info("[offers] map status", { offerId, offerNumber: p.offerNumber, statusApp: "GENERATED", statusSupabase: "GENERATED" });
         await syncOfferToSupabase(offerId, userId, {
           offerNumber: p.offerNumber,
           offerNumberStatus: p.offerNumber?.startsWith("TEMP-") ? "TEMP" : "FINAL",
-          status: "DRAFT",
+          status: "GENERATED",
         });
         db.prepare("INSERT INTO event_log (id, offer_id, user_id, event_type, details_json) VALUES (?, ?, ?, 'OFFER_CREATED', ?)").run(
           uuid(),
@@ -2322,6 +2323,8 @@ export async function registerIpcHandlers(deps: {
                   WHERE id=?`
                 ).run(clientFirstName, clientLastName, companyName, d.clientNip ?? "", d.clientPhone ?? "", d.clientEmail ?? "", d.variantHali ?? "T18_T35_DACH", w, l, h, areaM2, nowIso, offerId);
               }
+              logger.info("[offers] save draft success (local update)", { offerId, offerNumber, statusApp: "IN_PROGRESS", statusSupabase: "DRAFT" });
+              await syncOfferToSupabase(offerId, user.id, { offerNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
             } else {
               if (hasClientAddress) {
                 db.prepare(
@@ -2346,6 +2349,7 @@ export async function registerIpcHandlers(deps: {
                   nowIso,
                   nowIso
                 );
+                logger.info("[offers] save draft success (local insert)", { offerId, offerNumber, statusApp: "IN_PROGRESS", statusSupabase: "DRAFT" });
                 await syncOfferToSupabase(offerId, user.id, { offerNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
               } else {
                 db.prepare(
@@ -2369,6 +2373,7 @@ export async function registerIpcHandlers(deps: {
                   nowIso,
                   nowIso
                 );
+                logger.info("[offers] save draft success (local insert)", { offerId, offerNumber, statusApp: "IN_PROGRESS", statusSupabase: "DRAFT" });
                 await syncOfferToSupabase(offerId, user.id, { offerNumber, offerNumberStatus: "TEMP", status: "DRAFT" });
               }
             }
@@ -2663,7 +2668,7 @@ export async function registerIpcHandlers(deps: {
     }
   });
 
-  /** CRM: usuń ofertę tylko gdy status = IN_PROGRESS. Usuwa powiązane: pdfs, email_history, offer_audit, outbox, offers_crm. */
+  /** CRM: usuń ofertę (soft-free: kasuje rekord i powiązane lokalne). Best-effort usuwa też z Supabase public.offers. */
   ipcMain.handle("planlux:deleteOffer", async (_, offerId: string) => {
     try {
       const user = requireAuth();
@@ -2672,9 +2677,6 @@ export async function registerIpcHandlers(deps: {
       if (tables.length === 0) return { ok: false, error: "Brak tabeli ofert", code: "ERR_NO_TABLE" };
       const offer = db.prepare("SELECT id, status, user_id FROM offers_crm WHERE id = ?").get(offerId) as { id: string; status: string; user_id: string } | undefined;
       if (!offer) return { ok: false, error: "Oferta nie znaleziona", code: "ERR_NOT_FOUND" };
-      if (offer.status !== "IN_PROGRESS") {
-        return { ok: false, error: "Nie można usunąć oferty po zatwierdzeniu", code: "ERR_STATUS" };
-      }
       const canAccess = offer.user_id === user.id || (user.role === "ADMIN" || user.role === "SZEF");
       if (!canAccess) return { ok: false, error: "Forbidden", code: "ERR_AUTH" };
       db.transaction(() => {
@@ -2694,7 +2696,15 @@ export async function registerIpcHandlers(deps: {
         }
         db.prepare("DELETE FROM offers_crm WHERE id = ?").run(offerId);
       })();
-      logger.info("[crm] deleteOffer", { offerId, userId: user.id });
+      if (getSupabase) {
+        try {
+          const supabase = getSupabase();
+          await supabase.from("offers").delete().eq("id", offerId);
+        } catch (e) {
+          logger.warn("[supabase][offers] deleteOffer failed (best-effort)", { offerId, error: e });
+        }
+      }
+      logger.info("[offers] delete success", { offerId, userId: user.id, status: offer.status });
       return { ok: true };
     } catch (e) {
       logger.error("[crm] deleteOffer failed", e);

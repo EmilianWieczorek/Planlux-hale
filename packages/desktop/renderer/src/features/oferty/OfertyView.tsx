@@ -52,6 +52,7 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
   const [loading, setLoading] = useState(false);
 
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const SYNC_TIMEOUT_MS = 4000;
 
   useEffect(() => {
@@ -122,6 +123,22 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
     await api("shell:openPath", filePath);
   };
 
+  const handleDeleteOffer = async (offerId: string, status: string) => {
+    const ok = window.confirm("Usunąć ofertę? Tej operacji nie da się cofnąć.");
+    if (!ok) return;
+    console.debug("[offers] delete start", { offerId, status });
+    const r = (await api("planlux:deleteOffer", offerId)) as { ok: boolean; error?: string; code?: string };
+    if (r?.ok) {
+      console.debug("[offers] delete success", { offerId });
+      setOffers((prev) => prev.filter((o) => o.id !== offerId));
+      setToast("Usunięto ofertę.");
+    } else {
+      const msg = r?.error ?? "Nie udało się usunąć oferty.";
+      console.debug("[offers] delete error", { offerId, code: r?.code, msg });
+      setToast(msg);
+    }
+  };
+
   if (selectedOfferId) {
     return (
       <OfferDetailsView
@@ -140,6 +157,16 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
 
   return (
     <Box>
+      <Snackbar
+        open={!!toast}
+        autoHideDuration={3500}
+        onClose={() => setToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="info" onClose={() => setToast(null)}>
+          {toast}
+        </Alert>
+      </Snackbar>
       <Snackbar
         open={!!syncError}
         autoHideDuration={5000}
@@ -209,6 +236,9 @@ export function OfertyView({ api, userId, isAdmin, online, onEditOffer }: Props)
                   </Button>
                   <Button size="small" sx={{ ml: 1 }} onClick={() => setSelectedOfferId(o.id)}>
                     Otwórz
+                  </Button>
+                  <Button size="small" color="error" sx={{ ml: 1 }} onClick={() => handleDeleteOffer(o.id, o.status)}>
+                    Usuń
                   </Button>
                 </TableCell>
               </TableRow>

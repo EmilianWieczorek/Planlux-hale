@@ -3,6 +3,7 @@ import { useOfferDraft } from "../../state/useOfferDraft";
 import { buildPayloadFromDraft, offerDraftStore, requestSyncTempNumbers, type OfferStatus } from "../../state/offerDraftStore";
 import { buildPdfFileName as buildPdfFileNameFromShared, normalizeErrorMessage as normalizeErrorMessageFromShared } from "@planlux/shared";
 import type { PricingEngineData } from "@planlux/shared";
+import { isRendererDebug } from "../../utils/env";
 
 /** Bezpieczne wywołanie – fallback gdy import nie zadziała (np. cache Vite). */
 const buildPdfFileName =
@@ -11,8 +12,21 @@ const buildPdfFileName =
     : (params: { sellerName?: string; clientCompany?: string; offerNumber: string }) =>
         `PLANLUX-Oferta-${params.clientCompany || params.sellerName || "Handlowiec"}-${(params.offerNumber || "—").replace(/\//g, "-")}.pdf`;
 
-/** W rendererze (Vite) nie ma globalnego process – używamy import.meta.env. */
-const isDebugLog = typeof import.meta !== "undefined" && !!import.meta.env?.DEV;
+const isDebugLog = isRendererDebug();
+
+function isSegmentalGateStandard(name: string): boolean {
+  return /brama\s*segmentowa/i.test(name);
+}
+
+/** True when a selected standard is segmental gate but width/height are missing or invalid. */
+function segmentalGateMissingDimensions(standards: Array<{ name: string; widthM?: string; heightM?: string }>): boolean {
+  return standards.some((s) => {
+    if (!isSegmentalGateStandard(s.name)) return false;
+    const w = s.widthM != null && String(s.widthM).trim() !== "" ? Number(String(s.widthM).replace(",", ".")) : null;
+    const h = s.heightM != null && String(s.heightM).trim() !== "" ? Number(String(s.heightM).replace(",", ".")) : null;
+    return !(w != null && Number.isFinite(w) && w > 0 && h != null && Number.isFinite(h) && h > 0);
+  });
+}
 
 /** Normalizacja błędu do tekstu; fallback gdy import z @planlux/shared nie jest funkcją (runtime/bundling). */
 function safeNormalizeError(error: unknown): string {
@@ -184,7 +198,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
   const widthM = draft.widthM;
   const lengthM = draft.lengthM;
   const heightM = draft.heightM;
-  const selectedStandards = (draft.selectedStandards ?? []) as Array<{ name: string; description: string }>;
+  const selectedStandards = (draft.selectedStandards ?? []) as Array<{ name: string; description: string; widthM?: string; heightM?: string }>;
   const selectedAddons = (draft.selectedAddons ?? []) as Array<{ name: string; price: number; unit?: string; quantity: number }>;
   const gutterStandard = (draft.gutterStandard ?? { pricingMode: "INCLUDED", calcMode: "BY_LENGTH", sides: 2 }) as {
     pricingMode: "INCLUDED" | "ADD";
@@ -202,6 +216,9 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       String((item as { name?: unknown }).name) !== "Wybierz standard (w cenie, informacyjnie)"
   );
   const gutterSelected = actualSelectedStandards.some((s) => normalizeName(s?.name) === "system rynnowy");
+  const segmentGateStandard = draft.segmentGateStandard ?? { selected: false, widthM: 4, heightM: 4, qty: 1 };
+  const segmentGateMissingDims =
+    segmentGateStandard.selected && (segmentGateStandard.widthM <= 0 || segmentGateStandard.heightM <= 0);
   const rainGuttersAuto = draft.rainGuttersAuto ?? false;
   const gates = (draft.gates ?? []) as Array<{ width: number; height: number; quantity: number; unitPricePerM2?: number }>;
   const plate80 = draft.plate80 ?? false;
@@ -233,6 +250,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     areaM2Pricing?: number;
     areaPricingCapped?: boolean;
     areaPricingCapValue?: number;
+    baseUnitPriceApplied?: number;
   } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -598,22 +616,23 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
       return line != null && line.total != null && line.total > 0 ? { label: "Dopłata za wysokość", amount: line.total } : null;
     })();
 
-  /** Po zmianie wariantu: zostaw tylko dodatki/standardy dostępne dla tego wariantu; wyczyść bramy jeśli wariant nie ma bramy segmentowej. */
+  /** Po zmianie wariantu: zostaw tylko dodatki/standardy dostępne dla tego wariantu; wyczyść bramy jeśli wariant nie ma bramy segmentowej. Zachowaj pełne obiekty standardów (widthM, heightM dla bramy). */
   useEffect(() => {
     if (!pricingData) return;
     const d = offerDraftStore.getState();
     const currentAddons = (d.selectedAddons ?? []) as Array<{ name: string }>;
-    const currentStandards = (d.selectedStandards ?? []) as Array<{ name: string }>;
+    const currentStandards = (d.selectedStandards ?? []) as Array<{ name: string; description?: string; widthM?: string; heightM?: string }>;
     const currentGates = d.gates ?? [];
     const availableAddonNames = new Set(addonOptions.map((o) => o.name));
-    const availableStandardNames = new Set(standardOptions.map((o) => o.name));
+    const norm = (x: string) => String(x ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+    const availableStandardNames = new Set(standardOptions.map((o) => norm(o.name)));
     const nextAddons = currentAddons.filter((a) => availableAddonNames.has(a.name));
-    const nextStandards = currentStandards.filter((s) => availableStandardNames.has((s as { name?: string }).name ?? ""));
+    const nextStandards = currentStandards.filter((s) => availableStandardNames.has(norm(s.name ?? "")));
     if (nextAddons.length !== currentAddons.length || nextAddons.some((a, i) => a.name !== currentAddons[i]?.name)) {
       actions.setSelectedAddons(nextAddons as Array<{ name: string; price: number; unit?: string; quantity: number; optionKey?: string }>);
     }
-    if (nextStandards.length !== currentStandards.length || nextStandards.some((s, i) => (s as { name?: string }).name !== (currentStandards[i] as { name?: string })?.name)) {
-      actions.setSelectedStandards(nextStandards as Array<{ name: string; description: string }>);
+    if (nextStandards.length !== currentStandards.length || nextStandards.some((s, i) => s.name !== currentStandards[i]?.name)) {
+      actions.setSelectedStandards(nextStandards);
     }
     if (!sectionalGateRow && currentGates.length > 0) {
       actions.setGates([]);
@@ -1108,6 +1127,8 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
               standardOptions={standardOptions}
               selectedStandards={selectedStandards}
               onSelectedStandardsChange={(v) => actions.setSelectedStandards(v)}
+              segmentGateStandard={segmentGateStandard}
+              onSegmentGateStandardChange={(v) => actions.setSegmentGateStandard(v)}
               gutter={{
                 selected: gutterSelected,
                 pricingMode: gutterStandard.pricingMode,
@@ -1304,6 +1325,35 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
             >
               Zapisz wersję
             </button>
+            <button
+              onClick={async () => {
+                try {
+                  console.debug("[offers] save draft start", { draftId: draft.draftId, offerNumber: draft.offerNumber });
+                  // Ensure we have a TEMP offer number so the draft can show up in Oferty (Supabase list uses offer_number).
+                  if (!draft.offerNumber?.trim()) {
+                    const res = (await api("planlux:getNextOfferNumber")) as { ok: boolean; offerNumber?: string };
+                    if (res?.ok && res.offerNumber) actions.setOfferNumber(res.offerNumber);
+                  }
+                  const nextDraft = offerDraftStore.getState();
+                  const r = (await api("planlux:saveOfferDraft", nextDraft)) as { ok: boolean; code?: string; message?: string; error?: string };
+                  if (!r?.ok) {
+                    const msg = r.message ?? r.error ?? "Nie udało się zapisać wersji roboczej.";
+                    console.debug("[offers] save draft error", { msg, code: r.code });
+                    showToast(msg);
+                    return;
+                  }
+                  console.debug("[offers] save draft success", { draftId: nextDraft.draftId, offerNumber: nextDraft.offerNumber });
+                  showToast("Zapisano wersję roboczą.");
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  console.debug("[offers] save draft error", { msg });
+                  showToast(msg);
+                }
+              }}
+              style={styles.buttonSecondary}
+            >
+              Zapisz wersję roboczą
+            </button>
             {(draft.versions?.length ?? 0) > 0 && (
               <>
                 <label style={styles.label}>Wersje</label>
@@ -1421,7 +1471,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
                     color: tokens.color.text ?? "#1a1a1a",
                   }}
                 >
-                  Powierzchnia hali przekracza maksymalny próg cennika {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m². Cena bazowa została obliczona według progu {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m².
+                  Dla hal powyżej {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m² zastosowano stawkę za 1 m² z progu {new Intl.NumberFormat("pl-PL").format(result.areaPricingCapValue)} m².
                 </div>
               )}
               {result.base?.matched && result.base?.fallbackUsed && result.base?.fallbackInfo && !result.areaPricingCapped && (
@@ -1437,13 +1487,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
               {(result.base?.matched && (result.base.totalBase != null || (result.totalAdditions ?? 0) > 0)) && (
                 <div style={{ fontSize: tokens.font.size.sm, color: tokens.color.textMuted, marginTop: 8 }}>
                   {result.areaM2Actual != null && (
-                    <div>Powierzchnia hali: {new Intl.NumberFormat("pl-PL").format(result.areaM2Actual)} m²</div>
+                    <div>Powierzchnia rzeczywista hali: {new Intl.NumberFormat("pl-PL").format(result.areaM2Actual)} m²</div>
+                  )}
+                  {result.baseUnitPriceApplied != null && (
+                    <div>Stawka bazowa za m²: {new Intl.NumberFormat("pl-PL").format(result.baseUnitPriceApplied)} zł/m²</div>
                   )}
                   {result.areaPricingCapped && result.areaM2Pricing != null && (
-                    <div>Powierzchnia do ceny bazowej: {new Intl.NumberFormat("pl-PL").format(result.areaM2Pricing)} m² (maks. próg cennika)</div>
+                    <div>Stawka z progu: {new Intl.NumberFormat("pl-PL").format(result.areaM2Pricing)} m²</div>
                   )}
                   {result.base.totalBase != null && (
-                    <div>Cena bazowa: {new Intl.NumberFormat("pl-PL").format(result.base.totalBase)} zł</div>
+                    <div>Cena bazowa (dla całej powierzchni): {new Intl.NumberFormat("pl-PL").format(result.base.totalBase)} zł</div>
                   )}
                   {(result.totalAdditions ?? 0) > 0 && (
                     <div>Dodatki: {new Intl.NumberFormat("pl-PL").format(result.totalAdditions)} zł</div>
@@ -1517,13 +1570,16 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
           {result && !result.success && (
             <div style={styles.diag}>{result.errorMessage ?? "Brak dopasowania ceny"}</div>
           )}
+          {segmentGateMissingDims && (
+            <div style={styles.diag}>Podaj wymiary bramy segmentowej (szerokość i wysokość w m).</div>
+          )}
           {!pricingData && (
             <p style={{ color: tokens.color.textMuted }}>
               {syncing ? "Ładowanie bazy cennika…" : (syncStatus === "error" ? (syncError ?? "Błąd synchronizacji. Kliknij „Synchronizuj bazę” (wymaga internetu).") : "Brak bazy cennika. Kliknij „Synchronizuj bazę” (wymaga internetu).")}
             </p>
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
-            <button onClick={generatePdf} disabled={generating || !result?.success} style={styles.button} data-testid="offer-generate-pdf">
+            <button onClick={generatePdf} disabled={generating || !result?.success || segmentGateMissingDims} style={styles.button} data-testid="offer-generate-pdf">
               {generating ? "Generowanie..." : "Generuj PDF"}
             </button>
             {(generating || hasGeneratedPdf || pdfStatusMessage) && (
