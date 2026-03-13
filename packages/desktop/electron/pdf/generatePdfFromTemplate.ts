@@ -13,7 +13,7 @@ import path from "path";
 import fs from "fs";
 import { pathToFileURL } from "url";
 import { app } from "electron";
-import type { GeneratePdfPayload } from "@planlux/shared";
+import type { GeneratePdfPayload, GeneratePdfAddition, GeneratePdfStandardInPrice } from "@planlux/shared";
 import { buildPdfFileName, escapeHtml, formatCurrency } from "@planlux/shared";
 import type { PdfTemplateConfig, PdfEditorContent } from "@planlux/shared";
 import { DEFAULT_PDF_EDITOR_PAGE2 } from "@planlux/shared";
@@ -155,7 +155,7 @@ export function mapOfferDataToPayload(
     <td class="right">${formatCurrency(basePrice)} zł</td>
   </tr>`;
 
-  const pdfAdditions = (pr.additions ?? []).filter((a) => !isAutomaticHeightSurchargeAddition(a.nazwa));
+  const pdfAdditions = (pr.additions ?? []).filter((a: GeneratePdfAddition) => !isAutomaticHeightSurchargeAddition(a.nazwa));
   const pdfFilteredAutomaticHeightSurcharge = (pr.additions ?? []).length !== pdfAdditions.length;
   if (pdfFilteredAutomaticHeightSurcharge && process.env.LOG_LEVEL === "debug") {
     // eslint-disable-next-line no-console
@@ -169,14 +169,14 @@ export function mapOfferDataToPayload(
 
   const addonsTableRows = pdfAdditions
     .map(
-      (a) =>
+      (a: GeneratePdfAddition) =>
         `<tr><td>${escapeHtml(a.nazwa)}${a.warunek ? ` (${escapeHtml(a.warunek)})` : ""}</td><td>${a.ilosc} ${a.jednostka}</td><td>${formatCurrency(a.stawka)} zł</td><td class="right">${formatCurrency(a.total)} zł</td></tr>`
     )
     .join("");
 
   const standardChargeRows = (pr.standardInPrice ?? [])
-    .filter((s) => (s as { pricingMode?: string }).pricingMode === "CHARGE_EXTRA" && (s as { total?: number }).total != null)
-    .map((s) => {
+    .filter((s: GeneratePdfStandardInPrice & { pricingMode?: string; total?: number }) => s.pricingMode === "CHARGE_EXTRA" && s.total != null)
+    .map((s: GeneratePdfStandardInPrice & { total?: number; mbValue?: number }) => {
       const total = (s as { total?: number }).total!;
       const qty = (s as { mbValue?: number }).mbValue ?? s.ilosc;
       return `<tr><td>${escapeHtml(s.element)} (standard)</td><td>${qty} ${s.jednostka}</td><td>${formatCurrency(s.wartoscRef)} zł</td><td class="right">${formatCurrency(total)} zł</td></tr>`;
@@ -186,7 +186,7 @@ export function mapOfferDataToPayload(
   const breakdownRowsHtml = baseTableRow + addonsTableRows + standardChargeRows;
 
   const addonsListHtml = pdfAdditions
-    .map((a) => `<li>${escapeHtml(a.nazwa)} – ${a.ilosc} ${a.jednostka} (${formatCurrency(a.total)} zł)</li>`)
+    .map((a: GeneratePdfAddition) => `<li>${escapeHtml(a.nazwa)} – ${a.ilosc} ${a.jednostka} (${formatCurrency(a.total)} zł)</li>`)
     .join("");
 
   function renderAddonTag(label: string): string {
@@ -209,12 +209,12 @@ export function mapOfferDataToPayload(
 
   const paidAddonsPills =
     pdfAdditions.length > 0
-      ? pdfAdditions.map((a) => renderAddonTag(a.nazwa)).join("")
+      ? pdfAdditions.map((a: GeneratePdfAddition) => renderAddonTag(a.nazwa)).join("")
       : "";
 
   const standardItems = (pr.standardInPrice ?? []).slice();
   const standardSeen = new Set<string>();
-  const dedupedStandardItems = standardItems.filter((s) => {
+  const dedupedStandardItems = standardItems.filter((s: GeneratePdfStandardInPrice) => {
     const key = normalizeAddonDisplayKey(s.element);
     if (standardSeen.has(key)) return false;
     standardSeen.add(key);
@@ -222,7 +222,7 @@ export function mapOfferDataToPayload(
   });
 
   const standardPills = dedupedStandardItems
-    .map((s) => renderAddonTag(formatStandardAddonLabel({ element: s.element, ilosc: s.ilosc, jednostka: s.jednostka })))
+    .map((s: GeneratePdfStandardInPrice) => renderAddonTag(formatStandardAddonLabel({ element: s.element, ilosc: s.ilosc, jednostka: s.jednostka })))
     .join("");
 
   const addonsPillsHtml =
@@ -236,7 +236,7 @@ export function mapOfferDataToPayload(
     // eslint-disable-next-line no-console
     console.debug("[pdf] standards payload", {
       count: (pr.standardInPrice ?? []).length,
-      first: (pr.standardInPrice ?? []).slice(0, 3).map((x) => ({ element: x.element, uwagi: (x as { uwagi?: string }).uwagi })),
+      first: (pr.standardInPrice ?? []).slice(0, 3).map((x: GeneratePdfStandardInPrice) => ({ element: x.element, uwagi: x.uwagi })),
     });
     // eslint-disable-next-line no-console
     console.debug("[pdf] rendered standards", { htmlLength: standardListHtml.length });
@@ -338,6 +338,10 @@ export async function generatePdfFromTemplate(
 ): Promise<GeneratePdfFromTemplateResult> {
   const isE2E = process.env.PLANLUX_E2E === "1";
   const templateDir = getPdfTemplateDir();
+  logger.info("[PLANLUX_PDF_DEBUG] generatePdfFromTemplate start", {
+    previewMode: options?.previewMode ?? false,
+    testMode: options?.testMode ?? false,
+  });
   if (isE2E || process.env.PLANLUX_LOG_LEVEL === "debug") {
     const outDir = options?.previewMode ? getPdfPreviewDir() : getPdfOutputDir();
     logger.info("[E2E/pdf] pipeline start", {
@@ -480,7 +484,7 @@ export async function generatePdfFromTemplate(
   const editorContentForPage2 = { page2: mergedPage2 } as Partial<PdfEditorContent>;
 
   let html: string;
-  logger.info("[pdf] render z katalogu (pełna ścieżka)", path.resolve(templateDir));
+  logger.info("[PLANLUX_PDF_DEBUG] render from templateDir", { templateDir: path.resolve(templateDir) });
   logger.info("[pdf] page2 placeholders replaced with values", {
     konstrukcja: payload.constructionType ?? SPEC_FALLBACK,
     dach: payload.roofType ?? SPEC_FALLBACK,
@@ -506,6 +510,12 @@ export async function generatePdfFromTemplate(
   const offerId = `offer_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   const offerDir = path.join(tmpDir, offerId);
   const tempHtmlPath = path.join(offerDir, "index.html");
+  logger.info("[PLANLUX_PDF_DEBUG] temp paths", {
+    userData: baseDir,
+    tmpDir,
+    offerDir,
+    tempHtmlPath,
+  });
 
   try {
     await fs.promises.mkdir(offerDir, { recursive: true });
@@ -513,9 +523,12 @@ export async function generatePdfFromTemplate(
     const assetsDest = path.join(offerDir, "assets");
     if (fs.existsSync(assetsSrc)) {
       fs.cpSync(assetsSrc, assetsDest, { recursive: true });
-      logger.info("[pdf] assets copied to tmp", { dest: path.resolve(assetsDest), source: path.resolve(assetsSrc) });
+      logger.info("[PLANLUX_PDF_DEBUG] assets copied to tmp", {
+        dest: path.resolve(assetsDest),
+        source: path.resolve(assetsSrc),
+      });
     } else {
-      logger.warn("[pdf] template has no assets directory", path.resolve(assetsSrc));
+      logger.warn("[PLANLUX_PDF_DEBUG] template has no assets directory", path.resolve(assetsSrc));
     }
     diagnoseAssets(html, templateDir, offerDir, logger);
   } catch (e) {
@@ -534,7 +547,7 @@ export async function generatePdfFromTemplate(
   const chosenLogoFile = logoPngCopied ? "logo-bez-tla.png" : logoSvgCopied ? "logo-bez-tla.svg" : null;
   const logoSrcInHtml = chosenLogoFile ? `assets/${chosenLogoFile}` : null;
 
-  logger.info("[pdf] logo diagnostics", {
+  logger.info("[PLANLUX_PDF_DEBUG] logo diagnostics", {
     templateDir: path.resolve(templateDir),
     offerDir: path.resolve(offerDir),
     logoPngInTemplate,
@@ -552,7 +565,7 @@ export async function generatePdfFromTemplate(
         const svgContent = fs.readFileSync(logoSvgPath, "utf-8");
         const base64 = Buffer.from(svgContent, "utf-8").toString("base64");
         logoSrc = `data:image/svg+xml;base64,${base64}`;
-        logger.info("[pdf] logo: SVG wstrzyknięty jako data URI (stabilne w printToPDF)");
+      logger.info("[PLANLUX_PDF_DEBUG] logo: SVG injected as data URI");
       } catch (e) {
         logger.warn("[pdf] logo: nie udało się wczytać SVG, używam ścieżki względnej", e);
         logoSrc = "assets/logo-bez-tla.svg";
@@ -578,7 +591,7 @@ export async function generatePdfFromTemplate(
     const heroFallbackStyle =
       "<style>/* fallback gdy brak hero-bg-print-safe.png */ .hero,.plx-offer .hero,.plx-spec .hero,.page--spec .hero,.xd-terrain .hero{background-image:linear-gradient(165deg,#6b0d14 0%,#8b0f1b 25%,#c8102e 60%,#a80f0f 100%)!important;background-color:#8b0f1b!important}</style>";
     html = html.replace("</head>", heroFallbackStyle + "</head>");
-    logger.info("[pdf] hero background missing – zastosowano fallback (gradient)");
+    logger.info("[PLANLUX_PDF_DEBUG] hero background missing – applied gradient fallback");
   }
   const diagramPath = path.join(offerDir, "assets", "diagram-techniczny.png");
   if (!fs.existsSync(diagramPath)) {
@@ -595,13 +608,17 @@ export async function generatePdfFromTemplate(
   }
   try {
     fs.writeFileSync(tempHtmlPath, html, "utf-8");
-    logger.info("[pdf] temp HTML written", { path: tempHtmlPath, sizeBytes: Buffer.byteLength(html, "utf-8") });
+    logger.info("[PLANLUX_PDF_DEBUG] temp HTML written", {
+      path: tempHtmlPath,
+      sizeBytes: Buffer.byteLength(html, "utf-8"),
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.error("[pdf] write temp HTML failed", e);
     return { ok: false, error: `Zapis HTML: ${msg}`, stage: "HTML_WRITE_FAILED" };
   }
 
+  logger.info("[PLANLUX_PDF_DEBUG] calling runPrintToPdfFromFile", { tempHtmlPath });
   const printResult = await runPrintToPdfFromFile(tempHtmlPath, logger);
   try {
     if (fs.existsSync(offerDir)) fs.rmSync(offerDir, { recursive: true });

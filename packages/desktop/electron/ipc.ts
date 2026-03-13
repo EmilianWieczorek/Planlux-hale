@@ -701,9 +701,9 @@ export async function registerIpcHandlers(deps: {
       };
 
       try {
-        const cennikVariants = [...new Set(pricingData.cennik.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
-        const addonVariants = [...new Set(pricingData.dodatki.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
-        const standardVariants = [...new Set(pricingData.standard.map((r) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const cennikVariants = [...new Set(pricingData.cennik.map((r: CennikRow) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const addonVariants = [...new Set(pricingData.dodatki.map((r: DodatkiRow) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
+        const standardVariants = [...new Set(pricingData.standard.map((r: StandardRow) => String((r as unknown as { variant?: string }).variant ?? "").trim()).filter(Boolean))];
         const missingAddons = cennikVariants.filter((v) => !addonVariants.includes(v));
         const missingStandard = cennikVariants.filter((v) => !standardVariants.includes(v));
         logger.info("[pricing][supabase] addon sample", pricingData.dodatki[0] ?? null);
@@ -719,7 +719,7 @@ export async function registerIpcHandlers(deps: {
       const variantIds = [
         ...new Set(
           pricingData.cennik
-            .map((r) => String((r as unknown as { variant?: string; wariant_hali?: string }).variant ?? (r as unknown as { wariant_hali?: string }).wariant_hali ?? "").trim())
+            .map((r: CennikRow) => String((r as unknown as { variant?: string; wariant_hali?: string }).variant ?? (r as unknown as { wariant_hali?: string }).wariant_hali ?? "").trim())
             .filter(Boolean)
         ),
       ];
@@ -911,7 +911,7 @@ export async function registerIpcHandlers(deps: {
       });
       const selectedVariant = String(inp.variantHali ?? "").trim();
       const matchingCennikRows = data.cennik.filter(
-        (r) =>
+        (r: CennikRow) =>
           String((r as unknown as { variant?: string }).variant ?? (r as unknown as { wariant_hali?: string }).wariant_hali ?? "").trim() === selectedVariant
       );
       logger.info("[pricing][calculate] matching cennik rows", { count: matchingCennikRows.length });
@@ -1841,6 +1841,9 @@ export async function registerIpcHandlers(deps: {
     options?: GeneratePdfFromTemplateOptions | null,
     pdfOverrides?: unknown
   ): Promise<PdfHandlerResult> {
+    logger.info("[PLANLUX_PDF_DEBUG] pdf handler start", {
+      timeoutMs: PDF_HANDLER_TIMEOUT_MS,
+    });
     const timeoutPromise = new Promise<PdfHandlerResult>((resolve) => {
       setTimeout(() => resolve({ ok: false, error: "Generowanie PDF trwało zbyt długo (timeout). Spróbuj ponownie." }), PDF_HANDLER_TIMEOUT_MS);
     });
@@ -1849,6 +1852,11 @@ export async function registerIpcHandlers(deps: {
         handlePdfGenerate(offerData, templateConfig, options, pdfOverrides as import("./pdf/generatePdfFromTemplate").PdfOverridesForGenerator | null | undefined),
         timeoutPromise,
       ]);
+      logger.info("[PLANLUX_PDF_DEBUG] pdf handler outcome", {
+        ok: outcome.ok,
+        stage: (outcome as { stage?: string }).stage ?? null,
+        error: outcome.ok ? null : (outcome as { error?: string }).error ?? null,
+      });
       if (outcome.ok === false) {
         await insertPdfFailed(offerData, outcome.error);
         const meta = (offerData as { offer?: { clientName?: string; widthM?: number; lengthM?: number }; offerNumber?: string }) || {};
@@ -4168,7 +4176,7 @@ console.log("[IPC] handler registered: planlux:checkInternet");
               storage: createOutboxStorage(db as Parameters<typeof createOutboxStorage>[0]),
               isOnline: () => true,
               sendEmail: createSendEmailForFlush(getDb),
-              sendGenericEmail: async (payload) => {
+              sendGenericEmail: async (payload: { to: string; subject: string; text?: string; html?: string }) => {
                 await sendGenericEmailSmtp({ to: payload.to, subject: payload.subject, text: payload.text, html: payload.html });
               },
             }) as { processed: number; failed: number; firstError?: { code?: string; message: string; details?: unknown } };

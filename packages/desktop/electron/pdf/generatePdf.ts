@@ -103,7 +103,7 @@ export async function runPrintToPdf(
   filePath: string,
   logger: Logger
 ): Promise<{ ok: true; buffer: Buffer } | { ok: false; error: string; details?: string }> {
-  logger.info("[pdf] start");
+  logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdf start", { filePath, htmlLength: html.length });
   const winRef: { current: BrowserWindow | null } = { current: null };
 
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -120,16 +120,23 @@ export async function runPrintToPdf(
     });
     winRef.current = win;
     const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
-    logger.info("[pdf] html rendered, loading in window");
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdf: loading data URL in hidden window");
 
     await new Promise<void>((resolve, reject) => {
-      win.webContents.once("did-finish-load", () => resolve());
-      win.webContents.once("did-fail-load", (_, code, msg) =>
-        reject(new Error(`Load failed: ${code} ${msg}`))
-      );
-      win.loadURL(dataUrl).catch(reject);
+      win.webContents.once("did-finish-load", () => {
+        logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdf: did-finish-load");
+        resolve();
+      });
+      win.webContents.once("did-fail-load", (_, code, msg) => {
+        logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdf: did-fail-load", { code, msg });
+        reject(new Error(`Load failed: ${code} ${msg}`));
+      });
+      win.loadURL(dataUrl).catch((e) => {
+        logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdf: loadURL rejected", e);
+        reject(e);
+      });
     });
-    logger.info("[pdf] window loaded");
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdf: window loaded");
     await win.webContents
       .executeJavaScript("document.fonts ? document.fonts.ready.then(() => true) : true")
       .catch(() => {});
@@ -143,7 +150,7 @@ export async function runPrintToPdf(
       margins: { marginType: "none" },
       preferCSSPageSize: true,
     });
-    logger.info("[pdf] printToPDF ok");
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdf: printToPDF ok");
 
     return { ok: true, buffer: pdfBuf };
   };
@@ -154,7 +161,7 @@ export async function runPrintToPdf(
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     const stack = e instanceof Error ? e.stack : undefined;
-    logger.error("[pdf] failed", stack ?? e);
+    logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdf failed", stack ?? e);
     return { ok: false, error: message, details: stack };
   } finally {
     const w = winRef.current;
@@ -227,15 +234,15 @@ export async function runPrintToPdfFromFile(
   logger: Logger
 ): Promise<{ ok: true; buffer: Buffer } | { ok: false; error: string; details?: string }> {
   if (!fs.existsSync(tempHtmlPath)) {
-    logger.error("[pdf] temp HTML file not found", tempHtmlPath);
+    logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: temp HTML file not found", tempHtmlPath);
     return { ok: false, error: "Brak tymczasowego pliku HTML do druku." };
   }
   const isE2E = process.env.PLANLUX_E2E === "1";
   if (isE2E) {
-    logger.info("[E2E/pdf] using placeholder PDF (skip printToPDF for CI stability)");
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: using placeholder PDF for E2E");
     return { ok: true, buffer: getE2EPlaceholderPdfBuffer() };
   }
-  logger.info("[pdf] start (loadFile)");
+  logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile start", { tempHtmlPath });
   const winRef: { current: BrowserWindow | null } = { current: null };
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error("Generowanie PDF trwało zbyt długo (timeout 20s).")), PDF_TIMEOUT_MS);
@@ -253,16 +260,23 @@ export async function runPrintToPdfFromFile(
       webPreferences: { sandbox: false, contextIsolation: true, backgroundThrottling: false },
     });
     winRef.current = win;
-    logger.info("[pdf] loading file", tempHtmlPath);
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: loading file in hidden window", { tempHtmlPath });
 
     await new Promise<void>((resolve, reject) => {
-      win.webContents.once("did-finish-load", () => resolve());
-      win.webContents.once("did-fail-load", (_, code, msg) =>
-        reject(new Error(`LOADFILE_FAILED: Błąd ładowania dokumentu (kod ${code}): ${msg}`))
-      );
-      win.loadFile(tempHtmlPath).catch(reject);
+      win.webContents.once("did-finish-load", () => {
+        logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: did-finish-load");
+        resolve();
+      });
+      win.webContents.once("did-fail-load", (_, code, msg) => {
+        logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: did-fail-load", { code, msg });
+        reject(new Error(`LOADFILE_FAILED: Błąd ładowania dokumentu (kod ${code}): ${msg}`));
+      });
+      win.loadFile(tempHtmlPath).catch((e) => {
+        logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: loadFile rejected", e);
+        reject(e);
+      });
     });
-    logger.info("[pdf] window loaded");
+    logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: window loaded");
     await win.webContents
       .executeJavaScript("document.fonts ? document.fonts.ready.then(() => true) : true")
       .catch(() => {});
@@ -270,10 +284,10 @@ export async function runPrintToPdfFromFile(
     const zoomFactor = win.webContents.getZoomFactor();
     const bounds = win.getBounds();
     if (process.env.NODE_ENV !== "production") {
-      logger.info("[pdf] render params: BrowserWindow", { width: bounds.width, height: bounds.height });
-      logger.info("[pdf] render params: zoomFactor", zoomFactor);
+      logger.info("[PLANLUX_PDF_DEBUG] render params: BrowserWindow", { width: bounds.width, height: bounds.height });
+      logger.info("[PLANLUX_PDF_DEBUG] render params: zoomFactor", zoomFactor);
     }
-    logger.info("[pdf] diagnostyka: HTML path (loaded)", tempHtmlPath);
+    logger.info("[PLANLUX_PDF_DEBUG] diagnostyka: HTML path (loaded)", tempHtmlPath);
 
     await new Promise((r) => setTimeout(r, LAYOUT_DELAY_MS));
 
@@ -336,15 +350,15 @@ export async function runPrintToPdfFromFile(
         })()`
       )
       .catch(() => ({}));
-    logger.info("[pdf] diagnostyka: renderer .hero backgroundImage", rendererDiag.heroBackgroundImage ?? "(brak)");
-    logger.info("[pdf] diagnostyka: document/body widths i overflow", {
+    logger.info("[PLANLUX_PDF_DEBUG] diagnostyka: renderer .hero backgroundImage", rendererDiag.heroBackgroundImage ?? "(brak)");
+    logger.info("[PLANLUX_PDF_DEBUG] diagnostyka: document/body widths i overflow", {
       documentElementScrollWidth: rendererDiag.documentElementScrollWidth,
       documentElementClientWidth: rendererDiag.documentElementClientWidth,
       bodyScrollWidth: rendererDiag.bodyScrollWidth,
       bodyClientWidth: rendererDiag.bodyClientWidth,
       horizontalOverflow: rendererDiag.horizontalOverflow,
     });
-    logger.info("[pdf] diagnostyka: wrap/page/hero widths", {
+    logger.info("[PLANLUX_PDF_DEBUG] diagnostyka: wrap/page/hero widths", {
       wrapScrollWidth: rendererDiag.wrapScrollWidth,
       wrapClientWidth: rendererDiag.wrapClientWidth,
       wrapComputedWidth: rendererDiag.wrapComputedWidth,
@@ -356,7 +370,7 @@ export async function runPrintToPdfFromFile(
       heroComputedWidth: rendererDiag.heroComputedWidth,
     });
     if (rendererDiag.horizontalOverflow) {
-      logger.warn("[pdf] horizontal overflow detected – scrollWidth > clientWidth (możliwy biały pasek po prawej)");
+      logger.warn("[PLANLUX_PDF_DEBUG] horizontal overflow detected – scrollWidth > clientWidth (możliwy biały pasek po prawej)");
     }
 
     let pdfBuf: Buffer;
@@ -367,9 +381,9 @@ export async function runPrintToPdfFromFile(
         margins: { marginType: "none" },
         preferCSSPageSize: true,
       });
-      logger.info("[pdf] printToPDF ok");
+      logger.info("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: printToPDF ok");
     } catch (printErr) {
-      logger.error("[pdf] printToPDF failed", printErr);
+      logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile: printToPDF failed", printErr);
       throw printErr;
     }
     return { ok: true, buffer: pdfBuf };
@@ -381,7 +395,7 @@ export async function runPrintToPdfFromFile(
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     const stack = e instanceof Error ? e.stack : undefined;
-    logger.error("[pdf] failed", stack ?? e);
+    logger.error("[PLANLUX_PDF_DEBUG] runPrintToPdfFromFile failed", stack ?? e);
     return { ok: false, error: message, details: stack };
   } finally {
     const w = winRef.current;

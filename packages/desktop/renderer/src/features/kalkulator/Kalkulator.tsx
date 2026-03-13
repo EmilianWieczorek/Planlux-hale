@@ -15,7 +15,13 @@ const buildPdfFileName =
 const isDebugLog = isRendererDebug();
 
 function isSegmentalGateStandard(name: string): boolean {
-  return /brama\s*segmentowa/i.test(name);
+  const raw = String(name ?? "");
+  const normalized = raw
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized.includes("brama segmentowa");
 }
 
 /** True when a selected standard is segmental gate but width/height are missing or invalid. */
@@ -826,15 +832,21 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
     }, ms);
   }, [refreshPdfPreview, hasEnoughDataForPreview]);
 
-  const hasMountedRef = useRef(false);
+  const hasTriggeredInitialPreviewRef = useRef(false);
   const isFirstChangeEffectRef = useRef(true);
+
+  // Initial preview: wywołaj raz, gdy dane są gotowe (wymiary + pricing) i nie trwa generowanie.
   useEffect(() => {
-    if (!hasMountedRef.current) {
-      hasMountedRef.current = true;
-      if (hasEnoughDataForPreview && !generating) refreshPdfPreview();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- run once on mount
-  }, []);
+    if (hasTriggeredInitialPreviewRef.current) return;
+    if (!hasEnoughDataForPreview) return;
+    if (generating) return;
+    // pricingData jest zależne od API; upewnij się, że zostało załadowane (lub celowo brak cennika).
+    const pricingLoadedOrKnownEmpty = pricingData !== undefined; // null/obiekt po loadPricing; undefined przed pierwszym wywołaniem.
+    if (!pricingLoadedOrKnownEmpty) return;
+
+    hasTriggeredInitialPreviewRef.current = true;
+    refreshPdfPreview();
+  }, [hasEnoughDataForPreview, generating, pricingData, refreshPdfPreview]);
 
   useEffect(() => {
     if (isFirstChangeEffectRef.current) {
@@ -1122,7 +1134,7 @@ export function Kalkulator({ api, userId, userDisplayName, online, onOpenOffer }
               {standardsCount > 0 ? `${standardsCount} elementy` : "—"}
             </Typography>
           </AccordionSummary>
-          <AccordionDetails>
+          <AccordionDetails sx={{ overflow: "visible" }}>
             <StandardPanel
               standardOptions={standardOptions}
               selectedStandards={selectedStandards}

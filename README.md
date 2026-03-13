@@ -21,10 +21,55 @@ Kalkulator i CRM ofert hal stalowych – aplikacja Electron (enterprise-grade).
 
 ## Wymagania
 
-- **Node.js** 20 LTS (zalecane)
+- **Node.js** >= 20.19.0 (zalecane: **Node 22 LTS**)
 - **npm** 9+
 
-## Uruchomienie
+## Pierwsze uruchomienie na nowym komputerze
+
+1. **Zainstaluj Node.js**  
+   - Upewnij się, że `node -v` zwraca co najmniej `v20.19.0` (rekomendowane: `v22.x`).
+2. **Sklonuj repozytorium i zainstaluj zależności**
+
+   ```bash
+   npm install
+   ```
+
+3. **Skonfiguruj zmienne środowiskowe**
+   - Skopiuj plik `.env.example` do `.env` w katalogu głównym **lub** w `packages/desktop/`:
+
+   ```bash
+   cp .env.example .env
+   # lub
+   cp .env.example packages/desktop/.env
+   ```
+
+   - Uzupełnij wartości w `.env` (Supabase, LOG_LEVEL itd. – patrz tabela poniżej).
+
+4. **Uruchom tryb deweloperski (Vite + Electron)**
+
+   ```bash
+   npm run dev:desktop
+   ```
+
+   - Skrypt wykona preflight (wersja Node, `.env`, istnienie pakietów workspace),
+   - następnie **zbuduje `@planlux/shared` i `@planlux/core`**, dopiero potem uruchomi:
+     - Vite (renderer),
+     - build TypeScript dla Electron,
+     - aplikację Electron z podpiętym dev-serverem.
+
+5. **Build produkcyjny (lokalnie)**
+
+   ```bash
+   # Pełny build monorepo (wszystkie pakiety)
+   npm run build
+
+   # Instalator Windows (.exe)
+   npm run dist:win
+   ```
+
+   - Skrypt `dist:win` wykonuje preflight w trybie produkcyjnym (w tym sprawdza, czy `packages/shared/dist` i `packages/core/dist` istnieją).
+
+## Uruchomienie (skrót)
 
 ```bash
 # Instalacja zależności
@@ -44,8 +89,10 @@ W trybie deweloperskim aplikacja ładuje `.env` z katalogu głównego lub `packa
 
 | Zmienna | Opis | Domyślnie (dev) |
 |--------|------|------------------|
-| `SUPABASE_URL` | URL projektu Supabase (health / auth) | – |
-| `SUPABASE_ANON_KEY` | Klucz anon Supabase | – |
+| `SUPABASE_URL` | URL projektu Supabase (backend / auth) | `https://fxsqwmflnzdnalkhwnuz.supabase.co` |
+| `SUPABASE_ANON_KEY` | Klucz anon Supabase (JWT) | z `.env.example` |
+| `VITE_SUPABASE_URL` | URL Supabase dla frontendu (Vite) | jak `SUPABASE_URL` |
+| `VITE_SUPABASE_ANON_KEY` | Klucz anon Supabase dla frontendu | jak `SUPABASE_ANON_KEY` |
 | `PLANLUX_BACKEND_URL` | Opcjonalnie: inny URL (np. updates) | – |
 | `SESSION_TTL_HOURS` | Czas życia sesji (godz.) | 12 |
 | `ONLINE_TIMEOUT_MS` | Limit czasu health check (ms) | 2000 |

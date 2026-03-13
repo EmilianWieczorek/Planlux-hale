@@ -2,7 +2,26 @@ import * as React from "react";
 import { Box, ButtonBase, Typography } from "@mui/material";
 import { tokens } from "../../theme/tokens";
 import { formatStandardLabel } from "./formatStandardLabel";
-import { isRendererDebug } from "../../utils/env";
+
+/** Parse decimal from input (accepts comma or dot). Returns NaN if invalid. */
+function parseDecimal(value: string): number {
+  const s = String(value ?? "").trim().replace(",", ".");
+  if (s === "") return NaN;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/** Clamp dimension to (min, reasonable max). Used when committing to draft. */
+function clampDimension(n: number, min: number, fallback: number): number {
+  if (!Number.isFinite(n) || n < min) return fallback;
+  return Math.max(min, Math.min(n, 50));
+}
+
+/** Clamp quantity to integer >= 1. */
+function clampQuantity(n: number): number {
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.max(1, Math.floor(n));
+}
 
 const styles = {
   section: {
@@ -33,7 +52,13 @@ export type StandardItem = {
 };
 
 function isSegmentalGateStandard(name: string): boolean {
-  return /brama\s*segmentowa/i.test(name);
+  const raw = String(name ?? "");
+  const normalized = raw
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized.includes("brama segmentowa");
 }
 
 function formatGateDimsShort(widthM: string, heightM: string): string {
@@ -81,15 +106,10 @@ export function StandardPanel(props: {
     previewDebounceModeRef,
   } = props;
   const [gutterConfigOpen, setGutterConfigOpen] = React.useState<boolean>(true);
-  const isDebugLog = isRendererDebug();
 
   const gateSelected = !!segmentGateStandard?.selected;
   const widthM = segmentGateStandard?.widthM ?? 4;
   const heightM = segmentGateStandard?.heightM ?? 4;
-  const qty = segmentGateStandard?.qty ?? 1;
-
-  // eslint-disable-next-line no-console
-  console.debug("[segment-gate-standard][render]", { gateSelected, segmentGateStandard });
 
   React.useEffect(() => {
     if (gutter.selected) setGutterConfigOpen(true);
@@ -112,15 +132,20 @@ export function StandardPanel(props: {
           onSegmentGateStandardChange({ ...segmentGateStandard, selected: false });
           onSelectedStandardsChange(selectedStandards.filter((x) => !isSegmentalGateStandard(x.name)));
         } else {
+          // Preserve existing dimensions when re-selecting; otherwise defaults (handlowiec może wrócić do kafla i ma zachowane wartości).
+          const prev = segmentGateStandard;
+          const w = prev?.widthM != null && Number.isFinite(prev.widthM) && prev.widthM > 0 ? prev.widthM : 4;
+          const h = prev?.heightM != null && Number.isFinite(prev.heightM) && prev.heightM > 0 ? prev.heightM : 4;
+          const q = prev?.qty != null && Number.isFinite(prev.qty) && prev.qty >= 1 ? Math.max(1, Math.floor(prev.qty)) : 1;
           onSegmentGateStandardChange({
             selected: true,
-            widthM: 4,
-            heightM: 4,
-            qty: 1,
+            widthM: w,
+            heightM: h,
+            qty: q,
           });
           onSelectedStandardsChange([
             ...selectedStandards.filter((x) => !isSegmentalGateStandard(x.name)),
-            { ...opt, widthM: "4", heightM: "4", qty: 1 },
+            { ...opt, widthM: String(w), heightM: String(h), qty: q },
           ]);
         }
       } else {
@@ -129,10 +154,6 @@ export function StandardPanel(props: {
         } else {
           onSelectedStandardsChange([...selectedStandards, opt]);
         }
-      }
-      if (isDebugLog) {
-        // eslint-disable-next-line no-console
-        console.debug("[standards] calculator state updated", { action: isSelected(opt.name) ? "remove" : "add", name: opt.name, isGate });
       }
       schedulePreviewRefresh("commit");
     },
@@ -157,19 +178,10 @@ export function StandardPanel(props: {
           },
         ]);
       }
-      if (isDebugLog) {
-        // eslint-disable-next-line no-console
-        console.debug("[segment-gate-standard] updateGateDims", patch);
-      }
       schedulePreviewRefresh("commit");
     },
-    [isDebugLog, onSelectedStandardsChange, onSegmentGateStandardChange, previewDebounceModeRef, schedulePreviewRefresh, segmentGateStandard, selectedStandards, standardOptions]
+    [onSelectedStandardsChange, onSegmentGateStandardChange, previewDebounceModeRef, schedulePreviewRefresh, segmentGateStandard, selectedStandards, standardOptions]
   );
-
-  const clampNum = React.useCallback((v: number, min: number, type: "w" | "h" | "qty"): number => {
-    if (type === "qty") return Math.max(1, Math.floor(v));
-    return Number.isFinite(v) && v > 0 ? Math.max(min, v) : min;
-  }, []);
 
   return (
     <div style={styles.section}>
@@ -183,12 +195,147 @@ export function StandardPanel(props: {
           gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
           gap: 1.5,
           mt: 1,
+          alignItems: "start",
         }}
       >
         {standardOptions.map((opt) => {
           const selected = isSelected(opt.name);
           const isGutter = normalizeName(opt.name) === "system rynnowy";
           const isGate = isSegmentalGateStandard(opt.name);
+
+          const tileBorder = `1px solid ${selected ? tokens.color.primary : tokens.color.border}`;
+          const tileBg = selected ? tokens.color.gray[50] : tokens.color.white;
+          const tileSx = {
+            textAlign: "left" as const,
+            borderRadius: 2,
+            border: tileBorder,
+            background: tileBg,
+            p: 1.5,
+            transition: "border-color 120ms ease, background 120ms ease",
+            "&:hover": {
+              borderColor: selected ? tokens.color.primary : tokens.color.gray[400],
+              background: selected ? tokens.color.gray[50] : tokens.color.gray[50],
+            },
+            overflow: "visible" as const,
+          };
+
+          if (isGate) {
+            return (
+              <Box
+                key={opt.name}
+                sx={{
+                  border: gateSelected ? "1.5px solid #a32035" : "1px solid #d9dee7",
+                  borderRadius: 3,
+                  background: gateSelected ? "#fff8fa" : "#fff",
+                  p: 1.5,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 1,
+                  overflow: "visible",
+                }}
+              >
+                <Box
+                  onClick={() => toggleStandard(opt)}
+                  role="button"
+                  aria-pressed={gateSelected}
+                  sx={{
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 1,
+                  }}
+                >
+                  <Box
+                    sx={{
+                      width: 18,
+                      height: 18,
+                      borderRadius: 0.75,
+                      border: gateSelected ? "1.5px solid #a32035" : "1.5px solid #94a3b8",
+                      background: gateSelected ? "#a32035" : "#fff",
+                      mt: 0.2,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography sx={{ fontWeight: 700, fontSize: 16, lineHeight: 1.2 }}>
+                      Brama Segmentowa
+                    </Typography>
+
+                    {!!opt.description && (
+                      <Typography sx={{ mt: 0.25, fontSize: 12, color: "#64748b", lineHeight: 1.3 }}>
+                        {opt.description}
+                      </Typography>
+                    )}
+
+                    {gateSelected && (
+                      <Typography sx={{ mt: 0.5, fontSize: 14, fontWeight: 600 }}>
+                        {widthM} × {heightM} m
+                      </Typography>
+                    )}
+                  </Box>
+                </Box>
+
+                {gateSelected && (
+                  <Box
+                    onClick={(e) => e.stopPropagation()}
+                    sx={{
+                      borderTop: "1px solid #e5e7eb",
+                      pt: 1.25,
+                      display: "grid",
+                      gap: 1,
+                    }}
+                  >
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>Szerokość (m)</span>
+                      <input
+                        value={String(widthM ?? "")}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => {
+                          const n = parseDecimal(e.target.value);
+                          updateSegmentGateDims({
+                            widthM: Number.isFinite(n) ? clampDimension(n, 0.01, 4) : widthM,
+                          });
+                        }}
+                        style={{
+                          width: "100%",
+                          minHeight: 36,
+                          padding: "8px 10px",
+                          border: "1px solid #cbd5e1",
+                          borderRadius: "10px",
+                          background: "#fff",
+                          color: "#111827",
+                        }}
+                      />
+                    </label>
+
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>Wysokość (m)</span>
+                      <input
+                        value={String(heightM ?? "")}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => {
+                          const n = parseDecimal(e.target.value);
+                          updateSegmentGateDims({
+                            heightM: Number.isFinite(n) ? clampDimension(n, 0.01, 4) : heightM,
+                          });
+                        }}
+                        style={{
+                          width: "100%",
+                          minHeight: 36,
+                          padding: "8px 10px",
+                          border: "1px solid #cbd5e1",
+                          borderRadius: "10px",
+                          background: "#fff",
+                          color: "#111827",
+                        }}
+                      />
+                    </label>
+                  </Box>
+                )}
+              </Box>
+            );
+          }
+
           return (
             <ButtonBase
               key={opt.name}
@@ -196,23 +343,18 @@ export function StandardPanel(props: {
               aria-pressed={selected}
               aria-label={`${selected ? "Odznacz" : "Zaznacz"}: ${formatStandardLabel(opt.name)}`}
               sx={{
+                ...tileSx,
                 textAlign: "left",
                 alignItems: "stretch",
-                borderRadius: 2,
-                border: `1px solid ${selected ? tokens.color.primary : tokens.color.border}`,
-                background: selected ? tokens.color.gray[50] : tokens.color.white,
-                p: 1.5,
-                transition: "border-color 120ms ease, background 120ms ease, transform 120ms ease",
+                display: "flex",
+                gap: 1.25,
                 "&:hover": {
-                  borderColor: selected ? tokens.color.primary : tokens.color.gray[400],
-                  background: selected ? tokens.color.gray[50] : tokens.color.gray[50],
+                  ...tileSx["&:hover"],
                   transform: "translateY(-1px)",
                 },
                 "&:active": {
                   transform: "translateY(0px)",
                 },
-                display: "flex",
-                gap: 1.25,
               }}
             >
               <Box
@@ -265,72 +407,6 @@ export function StandardPanel(props: {
                     {gutter.pricingMode === "INCLUDED" ? "W cenie" : "Dolicz"} · {gutter.mb.toLocaleString("pl-PL")} mb ·{" "}
                     {gutter.sides === 1 ? "1 bok" : "2 boki"}
                   </Typography>
-                )}
-                {isGate && selected && widthM > 0 && heightM > 0 && (
-                  <Typography sx={{ color: tokens.color.textMuted, fontSize: 12, mt: 0.75 }}>
-                    {formatGateDimsShort(String(widthM), String(heightM))} • {qty} szt
-                  </Typography>
-                )}
-                {isGate && (
-                  <>
-                    {true && (
-                      <div style={{ marginTop: 8, padding: 8, border: "2px solid red" }}>
-                        TEST BRAMA SEGMENTOWA
-                      </div>
-                    )}
-                    <div style={{ fontSize: 12, color: "red", marginTop: 4 }}>
-                      gateSelected: {String(gateSelected)}
-                    </div>
-                  </>
-                )}
-                {isGate && gateSelected && (
-                  <div
-                    style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <input
-                      type="number"
-                      min={0.01}
-                      step={0.01}
-                      value={widthM}
-                      onChange={(e) =>
-                        onSegmentGateStandardChange({
-                          ...(segmentGateStandard ?? { selected: true, widthM: 4, heightM: 4, qty: 1 }),
-                          widthM: Number(e.target.value) || 4,
-                        })
-                      }
-                      placeholder="Szer. (m)"
-                      style={{ padding: 6, width: 80 }}
-                    />
-                    <input
-                      type="number"
-                      min={0.01}
-                      step={0.01}
-                      value={heightM}
-                      onChange={(e) =>
-                        onSegmentGateStandardChange({
-                          ...(segmentGateStandard ?? { selected: true, widthM: 4, heightM: 4, qty: 1 }),
-                          heightM: Number(e.target.value) || 4,
-                        })
-                      }
-                      placeholder="Wys. (m)"
-                      style={{ padding: 6, width: 80 }}
-                    />
-                    <input
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={qty}
-                      onChange={(e) =>
-                        onSegmentGateStandardChange({
-                          ...(segmentGateStandard ?? { selected: true, widthM: 4, heightM: 4, qty: 1 }),
-                          qty: Math.max(1, Math.floor(Number(e.target.value) || 1)),
-                        })
-                      }
-                      placeholder="szt"
-                      style={{ padding: 6, width: 60 }}
-                    />
-                  </div>
                 )}
               </Box>
             </ButtonBase>

@@ -114,6 +114,17 @@ export interface OfferDraft {
   emailHistory?: EmailHistoryEntry[];
 }
 
+/** Normalizacja nazwy bramy segmentowej – wspólny matcher dla legacy i nowego stanu. */
+function isSegmentalGateStandardLabel(name: unknown): boolean {
+  const raw = String(name ?? "");
+  const normalized = raw
+    .toLowerCase()
+    .replace(/[_-]+/g, " ") // BRAMA_SEGMENTOWA / BRAMA-SEGMENTOWA → "brama segmentowa"
+    .replace(/\s+/g, " ") // redukcja wielokrotnych spacji
+    .trim();
+  return normalized.includes("brama segmentowa");
+}
+
 function createEmptyDraft(): OfferDraft {
   return {
     draftId: window.crypto.randomUUID(),
@@ -433,7 +444,7 @@ export const offerDraftStore = {
           };
         }
         const standards = (loaded.selectedStandards ?? state.selectedStandards) as OfferDraft["selectedStandards"];
-        const gate = standards?.find((s) => /brama\s*segmentowa/i.test(String(s?.name)));
+        const gate = standards?.find((s) => isSegmentalGateStandardLabel(s?.name));
         if (gate) {
           const w = gate.widthM != null && String(gate.widthM).trim() !== "" ? Number(String(gate.widthM).replace(",", ".")) : 4;
           const h = gate.heightM != null && String(gate.heightM).trim() !== "" ? Number(String(gate.heightM).replace(",", ".")) : 4;
@@ -533,8 +544,15 @@ export function buildPayloadFromDraft(
   const segmentGate = d.segmentGateStandard;
   const standardInPrice = (() => {
     const raw: Array<{ element: string; ilosc: number; jednostka: string; wartoscRef: number; pricingMode: "INCLUDED_FREE"; uwagi?: string }> = [];
+    // 1) Brama segmentowa: jeśli segmentGateStandard.selected === true, dodajemy ją WYŁĄCZNIE z segmentGateStandard.
     if (segmentGate?.selected && segmentGate.widthM > 0 && segmentGate.heightM > 0) {
-      const dimsLabel = `${new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(segmentGate.widthM)} × ${new Intl.NumberFormat("pl-PL", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(segmentGate.heightM)} m`;
+      const dimsLabel = `${new Intl.NumberFormat("pl-PL", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2,
+      }).format(segmentGate.widthM)} × ${new Intl.NumberFormat("pl-PL", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2,
+      }).format(segmentGate.heightM)} m`;
       raw.push({
         element: `Brama segmentowa — ${dimsLabel}`,
         ilosc: Math.max(1, Math.floor(segmentGate.qty)),
@@ -543,22 +561,27 @@ export function buildPayloadFromDraft(
         pricingMode: "INCLUDED_FREE",
       });
     }
-    selectedStandards
-      .filter((s) => !/brama\s*segmentowa/i.test(String(s.name)))
-      .forEach((s) => {
-        const name = String(s.name).trim();
-        const isGutter = /system\s*rynnowy/i.test(name);
-        const element = isGutter ? "System rynnowy" : formatStandardLabel(name);
-        const qty = typeof s.qty === "number" && s.qty >= 1 ? Math.floor(s.qty) : 1;
-        raw.push({
-          element,
-          ilosc: qty,
-          jednostka: isGutter ? "" : "szt",
-          wartoscRef: 0,
-          pricingMode: "INCLUDED_FREE" as const,
-          uwagi: isGutter ? undefined : (s.description ? String(s.description) : undefined),
-        });
+
+    // 2) Pozostałe standardy: jeśli segmentGateStandard.selected === true, odfiltruj WSZYSTKIE legacy wpisy bramy z selectedStandards.
+    const standardsWithoutGate =
+      segmentGate?.selected && segmentGate.widthM > 0 && segmentGate.heightM > 0
+        ? selectedStandards.filter((s) => !isSegmentalGateStandardLabel(s.name))
+        : selectedStandards;
+
+    standardsWithoutGate.forEach((s) => {
+      const name = String(s.name).trim();
+      const isGutter = /system\s*rynnowy/i.test(name);
+      const element = isGutter ? "System rynnowy" : formatStandardLabel(name);
+      const qty = typeof s.qty === "number" && s.qty >= 1 ? Math.floor(s.qty) : 1;
+      raw.push({
+        element,
+        ilosc: qty,
+        jednostka: isGutter ? "" : "szt",
+        wartoscRef: 0,
+        pricingMode: "INCLUDED_FREE" as const,
+        uwagi: isGutter ? undefined : (s.description ? String(s.description) : undefined),
       });
+    });
     const seen = new Set<string>();
     return raw.filter((item) => {
       const key = normalizeAddonDisplayKey(item.element);

@@ -955,7 +955,7 @@ async function runStartup(): Promise<void> {
         storage: createOutboxStorage(getDb() as Db),
         isOnline: () => online,
         sendEmail: createSendEmailForFlush(getDb),
-        sendGenericEmail: async (payload) => {
+        sendGenericEmail: async (payload: { to: string; subject: string; text?: string; html?: string }) => {
           await sendGenericEmailSmtp({
             to: payload.to,
             subject: payload.subject,
@@ -963,7 +963,7 @@ async function runStartup(): Promise<void> {
             html: payload.html,
           });
         },
-        offerSync: async (payload) => {
+        offerSync: async (payload: { offers?: unknown[] }) => {
           const db = getDb() as Db;
           const offers = Array.isArray(payload?.offers) ? payload.offers : [];
           for (const o of offers) {
